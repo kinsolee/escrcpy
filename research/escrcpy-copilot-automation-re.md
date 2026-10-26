@@ -13,13 +13,13 @@
 
 ## 1. 分析对象与方法
 
-| 项 | 值 |
-| --- | --- |
-| 应用 | `/Applications/Escrcpy.app`，版本 3.3.1，Electron 42.1.0 / Chrome 148 |
-| 打包 | `app.asar`（12 MB）+ `app.asar.unpacked`（sharp、node-pty、opencv.js） |
-| 混淆 | 无。Vite/Rolldown 输出，main / preload 未压缩只改了变量名，并保留 `//#region <源文件路径>` 注释；renderer 已压缩 |
-| sourcemap | 无 |
-| madb | 单文件 ESM，保留了 TypeScript 源码的 JSDoc 注释 |
+| 项        | 值                                                                                                               |
+| --------- | ---------------------------------------------------------------------------------------------------------------- |
+| 应用      | `/Applications/Escrcpy.app`，版本 3.3.1，Electron 42.1.0 / Chrome 148                                            |
+| 打包      | `app.asar`（12 MB）+ `app.asar.unpacked`（sharp、node-pty、opencv.js）                                           |
+| 混淆      | 无。Vite/Rolldown 输出，main / preload 未压缩只改了变量名，并保留 `//#region <源文件路径>` 注释；renderer 已压缩 |
+| sourcemap | 无                                                                                                               |
+| madb      | 单文件 ESM，保留了 TypeScript 源码的 JSDoc 注释                                                                  |
 
 分析文件（解包在 scratchpad，未进仓库）：
 
@@ -60,15 +60,15 @@
 
 源文件（据 region 注释，`main.js`）：
 
-| 源文件 | 行号 | 作用 |
-| --- | --- | --- |
-| `electron/modules/copilot/helpers/provider.js` | 57758 | 按 apiType 创建模型；拼 system prompt |
-| `electron/modules/copilot/helpers/stream-timeout-manager.js` | 57844 | 流空闲超时 + 心跳超时 |
-| `electron/mcp/client.js` | 61071 | 用 stdio transport 连 MCP，缓存 tools |
-| `electron/mcp/server-manager.js` | 61123 | 每设备一个 madb 子进程，最多 3 个并发 |
-| `electron/modules/copilot/helpers/session.js` | 61221 | 会话管理 + 主循环 `_runToolLoop` |
-| `electron/modules/copilot/helpers/session-config.js` | 62253 | 从 electron-store 读供应商/模型配置 |
-| `electron/modules/copilot/window.js` | 62338 | 窗口 + IPC 注册 |
+| 源文件                                                       | 行号  | 作用                                  |
+| ------------------------------------------------------------ | ----- | ------------------------------------- |
+| `electron/modules/copilot/helpers/provider.js`               | 57758 | 按 apiType 创建模型；拼 system prompt |
+| `electron/modules/copilot/helpers/stream-timeout-manager.js` | 57844 | 流空闲超时 + 心跳超时                 |
+| `electron/mcp/client.js`                                     | 61071 | 用 stdio transport 连 MCP，缓存 tools |
+| `electron/mcp/server-manager.js`                             | 61123 | 每设备一个 madb 子进程，最多 3 个并发 |
+| `electron/modules/copilot/helpers/session.js`                | 61221 | 会话管理 + 主循环 `_runToolLoop`      |
+| `electron/modules/copilot/helpers/session-config.js`         | 62253 | 从 electron-store 读供应商/模型配置   |
+| `electron/modules/copilot/window.js`                         | 62338 | 窗口 + IPC 注册                       |
 
 **madb 子进程的启动方式**（`main.js` 61123–61208）：
 
@@ -109,20 +109,20 @@
 
 每个事件的形状是 `{ event, payload, context: { stepNumber, sessionId, deviceId, executionId } }`：
 
-| event | payload |
-| --- | --- |
-| `MCP_SESSION_READY` | `{ toolCount, toolNames }` |
-| `TASK_START` | `{ task }` |
-| `REASONING_DELTA` / `TEXT_DELTA` | `{ content }` |
-| `TOOL_CALL_START` | `{ name, arguments, toolCallId }` |
-| `TOOL_CALL_END` | `{ name, result, toolCallId }` |
-| `TOOL_CALL_ERROR` | `{ name, error, toolCallId }` |
-| `TOOL_CALL_CONFIRM_REQUIRED` | `{ name, arguments, requestId }` |
-| `THINKING_COMPLETE` | `{ content }` |
-| `TASK_COMPLETE` | `{ message, finishReason, usage }` |
-| `TASK_STEP_LIMIT_REACHED` | `{ message, stepCount, maxSteps, usage }` |
-| `ABORTED` | `{ message }` |
-| `ERROR` | `{ message, code?, statusCode?, guidance? }` |
+| event                            | payload                                      |
+| -------------------------------- | -------------------------------------------- |
+| `MCP_SESSION_READY`              | `{ toolCount, toolNames }`                   |
+| `TASK_START`                     | `{ task }`                                   |
+| `REASONING_DELTA` / `TEXT_DELTA` | `{ content }`                                |
+| `TOOL_CALL_START`                | `{ name, arguments, toolCallId }`            |
+| `TOOL_CALL_END`                  | `{ name, result, toolCallId }`               |
+| `TOOL_CALL_ERROR`                | `{ name, error, toolCallId }`                |
+| `TOOL_CALL_CONFIRM_REQUIRED`     | `{ name, arguments, requestId }`             |
+| `THINKING_COMPLETE`              | `{ content }`                                |
+| `TASK_COMPLETE`                  | `{ message, finishReason, usage }`           |
+| `TASK_STEP_LIMIT_REACHED`        | `{ message, stepCount, maxSteps, usage }`    |
+| `ABORTED`                        | `{ message }`                                |
+| `ERROR`                          | `{ message, code?, statusCode?, guidance? }` |
 
 渲染端会把这些事件逐条写进 IndexedDB 的 `executionJournal` 表（`runtime-message-*.js` 约 283–340 行），用来在窗口重开时恢复未完成的执行。**这份记录就是现成的“AI 操作录像”。**
 
@@ -141,14 +141,22 @@
 ```jsonc
 {
   "maxSteps": 500,
-  "active": "<vendorName>::<modelId>",      // 全局默认模型
-  "sessions": { "<deviceId>": "<vendorName>::<modelId>" },  // 按设备覆盖
+  "active": "<vendorName>::<modelId>", // 全局默认模型
+  "sessions": { "<deviceId>": "<vendorName>::<modelId>" }, // 按设备覆盖
   "vendors": [{
-    "name": "…", "vendor": "…", "isBuiltin": false,
-    "apiType": "messages|responses",        // 渲染端只提供这两个选项
+    "name": "…",
+    "vendor": "…",
+    "isBuiltin": false,
+    "apiType": "messages|responses", // 渲染端只提供这两个选项
     "apiKey": "…",
-    "models": [{ "id": "…", "name": "…", "url": "<baseUrl>",
-                 "maxInputTokens": 0, "maxOutputTokens": 0, "fixed": false }]
+    "models": [{
+      "id": "…",
+      "name": "…",
+      "url": "<baseUrl>",
+      "maxInputTokens": 0,
+      "maxOutputTokens": 0,
+      "fixed": false
+    }]
   }]
 }
 ```
@@ -161,14 +169,14 @@
 
 ### 3.9 本地数据库（Dexie，库名 `escrcpy_local_db`，版本 8）
 
-| 表 | 索引 |
-| --- | --- |
-| `messages` | `++id, sessionId, timestamp, role` |
-| `sessions` | `id, deviceId, updatedAt` |
-| `executionJournal` | `++id, executionId, sessionId, deviceId, sequence, timestamp` |
-| `executionAssets` | `++id, executionId, assetType, createdAt` |
-| `automationScripts` | `++id, name, deviceId, createdAt, updatedAt` |
-| `schedules` / `shortcuts` / `keyboardDevices` | 定时任务、快捷键、键位映射 |
+| 表                                            | 索引                                                          |
+| --------------------------------------------- | ------------------------------------------------------------- |
+| `messages`                                    | `++id, sessionId, timestamp, role`                            |
+| `sessions`                                    | `id, deviceId, updatedAt`                                     |
+| `executionJournal`                            | `++id, executionId, sessionId, deviceId, sequence, timestamp` |
+| `executionAssets`                             | `++id, executionId, assetType, createdAt`                     |
+| `automationScripts`                           | `++id, name, deviceId, createdAt, updatedAt`                  |
+| `schedules` / `shortcuts` / `keyboardDevices` | 定时任务、快捷键、键位映射                                    |
 
 ## 4. System prompt 结构
 
@@ -204,14 +212,14 @@
 
 ### 5.2 服务层
 
-| 服务 | 要点 |
-| --- | --- |
-| AdbService | 设备列表缓存 2s；`safeShell` 先过安全校验；把多条 shell 命令用分隔符 `__MADB_SEP__` 合并成一次往返 |
-| InputService | **按设备串行队列**，防止并发手势交错；记录走的是 yadb 还是 adb 以及耗时；scroll 用 swipe 实现，时长 300ms |
-| ScreenshotService | screencap 和 `wm size` + 方向查询并行；用 sharp 缩到 ≤2560 边长，转成 JPEG（质量 80）再 base64 |
-| UIService | 有 yadb 时用 `yadb -layout`，否则用 `uiautomator dump /dev/tty`（逻辑在开源的 `packages/adbx/src/index.ts:163`）；最多重试 3 次；XML 上限 5 MB；前台 app 从 `dumpsys activity activities` 里的 `mResumedActivity` 取 |
-| StateSnapshotService | snapshot 有效期 60s，id 形如 `snap_N`；**任何输入动作之后都会让该设备的所有 snapshot 失效**；查找顺序：指定 snapshot → 最新 snapshot → 重新 dump |
-| CoordinateService | 可视尺寸缓存 30s；截图时顺带更新；横屏时宽高互换 |
+| 服务                 | 要点                                                                                                                                                                                                                 |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| AdbService           | 设备列表缓存 2s；`safeShell` 先过安全校验；把多条 shell 命令用分隔符 `__MADB_SEP__` 合并成一次往返                                                                                                                   |
+| InputService         | **按设备串行队列**，防止并发手势交错；记录走的是 yadb 还是 adb 以及耗时；scroll 用 swipe 实现，时长 300ms                                                                                                            |
+| ScreenshotService    | screencap 和 `wm size` + 方向查询并行；用 sharp 缩到 ≤2560 边长，转成 JPEG（质量 80）再 base64                                                                                                                       |
+| UIService            | 有 yadb 时用 `yadb -layout`，否则用 `uiautomator dump /dev/tty`（逻辑在开源的 `packages/adbx/src/index.ts:163`）；最多重试 3 次；XML 上限 5 MB；前台 app 从 `dumpsys activity activities` 里的 `mResumedActivity` 取 |
+| StateSnapshotService | snapshot 有效期 60s，id 形如 `snap_N`；**任何输入动作之后都会让该设备的所有 snapshot 失效**；查找顺序：指定 snapshot → 最新 snapshot → 重新 dump                                                                     |
+| CoordinateService    | 可视尺寸缓存 30s；截图时顺带更新；横屏时宽高互换                                                                                                                                                                     |
 
 ### 5.3 UI 树解析规则（`ui-parser.ts`，54225 行）
 
@@ -235,40 +243,40 @@
 
 除了 `device_list`、`device_select`，所有工具都接受可选参数 `serial`。带 `settle` 的工具都是可选的“动作后等待毫秒数”（0–5000）。
 
-| # | 工具 | 类别 | 参数 | 行为概括 | 标注 |
-| --- | --- | --- | --- | --- | --- |
-| 1 | `device_list` | 设备 | — | 列出设备（serial、状态、model），强制刷新 | |
-| 2 | `device_info` | 设备 | — | 型号、品牌、Android 版本、SDK、分辨率、电量（一次 shell 往返） | |
-| 3 | `device_select` | 设备 | `serial`（必填） | 设置默认设备 | |
-| 4 | `screenshot` | 感知 | — | JPEG 图片 + 图片尺寸、设备尺寸、来源 | |
-| 5 | `get_screen_state` | 感知 | `include_screenshot?` | **核心观察工具**：snapshotId、前台 app、屏幕尺寸、元素列表，可选附带截图 | readOnly |
-| 6 | `get_foreground_app` | 感知 | — | 前台包名和 activity | readOnly |
-| 7 | `ui_dump` | UI | `format?: xml\|json` | 原始 XML 或解析后的 JSON，同时登记一个 snapshot | readOnly |
-| 8 | `ui_find_element` | UI | `text? resource_id? class_name? content_desc? exact_match? snapshot_id?` | 查找元素 | readOnly |
-| 9 | `ui_tap` | UI | 同上 + `index? settle?` | **按选择器找到元素并点击中心点**；找不到时返回查询条件、最多 15 个可见元素和提示 | destructive |
-| 10 | `ui_wait_for` | UI | 选择器 + `timeout_ms?`（1000–60000，默认 10000）`poll_interval_ms?`（默认 500） | server 端轮询直到元素出现；超时返回 `found:false`，不算错误 | readOnly |
-| 11 | `tap` | 输入 | `x y`（0~1） | 坐标点击 | destructive |
-| 12 | `swipe` | 输入 | `x1 y1 x2 y2 duration?`（默认 300） | 滑动 | destructive |
-| 13 | `long_press` | 输入 | `x y duration?`（默认 1000） | 长按 | destructive |
-| 14 | `drag` | 输入 | `x1 y1 x2 y2 duration?`（默认 1000） | 拖拽 | destructive |
-| 15 | `scroll` | 输入 | `x y h_scroll v_scroll distance_ratio?`（默认 0.3） | 用 swipe 模拟滚动，正数表示向下/向右 | destructive |
-| 16 | `pinch` | 输入 | `center_x center_y start_radius end_radius duration?` | 双指缩放，需要 yadb | destructive |
-| 17 | `key_event` | 输入 | `keycode`（数字或名字，如 HOME / BACK / ENTER） | 按键，内置约 40 个名字映射 | destructive |
-| 18 | `input_text` | 输入 | `text` | 向焦点输入框输入，yadb 支持 Unicode | destructive |
-| 19 | `app_start` | 应用 | `package activity? restart? settle?` | 先 `pm path` 检查是否安装；有 activity 用 `am start -n`，否则用 `monkey -p … LAUNCHER 1`；restart 时先 force-stop | |
-| 20 | `app_stop` | 应用 | `package settle?` | force-stop | |
-| 21 | `app_list` | 应用 | `filter?: all\|third-party\|system` | 列出包名（已排序） | |
-| 22 | `app_install` | 应用 | `path`（本机 APK） | 安装 | |
-| 23 | `app_uninstall` | 应用 | `package` | 卸载 | |
-| 24 | `open_url` | 导航 | `url settle?` | `am start -a VIEW --uri`，支持 deep link | destructive |
-| 25 | `get_orientation` | 导航 | — | 方向、user_rotation、是否自动旋转 | readOnly |
-| 26 | `set_orientation` | 导航 | `orientation: portrait\|landscape\|reverse-*\|auto` | 锁定或恢复自动旋转 | destructive |
-| 27 | `clipboard_get` | 剪贴板 | — | 通过 yadb 读剪贴板 | |
-| 28 | `clipboard_set` | 剪贴板 | `text` | 通过 yadb 写剪贴板 | |
-| 29 | `shell_exec` | Shell | `command` | 经安全校验，输出截断到 10 KB | |
-| 30 | `file_push` | 文件 | `local_path remote_path` | 推送文件 | |
-| 31 | `file_pull` | 文件 | `remote_path local_path` | 拉取文件 | |
-| 32 | `file_list` | 文件 | `path` | 列目录（name / size / mode / mtime） | |
+| #   | 工具                 | 类别   | 参数                                                                            | 行为概括                                                                                                          | 标注        |
+| --- | -------------------- | ------ | ------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | ----------- |
+| 1   | `device_list`        | 设备   | —                                                                               | 列出设备（serial、状态、model），强制刷新                                                                         |             |
+| 2   | `device_info`        | 设备   | —                                                                               | 型号、品牌、Android 版本、SDK、分辨率、电量（一次 shell 往返）                                                    |             |
+| 3   | `device_select`      | 设备   | `serial`（必填）                                                                | 设置默认设备                                                                                                      |             |
+| 4   | `screenshot`         | 感知   | —                                                                               | JPEG 图片 + 图片尺寸、设备尺寸、来源                                                                              |             |
+| 5   | `get_screen_state`   | 感知   | `include_screenshot?`                                                           | **核心观察工具**：snapshotId、前台 app、屏幕尺寸、元素列表，可选附带截图                                          | readOnly    |
+| 6   | `get_foreground_app` | 感知   | —                                                                               | 前台包名和 activity                                                                                               | readOnly    |
+| 7   | `ui_dump`            | UI     | `format?: xml\|json`                                                            | 原始 XML 或解析后的 JSON，同时登记一个 snapshot                                                                   | readOnly    |
+| 8   | `ui_find_element`    | UI     | `text? resource_id? class_name? content_desc? exact_match? snapshot_id?`        | 查找元素                                                                                                          | readOnly    |
+| 9   | `ui_tap`             | UI     | 同上 + `index? settle?`                                                         | **按选择器找到元素并点击中心点**；找不到时返回查询条件、最多 15 个可见元素和提示                                  | destructive |
+| 10  | `ui_wait_for`        | UI     | 选择器 + `timeout_ms?`（1000–60000，默认 10000）`poll_interval_ms?`（默认 500） | server 端轮询直到元素出现；超时返回 `found:false`，不算错误                                                       | readOnly    |
+| 11  | `tap`                | 输入   | `x y`（0~1）                                                                    | 坐标点击                                                                                                          | destructive |
+| 12  | `swipe`              | 输入   | `x1 y1 x2 y2 duration?`（默认 300）                                             | 滑动                                                                                                              | destructive |
+| 13  | `long_press`         | 输入   | `x y duration?`（默认 1000）                                                    | 长按                                                                                                              | destructive |
+| 14  | `drag`               | 输入   | `x1 y1 x2 y2 duration?`（默认 1000）                                            | 拖拽                                                                                                              | destructive |
+| 15  | `scroll`             | 输入   | `x y h_scroll v_scroll distance_ratio?`（默认 0.3）                             | 用 swipe 模拟滚动，正数表示向下/向右                                                                              | destructive |
+| 16  | `pinch`              | 输入   | `center_x center_y start_radius end_radius duration?`                           | 双指缩放，需要 yadb                                                                                               | destructive |
+| 17  | `key_event`          | 输入   | `keycode`（数字或名字，如 HOME / BACK / ENTER）                                 | 按键，内置约 40 个名字映射                                                                                        | destructive |
+| 18  | `input_text`         | 输入   | `text`                                                                          | 向焦点输入框输入，yadb 支持 Unicode                                                                               | destructive |
+| 19  | `app_start`          | 应用   | `package activity? restart? settle?`                                            | 先 `pm path` 检查是否安装；有 activity 用 `am start -n`，否则用 `monkey -p … LAUNCHER 1`；restart 时先 force-stop |             |
+| 20  | `app_stop`           | 应用   | `package settle?`                                                               | force-stop                                                                                                        |             |
+| 21  | `app_list`           | 应用   | `filter?: all\|third-party\|system`                                             | 列出包名（已排序）                                                                                                |             |
+| 22  | `app_install`        | 应用   | `path`（本机 APK）                                                              | 安装                                                                                                              |             |
+| 23  | `app_uninstall`      | 应用   | `package`                                                                       | 卸载                                                                                                              |             |
+| 24  | `open_url`           | 导航   | `url settle?`                                                                   | `am start -a VIEW --uri`，支持 deep link                                                                          | destructive |
+| 25  | `get_orientation`    | 导航   | —                                                                               | 方向、user_rotation、是否自动旋转                                                                                 | readOnly    |
+| 26  | `set_orientation`    | 导航   | `orientation: portrait\|landscape\|reverse-*\|auto`                             | 锁定或恢复自动旋转                                                                                                | destructive |
+| 27  | `clipboard_get`      | 剪贴板 | —                                                                               | 通过 yadb 读剪贴板                                                                                                |             |
+| 28  | `clipboard_set`      | 剪贴板 | `text`                                                                          | 通过 yadb 写剪贴板                                                                                                |             |
+| 29  | `shell_exec`         | Shell  | `command`                                                                       | 经安全校验，输出截断到 10 KB                                                                                      |             |
+| 30  | `file_push`          | 文件   | `local_path remote_path`                                                        | 推送文件                                                                                                          |             |
+| 31  | `file_pull`          | 文件   | `remote_path local_path`                                                        | 拉取文件                                                                                                          |             |
+| 32  | `file_list`          | 文件   | `path`                                                                          | 列目录（name / size / mode / mtime）                                                                              |             |
 
 > 注：prompt 里提到的 `settle` 是参数，不是单独的工具。
 
@@ -276,18 +284,18 @@
 
 ### 6.1 组成
 
-| 部分 | 位置 |
-| --- | --- |
-| 编辑器 UI | `dist/pages/automation`，`automation-*.js` |
-| 执行器 | `preload.mjs` 38309–38870（`electron/middleware/automation/helpers/*`） |
-| 图像匹配 | `preload.mjs` 38392（`electron/middleware/opencv/index.js`），`@techstark/opencv-js` + sharp |
-| 脚本存储 | IndexedDB 表 `automationScripts` |
-| 模板图片 | `<common.saveDir 或桌面>/automation-templates/<stepId>-<随机8位>.png` |
-| 变量 | Pinia store `app-automation-variables`，**按设备**持久化 |
+| 部分      | 位置                                                                                         |
+| --------- | -------------------------------------------------------------------------------------------- |
+| 编辑器 UI | `dist/pages/automation`，`automation-*.js`                                                   |
+| 执行器    | `preload.mjs` 38309–38870（`electron/middleware/automation/helpers/*`）                      |
+| 图像匹配  | `preload.mjs` 38392（`electron/middleware/opencv/index.js`），`@techstark/opencv-js` + sharp |
+| 脚本存储  | IndexedDB 表 `automationScripts`                                                             |
+| 模板图片  | `<common.saveDir 或桌面>/automation-templates/<stepId>-<随机8位>.png`                        |
+| 变量      | Pinia store `app-automation-variables`，**按设备**持久化                                     |
 
 ### 6.2 脚本 schema（据代码整理）
 
-```jsonc
+```text
 // 数据库中的一条脚本
 {
   "id": 1,                       // Dexie 自增
@@ -328,18 +336,18 @@
 
 坐标规则：**值 ≤ 1 视为比例，> 1 视为像素**，换算基准是 `wm size`。
 
-| type | params（UI 默认值） | 执行方式 |
-| --- | --- | --- |
-| `tap` | `{x:0.5, y:0.5}` | `adbx.input.tap` |
-| `swipe` | `{startX:0.5, startY:0.75, endX:0.5, endY:0.25, duration:300}` | `adbx.input.swipe` |
-| `input` | `{text:""}` | `adbx.input.text` |
-| `key` | `{keyCode:4}` | `adbx.input.key`；UI 提供 9 个常用键 |
-| `wait` | `{duration:1000}` | sleep |
-| `launch` | `{packageName, appLabel, forceStop:false}` | 可选先 force-stop 并等 300ms，再用 `monkey -p … LAUNCHER 1` 启动 |
-| `install` | `{apkPath, uninstallBefore:false, packageName?}` | 已安装时先卸载再安装 |
-| `screenshot` | `{saveDir}` | 保存成 `Screencap-<设备>-<时间>.png` |
-| `record` | `{duration:10, saveDir, source:"screen"\|"camera", args}` | 调 scrcpy 录屏（`--time-limit`，camera 时加 `--video-source=camera`），**不等待录完** |
-| `command` | `{command:"shell …"}` | 只接受以 `shell ` 开头的命令 |
+| type         | params（UI 默认值）                                            | 执行方式                                                                              |
+| ------------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `tap`        | `{x:0.5, y:0.5}`                                               | `adbx.input.tap`                                                                      |
+| `swipe`      | `{startX:0.5, startY:0.75, endX:0.5, endY:0.25, duration:300}` | `adbx.input.swipe`                                                                    |
+| `input`      | `{text:""}`                                                    | `adbx.input.text`                                                                     |
+| `key`        | `{keyCode:4}`                                                  | `adbx.input.key`；UI 提供 9 个常用键                                                  |
+| `wait`       | `{duration:1000}`                                              | sleep                                                                                 |
+| `launch`     | `{packageName, appLabel, forceStop:false}`                     | 可选先 force-stop 并等 300ms，再用 `monkey -p … LAUNCHER 1` 启动                      |
+| `install`    | `{apkPath, uninstallBefore:false, packageName?}`               | 已安装时先卸载再安装                                                                  |
+| `screenshot` | `{saveDir}`                                                    | 保存成 `Screencap-<设备>-<时间>.png`                                                  |
+| `record`     | `{duration:10, saveDir, source:"screen"\|"camera", args}`      | 调 scrcpy 录屏（`--time-limit`，camera 时加 `--video-source=camera`），**不等待录完** |
+| `command`    | `{command:"shell …"}`                                          | 只接受以 `shell ` 开头的命令                                                          |
 
 ### 6.4 执行器语义（用自己的话描述的伪代码）
 
@@ -388,15 +396,15 @@ run(deviceId, steps, {mode, stepIndex, magicVars, onProgress}):
 
 ### 7.1 现有能力和你的目标之间的差距
 
-| 你需要的 | 发布版是否具备 |
-| --- | --- |
-| AI 探索 UI | ✅ Copilot + madb |
-| 记录 AI 的每一步 | ⚠️ 已经记录到 `executionJournal`，但只用来恢复聊天窗口 |
-| 把记录转成脚本 | ❌ 没有 |
-| 按控件（text / resource-id）定位的步骤 | ❌ Automation 只有坐标 |
-| 等待元素出现 / 断言 / 条件分支 | ❌ 只有固定 wait，以及“匹配不到就跳过” |
-| 回放失败时自愈 | ❌ |
-| 多设备批量执行 + 变量 | ✅ 有，可以直接借鉴 |
+| 你需要的                               | 发布版是否具备                                         |
+| -------------------------------------- | ------------------------------------------------------ |
+| AI 探索 UI                             | ✅ Copilot + madb                                      |
+| 记录 AI 的每一步                       | ⚠️ 已经记录到 `executionJournal`，但只用来恢复聊天窗口 |
+| 把记录转成脚本                         | ❌ 没有                                                |
+| 按控件（text / resource-id）定位的步骤 | ❌ Automation 只有坐标                                 |
+| 等待元素出现 / 断言 / 条件分支         | ❌ 只有固定 wait，以及“匹配不到就跳过”                 |
+| 回放失败时自愈                         | ❌                                                     |
+| 多设备批量执行 + 变量                  | ✅ 有，可以直接借鉴                                    |
 
 ### 7.2 推荐方案：脚本 = 确定性的 MCP 工具调用序列
 
@@ -415,17 +423,18 @@ run(deviceId, steps, {mode, stepIndex, magicVars, onProgress}):
 
 ```jsonc
 {
-  "id": "s3", "name": "点击搜索",
-  "action": "ui_tap",                       // 直接对应 madb 工具名
+  "id": "s3",
+  "name": "点击搜索",
+  "action": "ui_tap", // 直接对应 madb 工具名
   "args": { "resource_id": "com.tencent.mm:id/search", "settle": 500 },
-  "locators": [                             // 回放时按顺序尝试
+  "locators": [ // 回放时按顺序尝试
     { "kind": "selector", "resource_id": "com.tencent.mm:id/search" },
     { "kind": "selector", "content_desc": "搜索", "exact_match": true },
     { "kind": "image", "templatePath": "…/s3.png", "threshold": 0.85 },
     { "kind": "point", "x": 0.8375, "y": 0.0744 }
   ],
   "expect": { "tool": "ui_wait_for", "args": { "text": "搜索", "timeout_ms": 5000 } },
-  "onFail": "heal"                          // heal | skip | abort
+  "onFail": "heal" // heal | skip | abort
 }
 ```
 

@@ -1,0 +1,29 @@
+{
+  "name": "@escrcpy/flow-core",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Flow script schema, compiler and replayer (M2)",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@escrcpy/flow-device": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsdown": "*",
+    "typescript": "*"
+  }
+}

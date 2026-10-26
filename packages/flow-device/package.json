@@ -1,0 +1,33 @@
+{
+  "name": "@escrcpy/flow-device",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Device layer for record/replay flows: UI dump, parsing, selectors, input queue, screenshots",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@escrcpy/adbx": "workspace:*",
+    "sharp": "*"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsdown": "*",
+    "typescript": "*",
+    "vitest": "5.0.5"
+  }
+}

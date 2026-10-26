@@ -1,0 +1,29 @@
+{
+  "name": "@escrcpy/flow-mcp",
+  "type": "module",
+  "version": "0.0.0",
+  "private": true,
+  "description": "MCP server exposing flow-device tools with a built-in trace recorder (M1)",
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./package.json": "./package.json"
+  },
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@escrcpy/flow-device": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "tsdown": "*",
+    "typescript": "*"
+  }
+}
