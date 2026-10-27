@@ -1,0 +1,33 @@
+version: 1
+name: settings
+description: Open settings
+app:
+  package: com.example.launcher
+recordedOn:
+  model: Fixture
+  sdk: 35
+  size: [1080, 2400]
+  trace: tr_fixture
+vars:
+  user:
+    required: true
+    description: Contact name
+defaults:
+  timeout: 1000
+  settle: 0
+interrupts:
+  - when:
+      text: Later
+      exact: true
+    do: tap
+steps:
+  - id: open
+    intent: Open settings
+    do: tap
+    target:
+      - resource_id: id/settings
+        exact: true
+    expect:
+      visible:
+        content_desc: Settings
+        exact: true
