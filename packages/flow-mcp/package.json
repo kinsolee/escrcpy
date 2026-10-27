@@ -9,6 +9,9 @@
     "./package.json": "./package.json"
   },
   "main": "dist/index.mjs",
+  "bin": {
+    "flow-mcp": "dist/index.mjs"
+  },
   "types": "dist/index.d.mts",
   "files": [
     "dist"
@@ -16,14 +19,21 @@
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
-    "typecheck": "tsc --noEmit"
+    "start": "node dist/index.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@escrcpy/flow-device": "workspace:*"
+    "@devicefarmer/adbkit": "*",
+    "@escrcpy/adbx": "workspace:*",
+    "@escrcpy/flow-device": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "*"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
     "tsdown": "*",
-    "typescript": "*"
+    "typescript": "*",
+    "vitest": "5.0.5"
   }
 }
