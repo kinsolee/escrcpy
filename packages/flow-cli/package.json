@@ -16,16 +16,20 @@
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@devicefarmer/adbkit": "*",
     "@escrcpy/adbx": "workspace:*",
-    "@escrcpy/flow-device": "workspace:*"
+    "@escrcpy/flow-core": "workspace:*",
+    "@escrcpy/flow-device": "workspace:*",
+    "@escrcpy/flow-mcp": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
     "tsdown": "*",
-    "typescript": "*"
+    "typescript": "*",
+    "vitest": "5.0.5"
   }
 }
