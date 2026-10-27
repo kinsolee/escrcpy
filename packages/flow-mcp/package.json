@@ -9,10 +9,10 @@
     "./package.json": "./package.json"
   },
   "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
   "bin": {
     "flow-mcp": "dist/index.mjs"
   },
-  "types": "dist/index.d.mts",
   "files": [
     "dist"
   ],
