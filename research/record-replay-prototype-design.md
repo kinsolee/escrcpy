@@ -275,13 +275,14 @@ Claude Code 的接入方式（项目级 `.mcp.json`）：`{"flow": {"command": "
 
 ## 8. 里程碑
 
-| 里程碑            | 内容                                                                                  | 验收标准                                                                          |
-| ----------------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
-| **M0** 骨架       | 4 个包的脚手架；flow-device 的 dump / 解析 / 查找 / 输入 / 截图；fixture 单测         | `pnpm --filter @escrcpy/flow-device test` 通过；在真机上能 dump 并按选择器点击    |
-| **M1** 探索与录制 | flow-mcp 工具集 + 录制器 + 探索 prompt                                                | Claude Code 连上 server 后完成一个任务，生成完整的 trace（含 target 和 snapshot） |
-| **M2** 编译与回放 | 脚本 schema、编译器、回放器、报告、`flow run`                                         | 两个示例流程在同一台设备上回放 10 次成功 ≥ 9 次；换一台设备不改脚本也能跑通       |
-| **M3** 自愈       | interrupts、L2 自愈 agent、补丁与 `flow heal`                                         | 人为让首选定位失效（例如改掉 resource_id）后，能用备用定位或自愈跑完，并产出补丁  |
-| **M4** 桌面集成   | `modules/flow`、脚本列表与运行页、多设备 + 变量批量执行、导出 Escrcpy Automation JSON | 在桌面端选几台设备，加载一份变量 CSV，能一键跑完并查看每台设备的报告              |
+| 里程碑              | 内容                                                                                                                    | 验收标准                                                                                                                                                                                     |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **M0** 骨架         | 4 个包的脚手架；flow-device 的 dump / 解析 / 查找 / 输入 / 截图；fixture 单测                                           | `pnpm --filter @escrcpy/flow-device test` 通过；在真机上能 dump 并按选择器点击                                                                                                               |
+| **M1** 探索与录制   | flow-mcp 工具集 + 录制器 + 探索 prompt                                                                                  | Claude Code 连上 server 后完成一个任务，生成完整的 trace（含 target 和 snapshot）                                                                                                            |
+| **M2** 编译与回放   | 脚本 schema、编译器、回放器、报告、`flow run`                                                                           | 两个示例流程在同一台设备上回放 10 次成功 ≥ 9 次；换一台设备不改脚本也能跑通                                                                                                                  |
+| **M3** 自愈         | interrupts、L2 自愈 agent、补丁与 `flow heal`                                                                           | 人为让首选定位失效（例如改掉 resource_id）后，能用备用定位或自愈跑完，并产出补丁                                                                                                             |
+| **M3.5** 协调与批量 | DeviceLease 设备租约、flow-mcp 占用标注与 `device_claim` / `device_release`、`flow fleet`、agent 接入指南（见第 10 节） | 两个 MCP 客户端抢同一台设备，后到者收到含持有者的报错；`flow fleet` 在 ≥ 2 台设备上并行跑完清单并产出 `reports/<flow>/<device>/<run>/` 分层报告；持有者进程死亡或 120 s 无活动后租约自动释放 |
+| **M4** 桌面集成     | `modules/flow`、脚本列表与运行页、多设备 + 变量批量执行、导出 Escrcpy Automation JSON                                   | 在桌面端选几台设备，加载一份变量 CSV，能一键跑完并查看每台设备的报告                                                                                                                         |
 
 M0 到 M2 是核心价值，做完就能验证“回放比每次都用 AI 视觉理解快、而且稳”。M3、M4 按实际效果再决定投入多少。
 
@@ -292,3 +293,101 @@ M0 到 M2 是核心价值，做完就能验证“回放比每次都用 AI 视觉
 - **脚本表达力**：等需要条件分支和子流程时，再在 YAML 里加 `if` / `call`，或者直接让脚本支持 TS 写法（像 Playwright 那样）。现在不提前设计。
 - **和上游 Escrcpy 同步**：除 M4 外都是独立包，不碰上游代码；M4 只新增一个 module，冲突面最小。
 - **许可证**：工具名和参数结构属于接口层面，保持兼容没问题；实现代码全部自己写。
+
+## 10. M3.5：设备租约、flow fleet 与 agent 接入（介于 M3 与 M4 之间）
+
+> M3 解决"一个流程坏了能自愈"，M4 解决"进桌面端、批量跑"。但多进程并存（agent 的 MCP server、`flow run` / `flow fleet`、以后的桌面模块，甚至投屏）共用一台设备时，"谁在用、谁能用"在 M3 验收时就会暴露。M3.5 用一个**纯文件系统设备租约（DeviceLease）**把这层跨进程协调补上，并加 `flow fleet` 清单式批量派发；它不依赖桌面端，M4 的窗口 / 任务队列直接复用同一套租约（见 10.4）。agent 接入的操作细节见 [flow-agent-onboarding.md](flow-agent-onboarding.md)。
+
+### 10.1 DeviceLease：文件锁式设备租约
+
+目标：多个进程对"一台设备同一时刻只有一个操作者"达成共识，**不需要常驻服务**，只用文件系统。放在 `@escrcpy/flow-device/src/lease.ts`——flow-mcp、flow-cli、未来的 `modules/flow` 都已依赖 flow-device，复用零成本。它和 5.1 的"按设备串行队列"互补：队列管**同一进程内**的手势顺序，租约管**跨进程**的独占。
+
+| API                                               | 语义                                                                                                                       |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `acquire(serial, {holder?, waitMs?}) → LeaseInfo` | 原子创建锁文件成功即持有；已存在且新鲜 → 抛 `LeaseBusyError`（附持有者信息）；陈旧 → 清理后重试；`waitMs > 0` 时轮询等释放 |
+| `release(serial) → boolean`                       | 删除锁文件；本来就没有锁时返回 false（不校验持有者，释放即让位）                                                           |
+| `refresh(serial)`                                 | 持有者续约：更新锁文件 mtime（心跳语义）                                                                                   |
+| `info(serial) → LeaseInfo \| null`                | 读单台设备的租约，无则 `null`                                                                                              |
+| `list() → Record<serial, LeaseInfo>`              | 列出全部租约，给 `device_list` 和 fleet 调度用（读到陈旧锁时顺手清理）                                                     |
+
+- **锁文件**：`<dir>/<serial>.lock`，内容为 JSON：`{ "holder": "claude-code", "pid": 8321, "acquiredAt": 1761530400000 }`（即 `LeaseInfo`）。
+- **目录**：默认 `~/.escrcpy/flow/leases`，环境变量 `FLOW_LEASE_DIR` 覆盖（测试和 CI 指到临时目录）。
+- **原子创建**：`open(path, 'wx')`（O_EXCL）——创建即持有，创建失败即已被人持有，POSIX 与 Windows 语义一致，没有检查-再创建的竞态窗口。
+- **陈旧判定**（读取时惰性执行，满足任一条即视为已释放）：
+  - `now - mtime > staleMs`（默认 **120 s**）：持有者必须在窗口内有活动。MCP server 每次 action 调用自动 `refresh`，fleet 每步完成后续约；一次 dump ≤ 3 s、一步含等待 ≤ 8 s（默认 timeout），120 s 至少覆盖十几个连续慢步骤。agent"纯思考"超过 120 s 视为放弃，重新 `acquire` 即可。
+  - 锁内 `pid` 已不存在（`process.kill(pid, 0)` 抛 ESRCH）：进程崩了就立刻可抢，不傻等 mtime 过期。
+- **破坏陈旧锁的竞态**：多个进程同时发现陈旧时各自 `unlink` 后重走 acquire——重试仍是 `wx` 原子创建，只有一个赢家；输家在下轮循环里读到别人的新锁，按正常 busy 处理。`info()`/`list()` 读到陈旧锁也会顺手清理并视为无锁，fleet 的 busy 预检因此不会对着陈旧锁傻等/错跳。
+- **不做的事**：不加密、不做权限（本机单用户假设，见 1.2 的"规模"）；`shell_exec` 等绕过 flow-device 的操作管不住，靠约定。
+
+### 10.2 flow-mcp 增强
+
+`device_list` 的输出给每台设备加 `lease: { status: "free" }` 或 `lease: { status: "busy", holder, pid, acquiredAt }`，agent 一眼看到可用设备。新增两个工具：
+
+| 工具                                       | 作用                                                                                                            |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `device_claim(serial?, holder?, wait_ms?)` | 调 `acquire`。`holder` 默认取客户端可读名（如 `claude-code`），`pid` 为 server 进程；`wait_ms > 0` 时轮询等释放 |
+| `device_release(serial?)`                  | 调 `release`，任务结束建议显式调用；忘调也不怕，靠陈旧判定兜底                                                  |
+
+server 在 **action 类工具**执行前 `info()` 一次：被他人新鲜持有 → 报 `DEVICE_BUSY`（错误文本含 serial/holder/pid/acquiredAt）；读到陈旧 → 自动清理放行；自己持有 → `refresh`。**observe 类**（`get_screen_state`、`ui_dump`、`ui_find_element`、`ui_wait_for`、`screenshot`、`device_info`、`clipboard_get`）不检查租约——观察无副作用，且"先看一眼再决定抢不抢"更符合探索习惯。
+
+**手势级自动 acquire 的取舍**——action 时要不要替 agent 自动 acquire：
+
+| 方案                                   | 行为                                               | 优点                                 | 缺点                                                                                         |
+| -------------------------------------- | -------------------------------------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------- |
+| A. 手势级自动 acquire                  | 首次 action 自动 acquire、每次 action 自动 refresh | agent 零配合，天然强互斥             | 偶发查看也会长期占设备；agent 思考超过 staleMs 被误清；占用对 agent 不透明（不知道自己持锁） |
+| **B. 显式 claim + 手势级强制（选它）** | action 只检查"是否被他人持有"，不主动 acquire      | 语义可推理：报错即答案；观察不需占用 | 双方都不 claim 时仍有竞争窗口（原型接受，靠 onboarding 流程引导 claim）                      |
+
+选 B：接入指南把 `device_claim` 放进标准探索流程的第一环，配合 `device_list` 的 free/busy 标注，引导成本已经够低；A 的"零配合强互斥"留给 M4——那时持有者是桌面任务队列，不存在 agent 心智负担问题。
+
+### 10.3 flow fleet：清单式批量派发
+
+```bash
+flow fleet fleet.yaml [--report-dir reports/] [--wait-busy] [--dry-run]
+```
+
+清单（manifest）示例：
+
+```yaml
+# fleet.yaml — 派发清单
+flows:
+  - flow: flows/wechat-send-message.flow.yaml
+    vars: # 每一项是一行变量，与该 flow 做笛卡尔积；空列表 = 跑一次
+      - {user: 张三, message: 你好}
+      - {user: 李四, message: 中午吃啥}
+  - flow: flows/settings-wlan.flow.yaml
+    vars: []
+devices: [ABC123XYZ, emulator-5554] # 或 devices: auto，取派发时刻全部在线且 free 的设备
+defaults:
+  staleMs: 120000 # holder 统一为 fleet:<pid>
+```
+
+调度语义：
+
+- **运行项** = flows × vars 行的笛卡尔积；派发时把运行项按顺序分给设备。
+- **每台设备并发 = 1**：fleet 对每台设备先 `acquire`（holder = `fleet:<pid>`），跑完当前项再取下一项，同设备天然串行；跨进程互斥由租约保证。
+- **跨设备并行**：不同设备同时各跑一项；运行项多于设备时排队。
+- 设备被外部占用（agent 正在探索）：默认**跳过并标记 `blocked`**（汇总里含占用者），`--wait-busy` 改为等待释放。
+- 失败隔离：单项失败不影响其他项，退出码按汇总结果定。
+
+报告布局——比 4.3 的 `runs/` 多两层固定层级（flow / device），汇总文件列出每个运行项的状态、耗时与报告路径：
+
+```
+reports/<flow-name>/<serial>/<run>/report.json   # run = 时间戳，例如 2026-10-29T10-00-00_1
+reports/<flow-name>/<serial>/<run>/step-04.png
+reports/fleet-2026-10-29T10-00-00.json           # 本次派发汇总
+```
+
+**recordedOn 校验**：每个运行项开始前对比 `flow.recordedOn` 与 `device_info`，不一致**只告警不阻断**（分辨率无关正是 D5 的目标），告警写进 `report.warnings` 并打在控制台：
+
+| 不一致项      | 级别    | 含义                                                                           |
+| ------------- | ------- | ------------------------------------------------------------------------------ |
+| `size` 分辨率 | warning | 选择器不受影响；`point` 兜底可能偏移、`image` 模板按宽度比例缩放后阈值可能要调 |
+| `model` 型号  | info    | 提示模板图与系统界面可能不同，失败优先看 image 定位                            |
+| `sdk` 版本    | warning | 输入法、keyevent、权限弹窗行为可能有差异                                       |
+
+### 10.4 到 M4 桌面模块的演进路径
+
+- **租约逻辑原样复用**：`lease.ts` 不改一行。变化的只是持有者语义：从 agent（pid = MCP server 进程）换成**窗口 / 任务队列**——`holder = desktop:<windowId>` 或 `desktop:task:<id>`，`pid` = 桌面主进程。
+- 桌面"运行"按钮 = 主进程里的一次 fleet 调度（选中设备 + 变量表），走同一套 acquire/release；第 6 节"与投屏互斥"也以租约为仲裁点：镜像窗口启动前 acquire，失败就把占用者展示给用户。
+- agent 与桌面并存时，`device_list` 的 free/busy 两边可见——agent 看得到"桌面正在跑"，反之亦然，这是租约放在文件系统而不是进程内存里的直接收益。
+- M3.5 **不做**的：桌面 UI、报告渲染、CSV 变量导入（F6 / F7 留给 M4）。
