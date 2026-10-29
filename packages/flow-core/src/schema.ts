@@ -3,10 +3,10 @@ import { z } from 'zod'
 export const FLOW_SCHEMA_VERSION = 1
 
 export const selectorSchema = z.object({
-  resource_id: z.string().optional(),
-  text: z.string().optional(),
-  content_desc: z.string().optional(),
-  class_name: z.string().optional(),
+  resource_id: z.string().min(1).optional(),
+  text: z.string().min(1).optional(),
+  content_desc: z.string().min(1).optional(),
+  class_name: z.string().min(1).optional(),
   exact: z.boolean().optional(),
   index: z.number().int().optional(),
 }).refine(value => ['resource_id', 'text', 'content_desc', 'class_name'].some(field => value[field as keyof typeof value] !== undefined), {
@@ -67,6 +67,7 @@ export const actionSchema = z.enum([
   'scroll_until',
   'wait_for',
   'assert',
+  'extract',
   'sleep',
   'shell',
 ])
@@ -78,6 +79,8 @@ export const stepSchema = z.object({
   target: targetListSchema.optional(),
   with: z.record(z.string(), z.unknown()).optional(),
   expect: expectSchema.optional(),
+  /** Wait after this step, overriding `defaults.settle`. */
+  settle: z.number().int().nonnegative().optional(),
   optional: z.boolean().optional(),
 }).passthrough()
 

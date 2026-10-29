@@ -137,18 +137,25 @@ export function compileTrace(input: string | TraceEvent[], options: CompileTrace
     }
   }
 
+  if (!actionCalls.length)
+    throw new Error('Trace has no successful action calls to compile')
+
   const rawSteps: FlowStep[] = []
+  const compiledCalls: TraceCallEvent[] = []
   for (const [index, call] of actionCalls.entries()) {
     const step = callToStep(call, snapshots, values, warnings)
     if (!step)
       continue
     const intent = call.intent ?? intents.get(call.seq)
     rawSteps.push({ ...step, ...(intent ? { intent } : {}), id: step.id || `step-${index + 1}` })
+    compiledCalls.push(call)
   }
+  if (!rawSteps.length)
+    throw new Error('Trace has no supported successful actions to compile')
   const steps = mergeInputText(rawSteps, values)
   for (const [index, step] of steps.entries()) {
     const next = steps[index + 1]
-    const visible = next?.target?.[0] ?? (index === steps.length - 1 ? lastVisibleSelector(actionCalls[index], snapshots) : undefined)
+    const visible = next?.target?.[0] ?? (index === steps.length - 1 ? lastVisibleSelector(compiledCalls.at(-1), snapshots, calls) : undefined)
     if (visible && !step.expect)
       steps[index] = { ...step, expect: { visible } }
   }
@@ -176,6 +183,13 @@ export function compileTrace(input: string | TraceEvent[], options: CompileTrace
 }
 
 function callToStep(call: TraceCallEvent, snapshots: TraceSnapshots | undefined, values: Record<string, unknown>, warnings: string[]): FlowStep | undefined {
+  const step = actionStep(call, snapshots, values, warnings)
+  // A settle chosen while recording is what the UI needed to become ready; keep it for replay.
+  const settle = call.args?.settle
+  return step && typeof settle === 'number' && settle >= 0 ? { ...step, settle } : step
+}
+
+function actionStep(call: TraceCallEvent, snapshots: TraceSnapshots | undefined, values: Record<string, unknown>, warnings: string[]): FlowStep | undefined {
   const args = call.args ?? {}
   const id = `step-${call.seq}`
   const target = call.target ? targetsFor(call.target, snapshots, call.before?.snapshotId, values, warnings) : undefined
@@ -185,9 +199,9 @@ function callToStep(call: TraceCallEvent, snapshots: TraceSnapshots | undefined,
   switch (call.tool) {
     case 'ui_tap':
     case 'tap':
-      return { id, do: 'tap', ...(target ? { target } : {}) }
+      return { id, do: 'tap', ...(target ? { target } : {}), ...(!target && typeof args.x === 'number' && typeof args.y === 'number' ? { target: [{ point: [args.x, args.y] }] } : {}) }
     case 'long_press':
-      return { id, do: 'long_press', ...(target ? { target } : {}), with: withoutUndefined(withArgs) }
+      return { id, do: 'long_press', ...(target ? { target } : {}), ...(!target && typeof args.x === 'number' && typeof args.y === 'number' ? { target: [{ point: [args.x, args.y] }] } : {}), with: withoutUndefined(withArgs) }
     case 'input_text':
       return { id, do: 'input_text', with: { text: String(args.text ?? '') } }
     case 'key_event':
@@ -264,8 +278,8 @@ function targetIndex(matches: UiNode[], target: TraceTarget): number {
   return matches.findIndex(node => node.bounds.left === bounds[0] && node.bounds.top === bounds[1] && node.bounds.right === bounds[2] && node.bounds.bottom === bounds[3])
 }
 
-function lastVisibleSelector(call: TraceCallEvent | undefined, snapshots: TraceSnapshots | undefined): Target | undefined {
-  const snapshotId = call?.snapshotRef
+function lastVisibleSelector(call: TraceCallEvent | undefined, snapshots: TraceSnapshots | undefined, calls: TraceCallEvent[]): Target | undefined {
+  const snapshotId = call?.snapshotRef ?? calls.find(event => event.seq > (call?.seq ?? -1) && event.kind === 'observe' && event.ok)?.snapshotRef
   const snapshot = snapshotId ? getSnapshot(snapshots, snapshotId) : undefined
   const node = snapshot?.tree.nodes.find(node => node.contentDesc || node.text || node.resourceId)
   if (!node)
@@ -284,13 +298,18 @@ function getSnapshot(snapshots: TraceSnapshots | undefined, id: string): Snapsho
 }
 
 function looksObfuscatedResourceId(value: string): boolean {
-  const suffix = value.split('/').at(-1) ?? value
-  return /^([a-z\d]{2,5})$/i.test(suffix) && !suffix.includes('_') && !suffix.includes('-')
+  const [namespace, suffix = ''] = value.split(':')
+  if (namespace === 'android' || namespace.endsWith('.android') || namespace === 'com.android.systemui')
+    return false
+  return /\d/.test(suffix.split('/').at(-1) ?? suffix) && /^[a-z\d]{2,8}$/i.test(suffix.split('/').at(-1) ?? suffix) && !suffix.includes('_') && !suffix.includes('-')
 }
 
 function parameterize(value: string, values: Record<string, unknown>): string {
   return Object.entries(values)
-    .filter(([, candidate]) => typeof candidate === 'string' && candidate.length > 0)
+    .filter(([, candidate]) =>
+      ['string', 'number', 'boolean'].includes(typeof candidate)
+      && !(typeof candidate === 'string' && candidate.length === 0),
+    )
     .sort((a, b) => String(b[1]).length - String(a[1]).length)
     .reduce((current, [key, candidate]) => current.split(String(candidate)).join(`{{${key}}}`), value)
 }
@@ -310,7 +329,8 @@ function mergeInputText(steps: FlowStep[], vars: Record<string, unknown>): FlowS
     if (previous?.do === 'input_text' && step.do === 'input_text') {
       const a = String(previous.with?.text ?? '')
       const b = String(step.with?.text ?? '')
-      result[result.length - 1] = { ...previous, with: { ...previous.with, text: `${a}${b}` }, intent: previous.intent ?? step.intent }
+      const settle = step.settle ?? previous.settle
+      result[result.length - 1] = { ...previous, with: { ...previous.with, text: `${a}${b}` }, intent: previous.intent ?? step.intent, ...(settle === undefined ? {} : { settle }) }
     }
     else {
       result.push({ ...step, target: step.target?.map(target => mapTarget(target, vars)) })

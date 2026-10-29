@@ -1,4 +1,6 @@
 export * from './compiler.js'
+export * from './extract.js'
 export * from './replayer.js'
 export * from './schema.js'
+export * from './xlsx.js'
 export * from './yaml.js'

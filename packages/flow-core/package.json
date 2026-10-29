@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@escrcpy/flow-device": "workspace:*",
+    "@escrcpy/shared": "workspace:*",
     "yaml": "*",
     "zod": "*"
   },

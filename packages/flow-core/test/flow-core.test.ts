@@ -50,6 +50,7 @@ describe('flow YAML', () => {
     const path = join(dir, 'out.flow.yaml')
     await writeFlow(path, flow)
     expect((await readFile(path, 'utf8')).startsWith('version: 1')).toBe(true)
+    expect(() => parseFlow('version: 1\nname: invalid\nvars: {}\ndefaults: {}\ninterrupts: []\nsteps:\n  - id: tap\n    do: tap\n    target:\n      - text: ""\n')).toThrow()
   })
 })
 
@@ -131,5 +132,134 @@ describe('flow replayer', () => {
     expect(report.steps[0].context?.screenshot).toBeDefined()
     expect(report.steps[0].context?.xml).toBeDefined()
     expect(JSON.parse(await readFile(join(dir, 'report.json'), 'utf8')).status).toBe('failed')
+  })
+
+  it('blocks dangerous shell actions and times out a stuck shell', async () => {
+    const shell = async (_serial: string, command: string): Promise<string> => {
+      if (command === 'reboot')
+        return ''
+      return new Promise(() => {})
+    }
+    const device = { ...fakeDevice([]), shell }
+    const dangerousFlow: FlowScript = { ...baseFlow, vars: {}, steps: [{ id: 'shell', do: 'shell', with: { command: 'reboot' } }] }
+    const dangerous = await replayFlow(dangerousFlow, { serial: 'test', device, settleMs: 0 })
+    expect(dangerous.status).toBe('failed')
+    expect(dangerous.error).toContain('Device reboot')
+
+    const stuckFlow: FlowScript = { ...dangerousFlow, steps: [{ id: 'shell', do: 'shell', with: { command: 'echo ok' } }] }
+    const stuck = await replayFlow(stuckFlow, { serial: 'test', device, shellTimeoutMs: 5, settleMs: 0 })
+    expect(stuck.status).toBe('failed')
+    expect(stuck.error).toContain('shell command timed out')
+  })
+
+  it('reports missing variables and expect capability failures', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'flow-missing-var-'))
+    const missing = await replayFlow({ ...baseFlow, steps: [{ id: 'input', do: 'input_text', with: { text: '{{user}}' } }] }, { serial: 'test', device: fakeDevice([]), reportDir: dir, settleMs: 0 })
+    expect(missing.status).toBe('failed')
+    expect(missing.error).toContain('Missing required flow variable: user')
+    expect(JSON.parse(await readFile(join(dir, 'report.json'), 'utf8')).status).toBe('failed')
+
+    const appFlow: FlowScript = { ...baseFlow, vars: {}, steps: [{ id: 'assert-app', do: 'assert', expect: { app: { package: 'com.example' } } }] }
+    const appReport = await replayFlow(appFlow, { serial: 'test', device: fakeDevice([]), settleMs: 0 })
+    expect(appReport.status).toBe('failed')
+    expect(appReport.error).toContain('foregroundApp capability')
+  })
+
+  it('rejects traces without successful supported actions', () => {
+    const trace = [
+      { type: 'session', id: 'observe-only', name: 'observe', task: 'Inspect', device: { serial: 'test' }, startedAt: 1 },
+      { type: 'call', seq: 1, ts: 2, tool: 'get_screen_state', args: {}, ok: true, kind: 'observe' },
+      { type: 'end', outcome: 'completed', endedAt: 3 },
+    ]
+    expect(() => compileTrace(trace as never)).toThrow('Trace has no successful action calls to compile')
+  })
+
+  it('compiles a coordinate action when no target metadata was recorded', () => {
+    const trace = [
+      { type: 'session', id: 'tr-point', name: 'point', task: 'Tap', device: { serial: 'test' }, startedAt: 1 },
+      { type: 'call', seq: 1, ts: 2, tool: 'tap', args: { x: 0.25, y: 0.75 }, ok: true, kind: 'action' },
+      { type: 'end', outcome: 'completed', endedAt: 3 },
+    ]
+    const result = compileTrace(trace as never)
+    expect(result.flow.steps[0].target).toEqual([{ point: [0.25, 0.75] }])
+  })
+
+  it('keeps a recorded settle as a step override and honors it on replay', async () => {
+    const trace = [
+      { type: 'session', id: 'tr-settle', name: 'settle', task: 'Tap', device: { serial: 'test' }, startedAt: 1 },
+      { type: 'call', seq: 1, ts: 2, tool: 'tap', args: { x: 0.5, y: 0.5, settle: 1500 }, ok: true, kind: 'action' },
+      { type: 'call', seq: 2, ts: 3, tool: 'input_text', args: { text: 'a' }, ok: true, kind: 'action' },
+      { type: 'call', seq: 3, ts: 4, tool: 'input_text', args: { text: 'b', settle: 40 }, ok: true, kind: 'action' },
+      { type: 'end', outcome: 'completed', endedAt: 5 },
+    ]
+    const { flow } = compileTrace(trace as never)
+    expect(flow.steps.map(step => step.settle)).toEqual([1500, 40])
+    expect(flow.steps[1].with?.text).toBe('ab')
+
+    let clock = 0
+    const sleeps: number[] = []
+    const realSetTimeout = globalThis.setTimeout
+    globalThis.setTimeout = ((fn: () => void, ms?: number) => {
+      sleeps.push(ms ?? 0)
+      return realSetTimeout(fn, 0)
+    }) as typeof setTimeout
+    try {
+      await replayFlow({ ...flow, defaults: { settle: 300 } }, { serial: 'test', device: fakeDevice([]), now: () => clock++ })
+    }
+    finally {
+      globalThis.setTimeout = realSetTimeout
+    }
+    expect(sleeps).toEqual([1500, 40])
+  })
+
+  it('keeps short resource ids that contain no obfuscation-looking digits', () => {
+    const target = { ...targetNode, resourceId: 'id/title' }
+    const recorded = { ...snapshot, tree: { ...snapshot.tree, nodes: [target] } }
+    const trace = [
+      { type: 'session', id: 'tr-short-id', name: 'short id', task: 'Tap', device: { serial: 'test' }, startedAt: 1 },
+      { type: 'call', seq: 1, ts: 2, tool: 'ui_tap', args: {}, ok: true, kind: 'action', target: { resourceId: 'id/title', bounds: [0, 0, 100, 100] }, before: { snapshotId: 'snap-1' } },
+      { type: 'end', outcome: 'completed', endedAt: 3 },
+    ]
+    const result = compileTrace(trace as never, { snapshots: { 'snap-1': recorded as never } })
+    expect(result.flow.steps[0].target?.[0]).toEqual({ resource_id: 'id/title' })
+  })
+
+  it('retains framework resource ids and parameterizes numeric variables', () => {
+    const trace = [
+      { type: 'session', id: 'tr-framework', name: 'framework', task: 'Tap {{count}}', vars: { count: 42, empty: '' }, device: { serial: 'test' }, startedAt: 1 },
+      { type: 'call', seq: 1, ts: 2, tool: 'ui_tap', args: {}, ok: true, kind: 'action', target: { resourceId: 'android:id/button1', bounds: [0, 0, 100, 100] }, before: { snapshotId: 'snap-1' } },
+      { type: 'call', seq: 2, ts: 3, tool: 'input_text', args: { text: '42' }, ok: true, kind: 'action' },
+      { type: 'end', outcome: 'completed', endedAt: 4 },
+    ]
+    const frameworkSnapshot = { ...snapshot, tree: { ...snapshot.tree, nodes: [{ ...targetNode, resourceId: 'android:id/button1' }] } }
+    const result = compileTrace(trace as never, { snapshots: { 'snap-1': frameworkSnapshot as never } })
+    expect(result.flow.steps[0].target?.[0]).toEqual({ resource_id: 'android:id/button1' })
+    expect(result.flow.steps[1].with?.text).toBe('{{count}}')
+    expect(result.flow.vars).toEqual({ count: { required: true }, empty: { required: true } })
+  })
+
+  it('does not silently skip wait_for or empty assert steps', async () => {
+    const device = fakeDevice([true])
+    const waitFlow: FlowScript = {
+      version: 1,
+      name: 'wait',
+      vars: {},
+      defaults: { timeout: 1, settle: 0, pollInterval: 0 },
+      interrupts: [],
+      steps: [{ id: 'wait', do: 'wait_for' }],
+    }
+    const waitReport = await replayFlow(waitFlow, { serial: 'test', device, timeoutMs: 1, settleMs: 0, pollIntervalMs: 0 })
+    expect(waitReport.status).toBe('failed')
+    expect(waitReport.error).toContain('wait_for requires a target')
+
+    const assertFlow: FlowScript = { ...waitFlow, name: 'assert', steps: [{ id: 'assert', do: 'assert' }] }
+    const assertReport = await replayFlow(assertFlow, { serial: 'test', device, settleMs: 0 })
+    expect(assertReport.status).toBe('failed')
+    expect(assertReport.error).toContain('assert requires a target or expect')
+
+    const scrollFlow: FlowScript = { ...waitFlow, name: 'scroll', steps: [{ id: 'scroll', do: 'scroll', target: [{ content_desc: 'Settings', exact: true }] }] }
+    const scrollReport = await replayFlow(scrollFlow, { serial: 'test', device, settleMs: 0 })
+    expect(scrollReport.status).toBe('failed')
+    expect(scrollReport.error).toContain('scroll is not implemented in M2')
   })
 })

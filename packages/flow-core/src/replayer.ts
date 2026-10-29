@@ -1,7 +1,12 @@
 import { mkdir, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+import { withTimeout } from '@escrcpy/flow-device'
+import { shellEscape, validateShellCommand } from '@escrcpy/shared'
 import type { FlowDevice, RatioPoint, Selector } from '@escrcpy/flow-device'
+import { extractRows } from './extract.js'
+import type { ExtractedRow, ExtractSpec } from './extract.js'
 import { isImageTarget, isPointTarget, isSelectorTarget } from './schema.js'
+import { writeXlsx } from './xlsx.js'
 import type { FlowInterrupt, FlowScript, FlowStep, Target } from './schema.js'
 
 export interface ReplayDevice {
@@ -23,7 +28,10 @@ export interface ReplayOptions {
   timeoutMs?: number
   settleMs?: number
   pollIntervalMs?: number
+  shellTimeoutMs?: number
   reportDir?: string
+  /** Where `extract` steps write their `output` files. Defaults to `reportDir`. */
+  outputDir?: string
   now?: () => number
   device: ReplayDevice
 }
@@ -42,6 +50,12 @@ export interface StepReport {
   context?: { screenshot?: string, xml?: string }
 }
 
+export interface StepOutput {
+  rows: ExtractedRow[]
+  /** Path of the file written by the step's `output`, when one was requested. */
+  file?: string
+}
+
 export interface RunReport {
   version: 1
   flow: string
@@ -51,6 +65,8 @@ export interface RunReport {
   endedAt: number
   durationMs: number
   steps: StepReport[]
+  /** Data produced by `extract` steps, keyed by step id. */
+  outputs?: Record<string, StepOutput>
   error?: string
 }
 
@@ -64,7 +80,6 @@ export class ReplayError extends Error {
 export async function replayFlow(flow: FlowScript, options: ReplayOptions): Promise<RunReport> {
   const now = options.now ?? Date.now
   const startedAt = now()
-  const values = resolveVars(flow, options.vars ?? {})
   const runtimeOptions: ReplayOptions = {
     ...options,
     timeoutMs: options.timeoutMs ?? flow.defaults.timeout ?? 8_000,
@@ -82,6 +97,7 @@ export async function replayFlow(flow: FlowScript, options: ReplayOptions): Prom
     steps: [],
   }
   try {
+    const values = resolveVars(flow, options.vars ?? {})
     for (const step of flow.steps) {
       const started = now()
       const stepReport: StepReport = { id: step.id, status: 'passed', durationMs: 0, drift: false, interrupts: 0 }
@@ -92,7 +108,9 @@ export async function replayFlow(flow: FlowScript, options: ReplayOptions): Prom
           stepReport.drift = result.locatorIndex > 1
         }
         stepReport.interrupts = result.interrupts
-        await settle(runtimeOptions.settleMs!)
+        if (result.output)
+          (report.outputs ??= {})[step.id] = result.output
+        await settle(step.settle ?? runtimeOptions.settleMs!)
         if (step.expect)
           await assertExpect(step.expect, runtimeOptions.device, runtimeOptions.serial, values, runtimeOptions, now)
       }
@@ -126,6 +144,7 @@ export const runFlow = replayFlow
 interface ExecutionResult {
   locatorIndex?: number
   interrupts: number
+  output?: StepOutput
 }
 
 async function executeStep(flow: FlowScript, step: FlowStep, device: ReplayDevice, serial: string, values: Record<string, unknown>, options: ReplayOptions, now: () => number): Promise<ExecutionResult> {
@@ -143,8 +162,8 @@ async function executeStep(flow: FlowScript, step: FlowStep, device: ReplayDevic
       resolved = await resolveTarget(step.target, device, serial, values, options, now)
     }
   }
-  await perform(step, resolved, device, serial, values, options)
-  return { locatorIndex: resolved?.index, interrupts }
+  const output = await perform(step, resolved, device, serial, values, options)
+  return { locatorIndex: resolved?.index, interrupts, ...(output ? { output } : {}) }
 }
 
 interface ResolvedTarget {
@@ -166,7 +185,7 @@ async function resolveTarget(targets: Target[], device: ReplayDevice, serial: st
         return { target, index: index + 1 }
       const elapsedMs = now() - started
       const remaining = Math.max(0, timeoutMs - elapsedMs)
-      const result = await device.waitFor(serial, target, { timeoutMs: Math.min(remaining, options.pollIntervalMs ?? 500), intervalMs: 0 })
+      const result = await device.waitFor(serial, target, { timeoutMs: remaining, intervalMs: 0 })
       if (result.found)
         return { target, index: index + 1, result }
       lastError = `Target ${index + 1} did not match within ${timeoutMs}ms`
@@ -178,9 +197,11 @@ async function resolveTarget(targets: Target[], device: ReplayDevice, serial: st
   }
 }
 
-async function perform(step: FlowStep, resolved: ResolvedTarget | undefined, device: ReplayDevice, serial: string, values: Record<string, unknown>, options: ReplayOptions): Promise<void> {
+async function perform(step: FlowStep, resolved: ResolvedTarget | undefined, device: ReplayDevice, serial: string, values: Record<string, unknown>, options: ReplayOptions): Promise<StepOutput | void> {
   const args = renderValue(step.with ?? {}, values) as Record<string, unknown>
   switch (step.do) {
+    case 'extract':
+      return performExtract(args, device, serial, options)
     case 'tap':
       if (!resolved)
         throw new ReplayError('tap requires target')
@@ -213,37 +234,72 @@ async function perform(step: FlowStep, resolved: ResolvedTarget | undefined, dev
       return
     }
     case 'wait_for':
+      if (!resolved)
+        throw new ReplayError('wait_for requires a target')
       return
     case 'sleep':
       await settle(numberArg(args.duration_ms) ?? numberArg(args.ms) ?? 0)
       return
     case 'app_start':
       if (args.restart)
-        await shellCommand(device, serial, `am force-stop ${quote(String(args.package ?? ''))}`)
+        await shellCommand(device, serial, `am force-stop ${quote(String(args.package ?? ''))}`, options.shellTimeoutMs)
       if (args.activity)
-        await shellCommand(device, serial, `am start -n ${quote(`${args.package}/${args.activity}`)}`)
+        await shellCommand(device, serial, `am start -n ${quote(`${args.package}/${args.activity}`)}`, options.shellTimeoutMs)
       else
-        await shellCommand(device, serial, `monkey -p ${quote(String(args.package ?? ''))} -c android.intent.category.LAUNCHER 1`)
+        await shellCommand(device, serial, `monkey -p ${quote(String(args.package ?? ''))} -c android.intent.category.LAUNCHER 1`, options.shellTimeoutMs)
       return
     case 'app_stop':
-      await shellCommand(device, serial, `am force-stop ${quote(String(args.package ?? ''))}`)
+      await shellCommand(device, serial, `am force-stop ${quote(String(args.package ?? ''))}`, options.shellTimeoutMs)
       return
     case 'open_url':
-      await shellCommand(device, serial, `am start -a android.intent.action.VIEW -d ${quote(String(args.url ?? ''))}`)
+      await shellCommand(device, serial, `am start -a android.intent.action.VIEW -d ${quote(String(args.url ?? ''))}`, options.shellTimeoutMs)
       return
     case 'shell':
-      await shellCommand(device, serial, String(args.command ?? ''))
+      await shellCommand(device, serial, String(args.command ?? ''), options.shellTimeoutMs)
       return
     case 'scroll_until':
     case 'scroll':
-      if (resolved)
-        return
-      throw new ReplayError(`${step.do} requires a target in M2`)
+      throw new ReplayError(`${step.do} is not implemented in M2`)
     case 'assert':
+      if (!step.target && !step.expect)
+        throw new ReplayError('assert requires a target or expect')
       return
     default:
       throw new ReplayError(`Unsupported flow action: ${step.do}`)
   }
+}
+
+async function performExtract(args: Record<string, unknown>, device: ReplayDevice, serial: string, options: ReplayOptions): Promise<StepOutput> {
+  if (!device.snapshot)
+    throw new ReplayError('extract requires the replay device snapshot capability')
+  if (!args.columns || typeof args.columns !== 'object')
+    throw new ReplayError('extract requires with.columns')
+  const snapshot = await device.snapshot(serial)
+  let rows: ExtractedRow[]
+  try {
+    rows = extractRows(snapshot.tree, args as unknown as ExtractSpec)
+  }
+  catch (error) {
+    throw new ReplayError(error instanceof Error ? error.message : String(error))
+  }
+  const output: StepOutput = { rows }
+  if (typeof args.output === 'string' && args.output) {
+    const baseDir = resolve(options.outputDir ?? options.reportDir ?? '.')
+    const file = resolve(baseDir, args.output)
+    const rel = relative(baseDir, file)
+    if (rel.startsWith('..') || isAbsolute(rel))
+      throw new ReplayError(`extract output must stay inside ${baseDir}`, { output: args.output })
+    const columns = Object.keys(args.columns as object).map(key => ({ key }))
+    if (file.toLowerCase().endsWith('.xlsx')) {
+      await writeXlsx(file, columns, rows, typeof args.sheet === 'string' ? args.sheet : undefined)
+    }
+    else {
+      await mkdir(dirname(file), { recursive: true })
+      await writeFile(file, `${JSON.stringify(rows, null, 2)}\n`, 'utf8')
+    }
+    output.file = file
+  }
+  return output
 }
 
 async function assertExpect(expect: NonNullable<FlowStep['expect']>, device: ReplayDevice, serial: string, values: Record<string, unknown>, options: ReplayOptions, now: () => number): Promise<void> {
@@ -251,7 +307,9 @@ async function assertExpect(expect: NonNullable<FlowStep['expect']>, device: Rep
     const targets = Array.isArray(expect.visible) ? expect.visible : [expect.visible]
     await resolveTarget(targets, device, serial, values, options, now)
   }
-  if (expect.app && device.foregroundApp) {
+  if (expect.app) {
+    if (!device.foregroundApp)
+      throw new ReplayError('Expected app assertion requires foregroundApp capability')
     const app = await device.foregroundApp(serial)
     if (!app || app.package !== expect.app.package || (expect.app.activity && app.activity !== expect.app.activity))
       throw new ReplayError(`Expected app ${expect.app.package}, got ${app?.package ?? 'none'}`)
@@ -292,10 +350,18 @@ async function probeTarget(targets: Target[], device: ReplayDevice, serial: stri
   return false
 }
 
-async function shellCommand(device: ReplayDevice, serial: string, command: string): Promise<void> {
+async function shellCommand(device: ReplayDevice, serial: string, command: string, timeoutMs = 15_000): Promise<void> {
   if (!device.shell)
     throw new ReplayError('This flow action requires the replay device shell capability')
-  await device.shell(serial, command)
+  try {
+    validateShellCommand(command)
+    await withTimeout(device.shell(serial, command), timeoutMs, 'shell command')
+  }
+  catch (error) {
+    if (error instanceof ReplayError)
+      throw error
+    throw new ReplayError(error instanceof Error ? error.message : String(error), { command })
+  }
 }
 
 function resolveVars(flow: FlowScript, supplied: Record<string, unknown>): Record<string, unknown> {
@@ -341,13 +407,7 @@ function numberArg(value: unknown): number | undefined {
 }
 
 function quote(value: string): string {
-  const escaped = value
-    .replaceAll('\\', '\\\\')
-    .replaceAll('`', '\\`')
-    .replaceAll('"', '\\"')
-    .replaceAll('$', '\\$')
-    .replaceAll('\'', '\'\\\'\'')
-  return `'${escaped}'`
+  return `'${shellEscape(value)}'`
 }
 
 async function saveContext(options: ReplayOptions, id: string, index: number): Promise<StepReport['context']> {
