@@ -177,23 +177,48 @@ export interface HealLlmEnv {
   FLOW_LLM_BASE_URL?: string
   FLOW_LLM_API_KEY?: string
   FLOW_LLM_MODEL?: string
-  /** `messages` (Anthropic style, default) or `responses` (OpenAI Responses style). */
+  /** `messages` (Anthropic style, default), `responses` (OpenAI Responses) or `chat_completions` (OpenAI Chat). */
   FLOW_LLM_API_TYPE?: string
 }
 
-/** Reads the `FLOW_LLM_*` env vars; undefined means healing has no model configured. */
-export function createEnvLlmClient(env: HealLlmEnv = process.env): HealLlmClient | undefined {
-  const baseUrl = env.FLOW_LLM_BASE_URL?.trim().replace(/\/+$/, '')
-  const apiKey = env.FLOW_LLM_API_KEY?.trim()
-  const model = env.FLOW_LLM_MODEL?.trim()
+export type LlmApiType = 'messages' | 'responses' | 'chat_completions'
+
+/** Accepts the common spellings gateways and UIs use for the same wire format. */
+export function normalizeLlmApiType(value: string | undefined): LlmApiType {
+  const type = value?.trim().toLowerCase()
+  if (type === 'responses')
+    return 'responses'
+  if (type === 'chat_completions' || type === 'chat-completions' || type === 'chat')
+    return 'chat_completions'
+  return 'messages'
+}
+
+/** One model endpoint, e.g. one row of the UI provider list. */
+export interface HealLlmEndpoint {
+  baseUrl: string
+  apiKey: string
+  model: string
+  /** See `normalizeLlmApiType`; defaults to `messages`. */
+  apiType?: string
+}
+
+/** Builds a heal client for an explicit endpoint; undefined when the endpoint is incomplete. */
+export function createLlmClient(endpoint: HealLlmEndpoint): HealLlmClient | undefined {
+  const baseUrl = endpoint.baseUrl?.trim().replace(/\/+$/, '')
+  const apiKey = endpoint.apiKey?.trim()
+  const model = endpoint.model?.trim()
   if (!baseUrl || !apiKey || !model)
     return undefined
-  const apiType = env.FLOW_LLM_API_TYPE === 'responses' ? 'responses' : 'messages'
+  const apiType = normalizeLlmApiType(endpoint.apiType)
   return {
     async complete(prompt) {
+      // Reasoning models can burn ~1k tokens thinking before the JSON decision lands.
+      const messagesBody = JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'user', content: prompt }] })
       const request = apiType === 'responses'
         ? { url: `${baseUrl}/v1/responses`, body: JSON.stringify({ model, input: prompt }) }
-        : { url: `${baseUrl}/v1/messages`, body: JSON.stringify({ model, max_tokens: 1024, messages: [{ role: 'user', content: prompt }] }) }
+        : apiType === 'chat_completions'
+          ? { url: `${baseUrl}/v1/chat/completions`, body: messagesBody }
+          : { url: `${baseUrl}/v1/messages`, body: messagesBody }
       let response: Response
       try {
         response = await fetch(request.url, {
@@ -214,10 +239,20 @@ export function createEnvLlmClient(env: HealLlmEnv = process.env): HealLlmClient
         throw new HealError(`LLM request returned ${response.status}: ${detail.slice(0, 200)}`, { url: request.url, status: response.status })
       }
       const data: unknown = await response.json()
-      const text = apiType === 'responses' ? responsesText(data) : messagesText(data)
+      const text = apiType === 'responses' ? responsesText(data) : apiType === 'chat_completions' ? chatText(data) : messagesText(data)
       return parseHealDecision(text)
     },
   }
+}
+
+/** Reads the `FLOW_LLM_*` env vars; undefined means healing has no model configured. */
+export function createEnvLlmClient(env: HealLlmEnv = process.env): HealLlmClient | undefined {
+  return createLlmClient({
+    baseUrl: env.FLOW_LLM_BASE_URL,
+    apiKey: env.FLOW_LLM_API_KEY,
+    model: env.FLOW_LLM_MODEL,
+    apiType: env.FLOW_LLM_API_TYPE,
+  })
 }
 
 /** Parses `{action, reason}` from model output, tolerating code fences and stray prose around the JSON. */
@@ -272,6 +307,30 @@ function messagesText(data: unknown): string {
   if (!text)
     throw new HealError('LLM messages response has no text content')
   return text
+}
+
+function chatText(data: unknown): string {
+  const choices = (data as { choices?: unknown }).choices
+  const message = Array.isArray(choices) ? (choices[0] as { message?: unknown } | undefined)?.message : undefined
+  const record = (message ?? {}) as { content?: unknown, reasoning_content?: unknown }
+  const text = textFromContent(record.content)
+  if (text)
+    return text
+  // Reasoning models can burn the whole budget before writing `content`; some emit the answer only in reasoning_content.
+  const reasoning = typeof record.reasoning_content === 'string' ? record.reasoning_content : ''
+  if (reasoning)
+    return reasoning
+  throw new HealError('LLM chat response has no text content')
+}
+
+function textFromContent(content: unknown): string {
+  if (typeof content === 'string')
+    return content
+  if (Array.isArray(content)) {
+    const parts = content.map(item => (item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string' ? (item as { text: string }).text : ''))
+    return parts.join('')
+  }
+  return ''
 }
 
 function responsesText(data: unknown): string {

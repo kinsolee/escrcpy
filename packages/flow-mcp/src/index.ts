@@ -11,6 +11,7 @@ import {
 
 } from '@escrcpy/flow-device'
 import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
+import { llmConfigPath, loadLlmConfig, saveLlmConfig } from '@escrcpy/flow-core'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
@@ -209,6 +210,34 @@ function registerFlowTools(flow: FlowMcpServer): void {
         throw new Error('Lease is unavailable; provide a lease')
       return context.lease.release(serial)
     }, { serial })
+  })
+
+  // LLM config is shared state for every flow consumer (desktop dialog, CLI, MCP),
+  // so unlike the decompiled Copilot it stays reachable from the agent side. Keys are masked.
+  registerTool(flow, 'llm_config_get', 'Read the shared self-heal LLM config (vendors and active model; API keys are masked).', {}, async () => {
+    const config = loadLlmConfig()
+    return ok({
+      active: config?.active,
+      vendors: (config?.vendors ?? []).map(vendor => ({
+        id: vendor.id,
+        name: vendor.name,
+        baseUrl: vendor.baseUrl,
+        apiType: vendor.apiType ?? 'messages',
+        apiKey: vendor.apiKey ? `${vendor.apiKey.slice(0, 4)}***` : '',
+        models: vendor.models.map(model => model.id),
+      })),
+      path: llmConfigPath(),
+    })
+  })
+
+  registerTool(flow, 'llm_config_set_active', 'Switch the active self-heal model to <vendorId>::<modelId>.', { active: z.string().describe('vendorId::modelId, e.g. magpie::claude/claude-sonnet-5-5') }, async (args) => {
+    const [vendorId, model] = args.active.split('::')
+    const config = loadLlmConfig() ?? { vendors: [] }
+    if (!config.vendors.some(vendor => vendor.id === vendorId && vendor.models.some(item => item.id === model)))
+      throw new Error(`unknown vendor/model: ${args.active}; call llm_config_get for the list`)
+    config.active = args.active
+    const path = saveLlmConfig(config)
+    return ok({ active: args.active, path })
   })
 
   registerTool(flow, 'device_info', 'Return device identity and screen information.', { serial: selectorShape.serial }, async (args) => {

@@ -1,6 +1,7 @@
 export * from './compiler.js'
 export * from './extract.js'
 export * from './heal.js'
+export * from './llm-config.js'
 export * from './replayer.js'
 export * from './schema.js'
 export * from './xlsx.js'

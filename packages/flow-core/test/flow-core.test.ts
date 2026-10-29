@@ -4,7 +4,8 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { applyPatch, compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, writeFlow } from '../src/index.js'
 import type { HealLlmClient } from '../src/heal.js'
-import { parseHealDecision } from '../src/heal.js'
+import { createLlmClient, normalizeLlmApiType, parseHealDecision } from '../src/heal.js'
+import { loadLlmConfig, resolveLlm, saveLlmConfig } from '../src/llm-config.js'
 import type { ReplayDevice } from '../src/replayer.js'
 import type { FlowScript } from '../src/schema.js'
 
@@ -574,5 +575,69 @@ describe('flow self-heal', () => {
     const healed = await applyPatch(flowPath, patchPath)
     expect(healed.steps.map(step => step.id)).toEqual(['heal-1', 'open', 'after'])
     expect(await readFile(flowPath, 'utf8')).toContain('id: open')
+  })
+})
+
+describe('llm client and shared config', () => {
+  it('normalizes api type spellings', () => {
+    expect(normalizeLlmApiType(undefined)).toBe('messages')
+    expect(normalizeLlmApiType('responses')).toBe('responses')
+    expect(normalizeLlmApiType('chat_completions')).toBe('chat_completions')
+    expect(normalizeLlmApiType('chat-completions')).toBe('chat_completions')
+    expect(normalizeLlmApiType('CHAT')).toBe('chat_completions')
+  })
+
+  it('createLlmClient posts chat_completions and parses the choice content', async () => {
+    const originalFetch = globalThis.fetch
+    const seen: Array<{ url: string, body: { model?: string, messages?: Array<{ role?: string }> }, init: RequestInit }> = []
+    globalThis.fetch = (async (url, init) => {
+      seen.push({ url: String(url), body: JSON.parse(String(init?.body)), init: init! })
+      const content = '模型回复 ```json\n{"action":{"tool":"key","with":{"key":"BACK"}},"reason":"关弹窗"}\n```'
+      return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] }), { status: 200 })
+    }) as typeof fetch
+    try {
+      const client = createLlmClient({ baseUrl: 'http://gateway.test/', apiKey: 'k', model: 'm1', apiType: 'chat' })
+      const decision = await client!.complete('prompt')
+      expect(decision.action).toMatchObject({ tool: 'key', with: { key: 'BACK' } })
+      expect(decision.reason).toBe('关弹窗')
+      expect(seen[0].url).toBe('http://gateway.test/v1/chat/completions')
+      expect(seen[0].body.model).toBe('m1')
+      expect(seen[0].body.messages?.[0]?.role).toBe('user')
+    }
+    finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('falls back to reasoning_content when a reasoning model exhausts content', async () => {
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      choices: [{ message: { role: 'assistant', content: null, reasoning_content: '{"action":{"tool":"wait_for","target":[{"text":"Settings"}]},"reason":"等一下"}' } }],
+    }), { status: 200 })) as typeof fetch
+    try {
+      const client = createLlmClient({ baseUrl: 'http://gateway.test', apiKey: 'k', model: 'm1', apiType: 'chat_completions' })
+      const decision = await client!.complete('prompt')
+      expect(decision.action).toMatchObject({ tool: 'wait_for', target: [{ text: 'Settings' }] })
+    }
+    finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('saves a config file and resolves the active vendor model from it', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'llm-config-'))
+    const file = join(dir, 'llm.json')
+    saveLlmConfig({
+      active: 'magpie::claude/claude-sonnet-5-5',
+      vendors: [{ id: 'magpie', name: 'Magpie', baseUrl: 'http://127.0.0.1:3425', apiKey: 'magpie', apiType: 'messages', models: [{ id: 'claude/claude-sonnet-5-5', vision: true }] }],
+    }, file)
+    const config = loadLlmConfig(file)
+    expect(config?.vendors[0]?.models[0]?.vision).toBe(true)
+    const resolved = resolveLlm(config)
+    expect(resolved?.vendor.id).toBe('magpie')
+    expect(resolved?.model).toBe('claude/claude-sonnet-5-5')
+    expect(resolved?.client).toBeDefined()
+    expect(resolveLlm({ active: 'ghost::m', vendors: [] })).toBeUndefined()
+    expect(resolveLlm({ active: undefined, vendors: [] })).toBeUndefined()
   })
 })

@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util'
 import adbkit from '@devicefarmer/adbkit'
 import { createAdbx } from '@escrcpy/adbx'
 import type { FlowScript, FlowStep, HealLlmClient, RunReport, Target } from '@escrcpy/flow-core'
-import { applyPatch, compileTraceFile, createEnvLlmClient, readFlow, readTrace, replayFlow, writeFlow } from '@escrcpy/flow-core'
+import { applyPatch, compileTraceFile, createEnvLlmClient, loadLlmConfig, readFlow, readTrace, replayFlow, resolveLlm, writeFlow } from '@escrcpy/flow-core'
 import { startFlowMcpServer } from '@escrcpy/flow-mcp'
 import type { Selector, UiElement } from '@escrcpy/flow-device'
 import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError } from '@escrcpy/flow-device'
@@ -68,8 +68,9 @@ Environment:
   YADB_PATH        yadb binary, enables faster dumps and Unicode input
   ANDROID_SERIAL   default Android device serial
   FLOW_TRACE_DIR   trace directory used by flow mcp automatic recording
-  FLOW_LLM_BASE_URL / FLOW_LLM_API_KEY / FLOW_LLM_MODEL   LLM endpoint for self-heal
-  FLOW_LLM_API_TYPE  messages (default) or responses, matching the LLM endpoint style
+  FLOW_LLM_CONFIG  Path to the shared LLM config (default ~/.escrcpy/flow/llm.json, the desktop AI-model dialog)
+  FLOW_LLM_BASE_URL / FLOW_LLM_API_KEY / FLOW_LLM_MODEL   Fallback LLM endpoint when the config has none
+  FLOW_LLM_API_TYPE  messages (default), responses or chat_completions, matching the LLM endpoint style
 `
 
 interface CliValues {
@@ -318,11 +319,14 @@ export async function withDeviceLease<T>(serial: string, values: CliValues, run:
   }
 }
 
-/** Self-heal needs a model; point at the FLOW_LLM_* env vars instead of guessing a provider. */
+/** Self-heal needs a model: the shared llm.json (the desktop AI-model dialog writes it) wins; FLOW_LLM_* env is the fallback. */
 function requireHealClient(): HealLlmClient {
+  const fromConfig = resolveLlm(loadLlmConfig())
+  if (fromConfig)
+    return fromConfig.client
   const client = createEnvLlmClient(process.env)
   if (!client)
-    throw new Error('self-heal needs an LLM: set FLOW_LLM_BASE_URL, FLOW_LLM_API_KEY and FLOW_LLM_MODEL (and optionally FLOW_LLM_API_TYPE=responses)')
+    throw new Error('self-heal needs an LLM: pick a vendor + model in the desktop AI-model dialog (~/.escrcpy/flow/llm.json), or set FLOW_LLM_BASE_URL, FLOW_LLM_API_KEY and FLOW_LLM_MODEL (FLOW_LLM_API_TYPE=messages|responses|chat_completions)')
   return client
 }
 
