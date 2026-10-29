@@ -40,6 +40,7 @@ import {
 import {
   controlModule,
   explorerModule,
+  flowModule,
   mainModule,
   terminalModule,
 } from './modules/index.js'
@@ -78,6 +79,7 @@ mainApp.use(shortcutsService)
 
 mainApp.use(controlModule)
 mainApp.use(explorerModule)
+mainApp.use(flowModule)
 mainApp.use(terminalModule)
 
 app.whenReady().then(() => {

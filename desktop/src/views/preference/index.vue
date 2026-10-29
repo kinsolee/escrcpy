@@ -11,6 +11,8 @@
         />
       </div>
       <el-button-group class="flex-none">
+        <el-button :title="$t('flow.llm.dialog.title')" icon="MagicStick" plain @click="llmVisible = true">
+        </el-button>
         <el-button :title="$t('common.import')" icon="Upload" plain @click="handleImport">
         </el-button>
         <el-button :title="$t('common.export')" icon="Download" plain @click="handleExport">
@@ -31,6 +33,8 @@
       >
       </PreferenceForm>
     </div>
+
+    <LlmConfig v-model="llmVisible" />
   </div>
 </template>
 
@@ -38,12 +42,15 @@
 import { debounce } from 'lodash-es'
 
 import PreferenceForm from '$/components/preference-form/index.vue'
+import LlmConfig from './components/llm-config/index.vue'
 import ScopeSelect from './components/scope-select/index.vue'
 
 const preferenceStore = usePreferenceStore()
 const themeStore = useThemeStore()
 
 const configFile = useConfigFile()
+
+const llmVisible = ref(false)
 
 const preferenceData = computed({
   get() {

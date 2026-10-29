@@ -30,6 +30,7 @@
     "@escrcpy/adbx": "workspace:*",
     "@escrcpy/electron-ipcx": "workspace:*",
     "@escrcpy/electron-setup": "workspace:*",
+    "@escrcpy/flow-core": "workspace:*",
     "@escrcpy/shared": "workspace:*",
     "@escrcpy/unocss-preset-shades": "workspace:*",
     "@floating-ui/dom": "1.7.6",
