@@ -150,6 +150,18 @@ describe('tap', () => {
     expect(inputs(calls)).toEqual([['tap', 1200, 540]])
   })
 
+  it('swaps width and height after an external rotation invalidates the size cache', async () => {
+    const { backend, calls, raw } = fakeBackend([SETTINGS])
+    const orientation = vi.fn(async () => 0)
+    ;(backend.deviceInfo.getOrientation as any) = orientation
+    const device = createFlowDevice({ adbx: backend })
+    await device.tap(SERIAL, { x: 0.5, y: 0.5 })
+    orientation.mockResolvedValue(1)
+    await device.tap(SERIAL, { x: 0.5, y: 0.5 })
+    expect(inputs(calls)).toEqual([['tap', 540, 1200], ['tap', 1200, 540]])
+    expect(raw.deviceInfo.getScreenSize).toHaveBeenCalledTimes(2)
+  })
+
   it('rejects ratio points outside 0~1', async () => {
     const { backend } = fakeBackend([SETTINGS])
     const device = createFlowDevice({ adbx: backend })
@@ -186,6 +198,31 @@ describe('other gestures', () => {
     await expect(device.key(SERIAL, 'nope')).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
   })
 
+  it('keeps a timed out input in the device queue until its backend promise settles', async () => {
+    const { backend, calls, raw } = fakeBackend([SETTINGS])
+    let release!: () => void
+    let first = true
+    raw.input.key.mockImplementation((_serial, code) => {
+      calls.push(['key', code])
+      if (first) {
+        first = false
+        return new Promise((resolve) => {
+          release = () => resolve(undefined)
+        })
+      }
+      return Promise.resolve(undefined)
+    })
+    const device = createFlowDevice({ adbx: backend, inputTimeoutMs: 20 })
+    const firstRequest = device.key(SERIAL, 'HOME')
+    await expect(firstRequest).rejects.toThrow(/key event timed out/)
+    const second = device.key(SERIAL, 'BACK')
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(inputs(calls)).toEqual([['key', 3]])
+    release()
+    await second
+    expect(inputs(calls)).toEqual([['key', 3], ['key', 4]])
+  })
+
   it('times out a stuck input command and still invalidates snapshots', async () => {
     const { backend, raw } = fakeBackend([SETTINGS])
     raw.input.key.mockImplementation(() => new Promise(() => {}))
@@ -214,6 +251,16 @@ describe('waitFor', () => {
     expect(result.found).toBe(false)
     expect(result.attempts).toBeGreaterThanOrEqual(2)
     expect(result.snapshot.tree.nodes.length).toBe(49)
+  })
+
+  it('keeps polling through a failed dump and throws only if none ever succeeds', async () => {
+    const flaky = fakeBackend([...Array.from({ length: 3 }, () => new Error('could not get idle state')), SETTINGS])
+    const result = await createFlowDevice({ adbx: flaky.backend }).waitFor(SERIAL, { text: '连接' }, { timeoutMs: 2000, intervalMs: 10 })
+    expect(result.found).toBe(true)
+    expect(result.attempts).toBe(2)
+
+    const broken = fakeBackend([new Error('could not get idle state')])
+    await expect(createFlowDevice({ adbx: broken.backend }).waitFor(SERIAL, { text: 'x' }, { timeoutMs: 40, intervalMs: 10 })).rejects.toThrow(/idle state|dump|timed out/)
   })
 })
 

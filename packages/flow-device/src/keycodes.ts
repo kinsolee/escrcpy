@@ -61,8 +61,12 @@ export function resolveKeyCode(key: number | string): number {
     throw new RangeError(`Invalid key code: ${key}`)
   }
   const trimmed = key.trim()
-  if (/^\d+$/.test(trimmed))
-    return Number(trimmed)
+  if (/^\d+$/.test(trimmed)) {
+    const code = Number(trimmed)
+    if (Number.isSafeInteger(code))
+      return code
+    throw new RangeError(`Invalid key code: ${key}`)
+  }
   const name = trimmed.toUpperCase().replace(/^KEYCODE_/, '')
   const code = KEYCODES[ALIASES[name] ?? name]
   if (code === undefined)

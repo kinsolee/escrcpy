@@ -168,7 +168,7 @@ export function createAdbx(options: AdbxOptions) {
           await shell(serial, `rm -f ${remotePath}`).catch(() => {})
           return xml
         }
-        const raw = await shell(serial, 'uiautomator dump /dev/tty')
+        const raw = await shell(serial, 'uiautomator dump --compressed /sdcard/escrcpy-window.xml >/dev/null 2>&1 && cat /sdcard/escrcpy-window.xml; rm -f /sdcard/escrcpy-window.xml')
         const xmlMatch = raw.match(/(<hierarchy[\s\S]*?<\/hierarchy>)/i)
         return xmlMatch ? xmlMatch[1] : raw
       },

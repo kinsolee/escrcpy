@@ -107,7 +107,7 @@ export function createFlowDevice(options: FlowDeviceOptions) {
     ? options.snapshots
     : new SnapshotStore(options.snapshots)
   const queue = new KeyedQueue()
-  const sizeCache = new Map<string, { size: Size, at: number }>()
+  const sizeCache = new Map<string, { size: Size, orientation: number, at: number }>()
 
   async function dumpXml(serial: string): Promise<string> {
     let lastError: unknown
@@ -130,7 +130,7 @@ export function createFlowDevice(options: FlowDeviceOptions) {
   }
 
   async function foregroundApp(serial: string): Promise<ForegroundApp | undefined> {
-    const output = await adbx.shell(serial, 'dumpsys activity activities | grep -E "topResumedActivity|mResumedActivity"')
+    const output = await withTimeout(adbx.shell(serial, 'dumpsys activity activities | grep -E "topResumedActivity|mResumedActivity"'), dumpTimeoutMs, 'foreground app lookup')
     return parseForegroundApp(output)
   }
 
@@ -143,7 +143,7 @@ export function createFlowDevice(options: FlowDeviceOptions) {
     ])
     const tree = parseUiTree(xml)
     if (tree.size.width > 0 && tree.size.height > 0)
-      sizeCache.set(serial, { size: tree.size, at: Date.now() })
+      sizeCache.set(serial, { size: tree.size, orientation: tree.rotation, at: Date.now() })
     return snapshots.add(serial, { tree, xml, app, dumpMs: Date.now() - started })
   }
 
@@ -160,20 +160,20 @@ export function createFlowDevice(options: FlowDeviceOptions) {
 
   /** Current screen size in device pixels, honouring rotation. */
   async function screenSize(serial: string): Promise<Size> {
+    const orientation = await adbx.deviceInfo.getOrientation(serial)
     const cached = sizeCache.get(serial)
-    if (cached && Date.now() - cached.at < 10_000)
+    if (cached && cached.orientation === orientation && Date.now() - cached.at < 10_000)
       return cached.size
     const latest = snapshots.latest(serial)
-    if (latest && latest.tree.size.width > 0)
+    if (latest && latest.tree.size.width > 0 && latest.tree.rotation === orientation) {
+      sizeCache.set(serial, { size: latest.tree.size, orientation, at: Date.now() })
       return latest.tree.size
-    const [physical, orientation] = await Promise.all([
-      adbx.deviceInfo.getScreenSize(serial),
-      adbx.deviceInfo.getOrientation(serial),
-    ])
+    }
+    const physical = await adbx.deviceInfo.getScreenSize(serial)
     const size = orientation % 2 === 1
       ? { width: physical.height, height: physical.width }
       : physical
-    sizeCache.set(serial, { size, at: Date.now() })
+    sizeCache.set(serial, { size, orientation, at: Date.now() })
     return size
   }
 
@@ -188,17 +188,36 @@ export function createFlowDevice(options: FlowDeviceOptions) {
     const intervalMs = opts.intervalMs ?? 500
     const started = Date.now()
     let attempts = 0
+    let lastError: unknown
     while (true) {
       attempts++
-      const snap = await snapshot(serial)
-      const match = findOne(snap.tree, selector)
+      const elapsedBeforeDump = Date.now() - started
+      const remaining = Math.max(0, timeoutMs - elapsedBeforeDump)
+      let snap: Snapshot | undefined
+      try {
+        snap = await snapshotWithTimeout(serial, remaining)
+      }
+      catch (error) {
+        // Animated screens (video feeds) sometimes refuse a dump; keep polling until the deadline.
+        lastError = error
+      }
+      const match = snap && findOne(snap.tree, selector)
       const elapsedMs = Date.now() - started
-      if (match)
+      if (snap && match)
         return { found: true, snapshot: snap, match, attempts, elapsedMs }
-      if (elapsedMs + intervalMs > timeoutMs)
+      if (elapsedMs >= timeoutMs) {
+        if (!snap)
+          throw lastError
         return { found: false, snapshot: snap, attempts, elapsedMs }
-      await sleep(intervalMs)
+      }
+      await sleep(Math.min(intervalMs, timeoutMs - elapsedMs))
     }
+  }
+
+  async function snapshotWithTimeout(serial: string, timeoutMs: number): Promise<Snapshot> {
+    if (timeoutMs <= 0)
+      return snapshot(serial)
+    return withTimeout(snapshot(serial), timeoutMs, 'waitFor snapshot')
   }
 
   async function resolveTarget(serial: string, target: Target, ref?: SnapshotRef): Promise<ResolvedTarget> {
@@ -232,14 +251,17 @@ export function createFlowDevice(options: FlowDeviceOptions) {
     return queue.run(serial, async () => {
       const prepared = await prepare()
       try {
-        await withTimeout(send(prepared), inputTimeoutMs, label)
+        await send(prepared)
       }
       finally {
         snapshots.invalidate(serial)
         sizeCache.delete(serial)
       }
       return prepared
-    })
+    }, { ms: inputTimeoutMs, label, onTimeout: () => {
+      snapshots.invalidate(serial)
+      sizeCache.delete(serial)
+    } })
   }
 
   function ratioPoints(points: RatioPoint[], size: Size): Point[] {

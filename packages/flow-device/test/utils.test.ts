@@ -55,6 +55,7 @@ describe('resolveKeyCode', () => {
     expect(() => resolveKeyCode('FLY')).toThrow(/Unknown key/)
     expect(() => resolveKeyCode(-1)).toThrow(/Invalid key/)
     expect(() => resolveKeyCode(1.5)).toThrow()
+    expect(() => resolveKeyCode('9'.repeat(400))).toThrow(/Invalid key/)
   })
 })
 

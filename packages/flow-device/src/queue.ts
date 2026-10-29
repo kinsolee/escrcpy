@@ -5,10 +5,18 @@
 export class KeyedQueue {
   private readonly tails = new Map<string, Promise<unknown>>()
 
-  run<T>(key: string, task: () => Promise<T>): Promise<T> {
+  run<T>(key: string, task: () => Promise<T>, timeout?: { ms: number, label: string, onTimeout?: () => void }): Promise<T> {
     const previous = this.tails.get(key) ?? Promise.resolve()
-    const result = previous.catch(() => {}).then(task)
-    const tail = result.catch(() => {})
+    const gate = previous.catch(() => {})
+    const started = gate.then(task)
+    const result = timeout
+      ? gate.then(() => withTimeout(started, timeout.ms, timeout.label)).catch((error) => {
+          if (error instanceof Error && error.message === `${timeout.label} timed out after ${timeout.ms} ms`)
+            timeout.onTimeout?.()
+          throw error
+        })
+      : started
+    const tail = started.catch(() => {})
     this.tails.set(key, tail)
     void tail.then(() => {
       if (this.tails.get(key) === tail)
