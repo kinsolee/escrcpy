@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 import { applyPatch, compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, toAutomationScript, writeFlow } from '../src/index.js'
 import type { HealLlmClient } from '../src/heal.js'
 import { createLlmClient, normalizeLlmApiType, parseHealDecision } from '../src/heal.js'
-import { loadLlmConfig, resolveLlm, saveLlmConfig } from '../src/llm-config.js'
+import { llmConfigSchema, loadLlmConfig, resolveLlm, saveLlmConfig } from '../src/llm-config.js'
 import type { ReplayDevice } from '../src/replayer.js'
 import type { FlowScript } from '../src/schema.js'
 
@@ -639,6 +639,23 @@ describe('llm client and shared config', () => {
     expect(resolved?.client).toBeDefined()
     expect(resolveLlm({ active: 'ghost::m', vendors: [] })).toBeUndefined()
     expect(resolveLlm({ active: undefined, vendors: [] })).toBeUndefined()
+  })
+
+  it('tolerates an empty vendor display name but not a missing id', () => {
+    const ok = llmConfigSchema.safeParse({
+      vendors: [{ id: 'mimo', name: '', baseUrl: 'https://example.com', apiKey: '', models: [] }],
+    })
+    expect(ok.success).toBe(true)
+
+    const noId = llmConfigSchema.safeParse({
+      vendors: [{ id: '', name: 'n', baseUrl: 'https://example.com', apiKey: '', models: [] }],
+    })
+    expect(noId.success).toBe(false)
+
+    const noBaseUrl = llmConfigSchema.safeParse({
+      vendors: [{ id: 'mimo', name: 'n', baseUrl: '', apiKey: '', models: [] }],
+    })
+    expect(noBaseUrl.success).toBe(false)
   })
 })
 

@@ -29,3 +29,6 @@ yarn.lock
 
 # Dist
 dist*
+
+# Local Claude env files (credentials)
+.claude/*.env

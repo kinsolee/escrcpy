@@ -6,16 +6,17 @@ import { createLlmClient, normalizeLlmApiType } from './heal.js'
 import type { HealLlmClient } from './heal.js'
 
 export const llmModelSchema = z.object({
-  id: z.string().min(1),
+  id: z.string().min(1, '模型 ID 不能为空'),
   /** Whether the model accepts image input; the UI badges vision-capable rows with it. */
   vision: z.boolean().optional(),
 }).passthrough()
 
 export const llmVendorSchema = z.object({
   /** Stable slug referenced by `active`, e.g. `magpie`. */
-  id: z.string().min(1),
-  name: z.string().min(1).optional(),
-  baseUrl: z.string().min(1),
+  id: z.string().min(1, '供应商标识不能为空'),
+  /** Cosmetic only; empty is allowed and the UI falls back to an untitled label. */
+  name: z.string().optional(),
+  baseUrl: z.string().min(1, '供应商 Base URL 不能为空'),
   apiKey: z.string(),
   /** See `normalizeLlmApiType`; defaults to `messages`. */
   apiType: z.string().optional(),

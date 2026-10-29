@@ -39,20 +39,20 @@
       </div>
 
       <div v-if="current" class="flex-1 min-w-0 flex flex-col gap-2">
-        <div class="grid grid-cols-2 gap-2">
-          <el-form-item :label="$t('flow.llm.vendor.id')" class="!mb-0">
+        <div class="grid grid-cols-2 gap-x-4 gap-y-2">
+          <el-form-item :label="$t('flow.llm.vendor.id')" label-width="84px" class="!mb-0">
             <el-input v-model="current.id" placeholder="magpie" />
           </el-form-item>
-          <el-form-item :label="$t('flow.llm.vendor.name')" class="!mb-0">
+          <el-form-item :label="$t('flow.llm.vendor.name')" label-width="84px" class="!mb-0">
             <el-input v-model="current.name" />
           </el-form-item>
-          <el-form-item :label="$t('flow.llm.vendor.baseUrl')" class="!mb-0">
+          <el-form-item :label="$t('flow.llm.vendor.baseUrl')" label-width="84px" class="!mb-0">
             <el-input v-model="current.baseUrl" placeholder="https://api.example.com" />
           </el-form-item>
-          <el-form-item :label="$t('flow.llm.vendor.apiKey')" class="!mb-0">
+          <el-form-item :label="$t('flow.llm.vendor.apiKey')" label-width="84px" class="!mb-0">
             <el-input v-model="current.apiKey" type="password" show-password />
           </el-form-item>
-          <el-form-item :label="$t('flow.llm.vendor.apiType')" class="!mb-0">
+          <el-form-item :label="$t('flow.llm.vendor.apiType')" label-width="84px" class="!mb-0">
             <el-select v-model="current.apiType">
               <el-option
                 v-for="(label, value) in API_TYPES"
@@ -62,46 +62,51 @@
               />
             </el-select>
           </el-form-item>
-          <el-form-item :label="$t('flow.llm.vendor.models')" class="!mb-0">
-            <el-button :loading="fetching" @click="fetchModels">
-              {{ $t('flow.llm.models.fetch') }}
-            </el-button>
-          </el-form-item>
         </div>
 
-        <div class="flex-1 min-h-0 border rounded overflow-auto">
-          <div
-            v-for="model in current.models"
-            :key="model.id"
-            class="px-2 py-1.5 flex items-center gap-2 border-b last:border-b-0"
-          >
-            <el-radio
-              :model-value="active"
-              :value="`${current.id}::${model.id}`"
-              @change="active = `${current.id}::${model.id}`"
-            >
-              {{ model.id }}
-            </el-radio>
+        <div class="flex-1 min-h-0 border rounded flex flex-col">
+          <div class="px-2 py-1.5 border-b flex items-center gap-2">
+            <span class="text-sm">{{ $t('flow.llm.vendor.models') }}</span>
+            <span class="text-xs opacity-60">{{ current.models?.length || 0 }}</span>
             <div class="flex-1" />
-            <el-tag v-if="active === `${current.id}::${model.id}`" size="small" type="success">
-              {{ $t('flow.llm.active.tag') }}
-            </el-tag>
-            <el-button size="small" plain @click="testModel(model)">
-              {{ testing === model.id ? $t('flow.llm.test.testing') : $t('flow.llm.test.name') }}
-            </el-button>
-            <span v-if="results[model.id]" class="text-xs" :class="results[model.id].success ? 'text-success' : 'text-danger'">
-              {{ results[model.id].success
-                ? $t('flow.llm.test.ok', { ms: results[model.id].ms })
-                : $t('flow.llm.test.fail') }}
-            </span>
-            <el-button size="small" type="danger" plain circle @click="removeModel(model.id)">
-              <template #icon>
-                <el-icon-close />
-              </template>
+            <el-button size="small" :loading="fetching" @click="fetchModels">
+              {{ $t('flow.llm.models.fetch') }}
             </el-button>
           </div>
-          <div v-if="!current.models?.length" class="p-3 text-sm opacity-60">
-            {{ $t('flow.llm.models.empty') }}
+          <div class="flex-1 overflow-auto">
+            <div
+              v-for="model in current.models"
+              :key="model.id"
+              class="px-2 py-1.5 flex items-center gap-2 border-b last:border-b-0"
+            >
+              <el-radio
+                :model-value="active"
+                :value="`${current.id}::${model.id}`"
+                @change="active = `${current.id}::${model.id}`"
+              >
+                {{ model.id }}
+              </el-radio>
+              <div class="flex-1" />
+              <el-tag v-if="active === `${current.id}::${model.id}`" size="small" type="success">
+                {{ $t('flow.llm.active.tag') }}
+              </el-tag>
+              <el-button size="small" plain @click="testModel(model)">
+                {{ testing === model.id ? $t('flow.llm.test.testing') : $t('flow.llm.test.name') }}
+              </el-button>
+              <span v-if="results[model.id]" class="text-xs" :class="results[model.id].success ? 'text-success' : 'text-danger'">
+                {{ results[model.id].success
+                  ? $t('flow.llm.test.ok', { ms: results[model.id].ms })
+                  : $t('flow.llm.test.fail') }}
+              </span>
+              <el-button size="small" type="danger" plain circle @click="removeModel(model.id)">
+                <template #icon>
+                  <el-icon-close />
+                </template>
+              </el-button>
+            </div>
+            <div v-if="!current.models?.length" class="p-3 text-sm opacity-60">
+              {{ $t('flow.llm.models.empty') }}
+            </div>
           </div>
         </div>
 
@@ -298,17 +303,50 @@ async function testModel(model) {
 }
 
 async function saveConfig() {
-  const payload = {
-    active: active.value || undefined,
-    vendors: vendors.value
-      .filter(vendor => vendor.id?.trim() && vendor.baseUrl?.trim())
-      .map(vendor => ({
-        ...vendor,
-        id: vendor.id.trim(),
-        apiKey: vendor.apiKey?.trim() ?? '',
-        models: vendor.models.filter(model => model.id?.trim()),
-      })),
+  const vendorsPayload = []
+
+  for (const vendor of vendors.value) {
+    const id = vendor.id?.trim() ?? ''
+    const baseUrl = vendor.baseUrl?.trim() ?? ''
+    const name = vendor.name?.trim() ?? ''
+    const apiKey = vendor.apiKey?.trim() ?? ''
+    const models = (vendor.models ?? []).filter(model => model.id?.trim())
+
+    // Rows added but never touched are dropped; half-filled ones block the save
+    // with a pointed message instead of silently vanishing.
+    if (!id && !baseUrl && !name && !apiKey && !models.length)
+      continue
+    if (!id || !baseUrl) {
+      ElMessage.error(window.t('flow.llm.vendor.missingFields', {
+        name: name || id || window.t('flow.llm.vendor.untitled'),
+      }))
+      return
+    }
+    if (vendorsPayload.some(item => item.id === id)) {
+      ElMessage.error(window.t('flow.llm.vendor.duplicate', { id }))
+      return
+    }
+    vendorsPayload.push({
+      ...vendor,
+      id,
+      baseUrl,
+      name: name || undefined,
+      apiKey,
+      models: models.map(model => ({ ...model, id: model.id.trim() })),
+    })
   }
+
+  // A renamed or deleted vendor must not leave `active` pointing at nothing.
+  const activeKey = vendorsPayload.some(vendor =>
+    vendor.models.some(model => `${vendor.id}::${model.id}` === active.value),
+  )
+    ? active.value
+    : ''
+
+  const payload = JSON.parse(JSON.stringify({
+    active: activeKey || undefined,
+    vendors: vendorsPayload,
+  }))
 
   saving.value = true
   try {
@@ -317,6 +355,7 @@ async function saveConfig() {
       ElMessage.error(error)
       return
     }
+    active.value = activeKey
     ElMessage.success(window.t('flow.llm.saved', { path }))
     emit('update:modelValue', false)
   }

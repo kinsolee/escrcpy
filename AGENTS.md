@@ -21,7 +21,7 @@ Escrcpy is a pnpm + Turborepo monorepo for an Electron GUI around Android mirror
 - Lint: `pnpm lint` or `pnpm lint:fix`.
 - Build: `pnpm build`; platform variants are `pnpm build:win`, `pnpm build:mac`, and `pnpm build:linux`.
 - Docs: `pnpm docs:dev`, `pnpm docs:build`, `pnpm docs:preview`.
-- i18n sync: `pnpm lang-sync` after editing locale keys in `desktop/electron/resources/extra/common/locales/*.json`.
+- i18n sync: `pnpm locale-sync` (from [desktop/](../desktop/)) after editing locale keys in `desktop/electron/resources/extra/common/locales/*.json`.
 - Electron install repair: `pnpm electron-fix` when Electron reports an incomplete install.
 - wscrcpy type check: `pnpm --filter @escrcpy/wscrcpy typecheck` (vue-tsc; plain tsc cannot resolve `.vue` imports).
 
@@ -46,7 +46,7 @@ There is no repo-wide test script today. For changes, run the smallest meaningfu
 
 - Locale JSON is stored in `desktop/electron/resources/extra/common/locales/*.json`; `zh-CN` is the primary language for sync.
 - Main-process i18n uses `i18next-fs-backend`, exposes helpers through preload, and renderer translation uses the global `t` helper.
-- After adding or renaming translation keys, run `pnpm lang-sync` and check both Chinese and English strings.
+- After adding or renaming translation keys, run `pnpm locale-sync` (from [desktop/](../desktop/)) and check both Chinese and English strings.
 
 ## Gotchas
 

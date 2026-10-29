@@ -19,8 +19,12 @@ const handlers = {
   },
   'flow:llm-config-set': async (_event, payload) => {
     const checked = llmConfigSchema.safeParse(payload)
-    if (!checked.success)
-      return { success: false, error: checked.error.issues[0]?.message ?? 'invalid config' }
+    if (!checked.success) {
+      const detail = checked.error.issues
+        .map(issue => `${issue.path.join('.')}: ${issue.message}`)
+        .join('; ')
+      return { success: false, error: detail || 'invalid config' }
+    }
     const path = saveLlmConfig(checked.data)
     return { success: true, path }
   },
