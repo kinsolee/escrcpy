@@ -1,5 +1,8 @@
+import { dialog } from 'electron'
+import { writeFileSync } from 'node:fs'
 import { ipcxMain } from '@escrcpy/electron-ipcx/main'
 import { createLlmClient, listLlmModels, llmConfigSchema, loadLlmConfig, saveLlmConfig } from '@escrcpy/flow-core'
+import { exportOfficialAutomation, flowReportsDir, flowScriptsDir, listFlows, listReports, runFlowOnDevice } from './scripts.js'
 
 // Kept tiny on purpose: the round-trip proves auth, wire format and JSON-decision
 // parsing together, which is exactly what the heal agent depends on.
@@ -37,6 +40,31 @@ const handlers = {
     catch (error) {
       return { success: false, ms: Date.now() - started, error: error.message }
     }
+  },
+  'flow:list': async () => {
+    return { success: true, dir: flowScriptsDir(), flows: listFlows() }
+  },
+  'flow:run': async (_event, payload) => {
+    if (!payload?.path || !payload?.serial)
+      return { success: false, error: 'path and serial are required' }
+    const { report, reportDir } = await runFlowOnDevice(payload)
+    return { success: report.status === 'completed', report, reportDir }
+  },
+  'flow:reports': async () => {
+    return { success: true, dir: flowReportsDir(), reports: listReports() }
+  },
+  'flow:export': async (event, payload) => {
+    if (!payload?.path)
+      return { success: false, error: 'path is required' }
+    const { script, skipped } = await exportOfficialAutomation(payload.path)
+    const { canceled, filePath } = await dialog.showSaveDialog(event.sender, {
+      defaultPath: `${script.name}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    })
+    if (canceled || !filePath)
+      return { success: false, canceled: true }
+    writeFileSync(filePath, `${JSON.stringify(script, null, 2)}\n`, 'utf8')
+    return { success: true, path: filePath, skipped }
   },
 }
 

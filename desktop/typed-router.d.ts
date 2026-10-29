@@ -45,6 +45,13 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/flow/': RouteRecordInfo<
+      '/flow/',
+      '/flow',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
     '/preference/': RouteRecordInfo<
       '/preference/',
       '/preference',
@@ -76,6 +83,14 @@ declare module 'vue-router/auto-routes' {
     'src/views/device/index.vue': {
       routes:
         | '/device/'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/views/flow/index.vue': {
+      routes:
+        | '/flow/'
       views:
         | never
       pathParamNames:

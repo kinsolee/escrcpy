@@ -7,7 +7,7 @@ import { parseArgs } from 'node:util'
 import adbkit from '@devicefarmer/adbkit'
 import { createAdbx } from '@escrcpy/adbx'
 import type { FlowScript, FlowStep, HealLlmClient, RunReport, Target } from '@escrcpy/flow-core'
-import { applyPatch, compileTraceFile, createEnvLlmClient, loadLlmConfig, readFlow, readTrace, replayFlow, resolveLlm, writeFlow } from '@escrcpy/flow-core'
+import { applyPatch, compileTraceFile, createEnvLlmClient, loadLlmConfig, readFlow, readTrace, replayFlow, resolveLlm, toAutomationScript, writeFlow } from '@escrcpy/flow-core'
 import { startFlowMcpServer } from '@escrcpy/flow-mcp'
 import type { Selector, UiElement } from '@escrcpy/flow-device'
 import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError } from '@escrcpy/flow-device'
@@ -32,6 +32,7 @@ Commands:
   run <flow.yaml> -s <serial>   Replay a flow on an Android device
   fleet run <manifest.yaml>     Replay a manifest of flows across a device fleet
   export <flow.yaml> -o <file>  Export a flow as compatible JSON
+  export <flow.yaml> -o <file> --format official  Export as official Escrcpy Automation JSON (point steps only)
   heal <report.json> [--apply]  Re-run a failed flow with LLM self-heal and emit a patch
 
 Compile options:
@@ -577,9 +578,15 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
       throw new Error('flow export requires a flow YAML path')
     if (!values.output)
       throw new Error('flow export requires -o <file>')
-    if (values.format && values.format !== 'escrcpy-automation' && values.format !== 'json')
+    if (values.format && values.format !== 'escrcpy-automation' && values.format !== 'official' && values.format !== 'json')
       throw new Error(`Unsupported export format: ${values.format}`)
     const flow = await readFlow(input)
+    if (values.format === 'official') {
+      const { script, skipped } = toAutomationScript(flow)
+      await writeFile(values.output, `${JSON.stringify(script, null, 2)}\n`, 'utf8')
+      console.log(`exported ${input} -> ${values.output} (${script.steps.length} steps for the official Automation importer${skipped.length ? `; skipped selector-only steps: ${skipped.join(', ')}` : ''})`)
+      return
+    }
     await writeFile(values.output, `${JSON.stringify(exportFlow(flow), null, 2)}\n`, 'utf8')
     console.log(`exported ${input} -> ${values.output}`)
     return

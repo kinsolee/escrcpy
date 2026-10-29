@@ -254,7 +254,7 @@ describe('env LLM client', () => {
     expect(url).toBe('https://llm.example/v1/messages')
     expect((init.headers as Record<string, string>).authorization).toBe('Bearer secret')
     const body = JSON.parse(init.body as string)
-    expect(body).toMatchObject({ model: 'test-model', max_tokens: 1024 })
+    expect(body).toMatchObject({ model: 'test-model', max_tokens: 2048 })
     expect(body.messages[0].content).toBe('自愈提示词')
   })
 

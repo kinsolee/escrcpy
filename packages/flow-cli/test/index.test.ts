@@ -140,9 +140,12 @@ steps:
 `
 
   function withoutLlmEnv(): () => void {
-    const saved = Object.fromEntries(FLOW_LLM_KEYS.map(key => [key, process.env[key]]))
-    for (const key of FLOW_LLM_KEYS)
+    const keys = [...FLOW_LLM_KEYS, 'FLOW_LLM_CONFIG']
+    const saved = Object.fromEntries(keys.map(key => [key, process.env[key]]))
+    for (const key of keys)
       delete process.env[key]
+    // The shared config (~/.escrcpy/flow/llm.json) can exist on this machine; point at nothing.
+    process.env.FLOW_LLM_CONFIG = join(tmpdir(), `flow-no-llm-${process.pid}.json`)
     return () => {
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined)

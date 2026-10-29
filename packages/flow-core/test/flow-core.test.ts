@@ -2,7 +2,7 @@ import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { applyPatch, compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, writeFlow } from '../src/index.js'
+import { applyPatch, compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, toAutomationScript, writeFlow } from '../src/index.js'
 import type { HealLlmClient } from '../src/heal.js'
 import { createLlmClient, normalizeLlmApiType, parseHealDecision } from '../src/heal.js'
 import { loadLlmConfig, resolveLlm, saveLlmConfig } from '../src/llm-config.js'
@@ -639,5 +639,35 @@ describe('llm client and shared config', () => {
     expect(resolved?.client).toBeDefined()
     expect(resolveLlm({ active: 'ghost::m', vendors: [] })).toBeUndefined()
     expect(resolveLlm({ active: undefined, vendors: [] })).toBeUndefined()
+  })
+})
+
+describe('automation export', () => {
+  it('maps point-based steps and skips selector-only ones', () => {
+    const flow: FlowScript = {
+      version: 1,
+      name: 'demo',
+      description: 'd',
+      vars: { query: { required: true } },
+      defaults: {},
+      interrupts: [],
+      steps: [
+        { id: 's1', intent: 'Launch', do: 'app_start', with: { package: 'com.android.settings', restart: true }, settle: 2500 },
+        { id: 's2', do: 'tap', target: [{ point: [0.5, 0.28] }] },
+        { id: 's3', do: 'tap', target: [{ resource_id: 'id/gone' }] },
+        { id: 's4', do: 'input_text', with: { text: '{{query}}' } },
+        { id: 's5', do: 'key', with: { key: 4 } },
+        { id: 's6', do: 'sleep', with: { duration_ms: 800 } },
+        { id: 's7', do: 'swipe', with: { from: { x: 0.5, y: 0.7 }, to: { x: 0.5, y: 0.2 }, duration_ms: 350 } },
+        { id: 's8', do: 'extract', with: { list: { resource_id: 'x' }, columns: {} } },
+      ],
+    }
+    const { script, skipped } = toAutomationScript(flow)
+    expect(skipped).toEqual(['s3', 's8'])
+    expect(script.variables).toEqual([{ name: 'query' }])
+    expect(script.steps.map(step => step.type)).toEqual(['launch', 'tap', 'input', 'key', 'wait', 'swipe'])
+    expect(script.steps[0]).toMatchObject({ type: 'launch', params: { packageName: 'com.android.settings', forceStop: true }, delayBefore: 2500 })
+    expect(script.steps[1].params).toEqual({ x: 0.5, y: 0.28 })
+    expect(script.steps[5].params).toEqual({ startX: 0.5, startY: 0.7, endX: 0.5, endY: 0.2, duration: 350 })
   })
 })

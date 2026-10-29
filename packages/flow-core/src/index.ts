@@ -1,3 +1,4 @@
+export * from './automation.js'
 export * from './compiler.js'
 export * from './extract.js'
 export * from './heal.js'

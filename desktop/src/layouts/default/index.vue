@@ -53,6 +53,10 @@ const tabsModel = [
     value: '/device',
   },
   {
+    label: 'menus.flow.name',
+    value: '/flow',
+  },
+  {
     label: 'menus.preference.name',
     value: '/preference',
   },
