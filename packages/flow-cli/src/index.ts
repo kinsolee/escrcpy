@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'node:url'
-import { writeFile } from 'node:fs/promises'
+import { readdir, readFile, writeFile } from 'node:fs/promises'
+import { basename, dirname } from 'node:path'
 import process from 'node:process'
 import { parseArgs } from 'node:util'
 import adbkit from '@devicefarmer/adbkit'
 import { createAdbx } from '@escrcpy/adbx'
-import type { FlowScript, FlowStep, Target } from '@escrcpy/flow-core'
-import { compileTraceFile, readFlow, readTrace, replayFlow, writeFlow } from '@escrcpy/flow-core'
+import type { FlowScript, FlowStep, HealLlmClient, RunReport, Target } from '@escrcpy/flow-core'
+import { applyPatch, compileTraceFile, createEnvLlmClient, readFlow, readTrace, replayFlow, writeFlow } from '@escrcpy/flow-core'
 import { startFlowMcpServer } from '@escrcpy/flow-mcp'
 import type { Selector, UiElement } from '@escrcpy/flow-device'
 import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError } from '@escrcpy/flow-device'
@@ -31,6 +32,7 @@ Commands:
   run <flow.yaml> -s <serial>   Replay a flow on an Android device
   fleet run <manifest.yaml>     Replay a manifest of flows across a device fleet
   export <flow.yaml> -o <file>  Export a flow as compatible JSON
+  heal <report.json> [--apply]  Re-run a failed flow with LLM self-heal and emit a patch
 
 Compile options:
   --var <name=value>            Override or declare a trace variable (repeatable)
@@ -43,6 +45,11 @@ Run options:
   --report <path>               Write the run report to a JSON file or directory
   --out-dir <dir>               Directory for files written by extract steps (default: report dir, else .)
   --no-lease                    Skip the cross-process device lease acquire/release around the run
+  --heal                        Let the L2 heal agent recover failed steps that have an expect
+
+Heal options:
+  --flow <path>                 Flow YAML for flow heal (default: the flowPath saved in the report)
+  --apply                       Apply each produced patch to the flow file in place
 
 Fleet options:
   --dry-run                     Print the expanded plan (device -> task queue) without touching devices
@@ -61,6 +68,8 @@ Environment:
   YADB_PATH        yadb binary, enables faster dumps and Unicode input
   ANDROID_SERIAL   default Android device serial
   FLOW_TRACE_DIR   trace directory used by flow mcp automatic recording
+  FLOW_LLM_BASE_URL / FLOW_LLM_API_KEY / FLOW_LLM_MODEL   LLM endpoint for self-heal
+  FLOW_LLM_API_TYPE  messages (default) or responses, matching the LLM endpoint style
 `
 
 interface CliValues {
@@ -93,6 +102,9 @@ interface CliValues {
   'report-root'?: string
   'on-busy'?: string
   'no-lease'?: boolean
+  'heal'?: boolean
+  'apply'?: boolean
+  'flow'?: string
 }
 
 export interface ParsedCliArgs {
@@ -130,6 +142,9 @@ const CLI_OPTIONS = {
   'dry-run': { type: 'boolean' },
   'report-root': { type: 'string' },
   'on-busy': { type: 'string' },
+  'heal': { type: 'boolean' },
+  'apply': { type: 'boolean' },
+  'flow': { type: 'string' },
 } as const
 
 export function parseCliArgs(argv: string[] = process.argv.slice(2)): ParsedCliArgs {
@@ -303,10 +318,19 @@ export async function withDeviceLease<T>(serial: string, values: CliValues, run:
   }
 }
 
+/** Self-heal needs a model; point at the FLOW_LLM_* env vars instead of guessing a provider. */
+function requireHealClient(): HealLlmClient {
+  const client = createEnvLlmClient(process.env)
+  if (!client)
+    throw new Error('self-heal needs an LLM: set FLOW_LLM_BASE_URL, FLOW_LLM_API_KEY and FLOW_LLM_MODEL (and optionally FLOW_LLM_API_TYPE=responses)')
+  return client
+}
+
 async function runCommand(input: string, values: CliValues): Promise<void> {
   if (!input)
     throw new Error('flow run requires a flow YAML path')
   const flow = await readFlow(input)
+  const healClient = values.heal ? requireHealClient() : undefined
   const adbx = adbBackend(values)
   const device = createFlowDevice({ adbx })
   const serial = await selectedSerial(adbx, values)
@@ -318,15 +342,87 @@ async function runCommand(input: string, values: CliValues): Promise<void> {
     vars: parseVars(values),
     ...(reportDir ? { reportDir } : {}),
     ...(values['out-dir'] ? { outputDir: values['out-dir'] } : {}),
+    ...(healClient ? { flowPath: input, heal: { client: healClient, writePatch: true, logger: (message: string) => console.error(message) } } : {}),
   }))
   if (reportPath?.toLowerCase().endsWith('.json'))
     await writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8')
   console.log(`${report.status}: ${flow.name} on ${serial} (${report.durationMs} ms)`)
   for (const [id, output] of Object.entries(report.outputs ?? {}))
     console.log(`extract ${id}: ${output.rows.length} rows${output.file ? ` -> ${output.file}` : ''}`)
+  for (const step of report.steps) {
+    if (step.healed)
+      console.log(`healed ${step.id}`)
+  }
   if (reportPath)
     console.log(`report: ${reportPath}${reportDir ? '/report.json' : ''}`)
   if (report.status === 'failed')
+    process.exitCode = 1
+}
+
+/** Patch files written beside a flow YAML, e.g. by a `--heal` run of this CLI. */
+async function listPatches(flowPath: string): Promise<string[]> {
+  try {
+    const names = await readdir(dirname(flowPath))
+    return names.filter(name => name.startsWith(`${basename(flowPath)}.patch-`) && name.endsWith('.yaml')).sort()
+  }
+  catch {
+    return []
+  }
+}
+
+/**
+ * Re-run the flow behind a failed report with the L2 heal agent enabled, emit a patch per
+ * healed step, and optionally apply the patches to the flow file. `--flow` or the report's
+ * saved flowPath locates the flow; patches always target the steps that failed.
+ */
+async function healCommand(reportPath: string, values: CliValues): Promise<void> {
+  if (!reportPath)
+    throw new Error('flow heal requires a report JSON path')
+  const report: RunReport = JSON.parse(await readFile(reportPath, 'utf8'))
+  if (report.status !== 'failed')
+    throw new Error(`nothing to heal: report status is ${report.status}`)
+  const failedStep = report.steps.find(step => step.status === 'failed')
+  if (!failedStep)
+    throw new Error('nothing to heal: the report has no failed step')
+  const client = requireHealClient()
+  const flowPath = values.flow ?? report.flowPath
+  if (!flowPath)
+    throw new Error('flow heal needs --flow <flow.yaml> or a flowPath saved in the report')
+  const flow = await readFlow(flowPath)
+  const step = flow.steps.find(step => step.id === failedStep.id)
+  if (!step)
+    throw new Error(`report step ${failedStep.id} is not in ${flowPath}`)
+  if (!step.expect)
+    throw new Error(`step ${failedStep.id} has no expect; the heal agent needs an assertion to verify`)
+
+  const adbx = adbBackend(values)
+  const device = createFlowDevice({ adbx })
+  const serial = await selectedSerial(adbx, values)
+  const before = new Set(await listPatches(flowPath))
+  const healed = await withDeviceLease(serial, values, () => replayFlow(flow, {
+    device: { ...device, shell: (serial, command) => adbx.shell(serial, command) },
+    serial,
+    vars: parseVars(values),
+    flowPath,
+    heal: { client, writePatch: true, logger: (message: string) => console.error(message) },
+  }))
+  const patches = (await listPatches(flowPath)).filter(path => !before.has(path))
+  for (const stepReport of healed.steps) {
+    if (stepReport.healed)
+      console.log(`healed ${stepReport.id}`)
+  }
+  for (const patch of patches) {
+    console.log(`patch: ${patch}`)
+    if (values.apply) {
+      await writeFlow(flowPath, await applyPatch(flowPath, patch))
+      console.log(`applied ${patch} -> ${flowPath}`)
+    }
+  }
+  if (!patches.length)
+    console.error('no patch produced; see the heal log above')
+  if (values.apply)
+    console.error('note: --apply rewrites the flow file in place; keep a backup (e.g. git) before committing healed flows')
+  if (healed.status === 'failed')
     process.exitCode = 1
 }
 
@@ -457,6 +553,10 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   }
   if (command === 'run') {
     await runCommand(positionals[1], values)
+    return
+  }
+  if (command === 'heal') {
+    await healCommand(positionals[1], values)
     return
   }
   if (command === 'fleet') {

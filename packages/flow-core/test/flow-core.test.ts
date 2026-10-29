@@ -1,8 +1,9 @@
-import { mkdtemp, readFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, writeFlow } from '../src/index.js'
+import { applyPatch, compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, writeFlow } from '../src/index.js'
+import type { HealLlmClient } from '../src/heal.js'
 import type { ReplayDevice } from '../src/replayer.js'
 import type { FlowScript } from '../src/schema.js'
 
@@ -120,6 +121,26 @@ describe('flow replayer', () => {
     expect(report.steps[0].locatorIndex).toBe(2)
     expect(report.steps[0].drift).toBe(true)
     expect(device.calls).toContain('input:Ada')
+  })
+
+  it('keeps backup locators in the race when a dump fails mid-wait', async () => {
+    // First target: dump throws (animated screen); second target matches.
+    const base = fakeDevice([])
+    const flaky = {
+      ...base,
+      waitFor: async (_serial: string, selector: unknown) => {
+        if ((selector as { content_desc?: string }).content_desc === 'broken')
+          throw new Error('waitFor snapshot timed out after 8 ms')
+        return { found: true, snapshot: snapshot as never, attempts: 1, elapsedMs: 1, match: { node: targetNode as never, matchCount: 1 } }
+      },
+    }
+    const flow: FlowScript = {
+      ...baseFlow,
+      steps: [{ id: 'tap', do: 'tap', target: [{ content_desc: 'broken' }, { resource_id: 'id/settings' }] }],
+    }
+    const report = await replayFlow(flow, { serial: 'test', vars: { user: 'Ada' }, device: flaky, settleMs: 0 })
+    expect(report.status).toBe('completed')
+    expect(report.steps[0].locatorIndex).toBe(2)
   })
 
   it('reports expect timeout and saves failure context', async () => {
@@ -261,5 +282,288 @@ describe('flow replayer', () => {
     const scrollReport = await replayFlow(scrollFlow, { serial: 'test', device, settleMs: 0 })
     expect(scrollReport.status).toBe('failed')
     expect(scrollReport.error).toContain('scroll is not implemented in M2')
+  })
+})
+
+describe('flow interrupts', () => {
+  /** A fake screen: `waitFor` matches by resource_id against the visible set, taps mutate it via the script. */
+  function screenDevice(script: { visible: string[], onTap?: (id: string, screen: Set<string>) => void }): ReplayDevice & { calls: string[], screen: Set<string> } {
+    const calls: string[] = []
+    const screen = new Set(script.visible)
+    const resourceIdOf = (target: unknown) => typeof target === 'object' && target !== null && 'resource_id' in target ? String((target as { resource_id: string }).resource_id) : ''
+    return {
+      calls,
+      screen,
+      waitFor: async (_serial, selector, opts) => {
+        const id = resourceIdOf(selector)
+        calls.push(`wait:${id}@${opts?.timeoutMs ?? -1}`)
+        const found = screen.has(id)
+        return { found, snapshot: snapshot as never, attempts: 1, elapsedMs: 1, ...(found ? { match: { node: targetNode as never, matchCount: 1 } } : {}) }
+      },
+      tap: async (_serial, target) => {
+        const id = resourceIdOf(target)
+        calls.push(`tap:${id}`)
+        script.onTap?.(id, screen)
+      },
+      inputText: async () => { calls.push('input') },
+      key: async () => 4,
+      swipe: async () => { calls.push('swipe') },
+    }
+  }
+
+  function interruptFlow(interrupts: FlowScript['interrupts'], steps: FlowScript['steps']): FlowScript {
+    return { version: 1, name: 'interrupts', vars: {}, defaults: { timeout: 20, settle: 0, pollInterval: 5 }, interrupts, steps }
+  }
+
+  function replay(flow: FlowScript, device: ReplayDevice) {
+    return replayFlow(flow, { serial: 'test', device, timeoutMs: 20, pollIntervalMs: 5, settleMs: 0 })
+  }
+
+  const probeTimeoutOf = (device: { calls: string[] }, id: string) => {
+    const probe = device.calls.find(call => call.startsWith(`wait:${id}@`))
+    expect(probe).toBeDefined()
+    return Number(probe!.split('@')[1])
+  }
+
+  it('handles an interrupt popup when target resolution fails, then retries the target once', async () => {
+    const device = screenDevice({
+      visible: ['id/popup-ok'],
+      onTap: (id, screen) => {
+        if (id === 'id/popup-ok') {
+          screen.delete('id/popup-ok')
+          screen.add('id/main')
+        }
+      },
+    })
+    const flow = interruptFlow(
+      [{ when: { resource_id: 'id/popup-ok' }, do: 'tap' }],
+      [{ id: 'tap-main', do: 'tap', target: [{ resource_id: 'id/main' }] }],
+    )
+    const report = await replay(flow, device)
+    expect(report.status).toBe('completed')
+    expect(report.steps[0].status).toBe('passed')
+    expect(report.steps[0].interrupts).toBe(1)
+    expect(probeTimeoutOf(device, 'id/popup-ok')).toBeGreaterThan(0)
+    expect(device.calls.filter(call => call.startsWith('tap:'))).toEqual(['tap:id/popup-ok', 'tap:id/main'])
+  })
+
+  it('handles an interrupt popup when the expect assertion fails, then retries the assertion once', async () => {
+    const device = screenDevice({
+      visible: ['id/main', 'id/popup-ok'],
+      onTap: (id, screen) => {
+        if (id === 'id/popup-ok') {
+          screen.delete('id/popup-ok')
+          screen.add('id/done')
+        }
+      },
+    })
+    const flow = interruptFlow(
+      [{ when: { resource_id: 'id/popup-ok' }, do: 'tap' }],
+      [{ id: 'tap-main', do: 'tap', target: [{ resource_id: 'id/main' }], expect: { visible: { resource_id: 'id/done' } } }],
+    )
+    const report = await replay(flow, device)
+    expect(report.status).toBe('completed')
+    expect(report.steps[0].status).toBe('passed')
+    expect(report.steps[0].interrupts).toBe(1)
+    expect(probeTimeoutOf(device, 'id/popup-ok')).toBeGreaterThan(0)
+    expect(device.calls.filter(call => call.startsWith('tap:'))).toEqual(['tap:id/main', 'tap:id/popup-ok'])
+  })
+
+  it('keeps normal failure behavior when no interrupt matches', async () => {
+    const interrupts: FlowScript['interrupts'] = [{ when: { resource_id: 'id/popup-ok' }, do: 'tap' }]
+
+    const targetDevice = screenDevice({ visible: [] })
+    const targetReport = await replay(
+      interruptFlow(interrupts, [{ id: 'tap-main', do: 'tap', target: [{ resource_id: 'id/main' }] }]),
+      targetDevice,
+    )
+    expect(targetReport.status).toBe('failed')
+    expect(targetReport.steps[0].status).toBe('failed')
+    expect(targetReport.steps[0].interrupts).toBe(0)
+    expect(targetReport.error).toContain('did not match within 20ms')
+    expect(targetDevice.calls.filter(call => call.startsWith('tap:'))).toEqual([])
+
+    const expectDevice = screenDevice({ visible: ['id/main'] })
+    const expectReport = await replay(
+      interruptFlow(interrupts, [{ id: 'tap-main', do: 'tap', target: [{ resource_id: 'id/main' }], expect: { visible: { resource_id: 'id/done' } } }]),
+      expectDevice,
+    )
+    expect(expectReport.status).toBe('failed')
+    expect(expectReport.steps[0].status).toBe('failed')
+    expect(expectReport.steps[0].interrupts).toBe(0)
+    expect(expectReport.error).toContain('did not match within 20ms')
+    expect(expectDevice.calls.filter(call => call.startsWith('tap:'))).toEqual(['tap:id/main'])
+  })
+
+  it('handles every matching interrupt in definition order and counts each one', async () => {
+    const device = screenDevice({
+      visible: ['id/popup-one', 'id/popup-two'],
+      onTap: (id, screen) => {
+        screen.delete(id)
+        if (id === 'id/popup-two')
+          screen.add('id/main')
+      },
+    })
+    const flow = interruptFlow(
+      [
+        { when: { resource_id: 'id/popup-one' }, do: 'tap' },
+        { when: { resource_id: 'id/popup-two' }, do: 'tap' },
+      ],
+      [{ id: 'tap-main', do: 'tap', target: [{ resource_id: 'id/main' }] }],
+    )
+    const report = await replay(flow, device)
+    expect(report.status).toBe('completed')
+    expect(report.steps[0].interrupts).toBe(2)
+    expect(device.calls.indexOf('wait:id/popup-one@300')).toBeLessThan(device.calls.indexOf('wait:id/popup-two@300'))
+    expect(device.calls.filter(call => call.startsWith('tap:'))).toEqual(['tap:id/popup-one', 'tap:id/popup-two', 'tap:id/main'])
+  })
+
+  it('accepts a point target as an interrupt when condition', () => {
+    const source = [
+      'version: 1',
+      'name: point-when',
+      'vars: {}',
+      'defaults: {}',
+      'interrupts:',
+      '  - when:',
+      '      point: [0.5, 0.5]',
+      '    do: tap',
+      'steps:',
+      '  - id: tap',
+      '    do: tap',
+      '    target:',
+      '      - resource_id: id/main',
+    ].join('\n')
+    const flow = parseFlow(source)
+    expect(flow.interrupts[0].when).toEqual({ point: [0.5, 0.5] })
+    expect(() => parseFlow(source.replace('point: [0.5, 0.5]', 'image: popup.png'))).toThrow()
+  })
+})
+
+describe('flow self-heal', () => {
+  /** Screen state keyed by resource_id, or `desc:<content_desc>` for expect probes; `onKey` mutates it from key events. */
+  function healableDevice(onKey: (screen: Set<string>) => void): ReplayDevice & { calls: string[] } {
+    const calls: string[] = []
+    const screen = new Set<string>()
+    return {
+      calls,
+      waitFor: async (_serial, selector) => {
+        const key = 'resource_id' in selector ? String(selector.resource_id) : `desc:${selector.content_desc}`
+        calls.push(`wait:${key}`)
+        const found = screen.has(key)
+        return { found, snapshot: snapshot as never, attempts: 1, elapsedMs: 1, ...(found ? { match: { node: targetNode as never, matchCount: 1 } } : {}) }
+      },
+      tap: async (_serial, target) => { calls.push(`tap:${JSON.stringify(target)}`) },
+      inputText: async (_serial, text) => { calls.push(`input:${text}`) },
+      key: async (_serial, key) => {
+        calls.push(`key:${key}`)
+        onKey(screen)
+        return 4
+      },
+      swipe: async () => { calls.push('swipe') },
+    }
+  }
+
+  const healFlow: FlowScript = {
+    version: 1,
+    name: 'heal-demo',
+    vars: {},
+    defaults: { timeout: 10, settle: 0, pollInterval: 0 },
+    interrupts: [],
+    steps: [
+      { id: 'open', do: 'tap', target: [{ resource_id: 'id/missing' }], expect: { visible: { content_desc: 'Settings', exact: true } } },
+      { id: 'after', do: 'input_text', with: { text: 'ok' } },
+    ],
+  }
+
+  const backClient: HealLlmClient = { complete: async () => ({ action: { tool: 'key', with: { key: 'BACK' } }, reason: '关闭弹窗' }) }
+
+  it('heals a failed expect step, marks the report, writes a patch, and continues the flow', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'flow-heal-'))
+    const flowPath = join(dir, 'demo.flow.yaml')
+    await writeFlow(flowPath, healFlow)
+    const device = healableDevice((screen) => {
+      screen.add('desc:Settings')
+    })
+    const logs: string[] = []
+    const report = await replayFlow(healFlow, {
+      serial: 'test',
+      device,
+      timeoutMs: 10,
+      pollIntervalMs: 0,
+      settleMs: 0,
+      flowPath,
+      heal: { client: backClient, writePatch: true, logger: message => logs.push(message) },
+    })
+    expect(report.status).toBe('completed')
+    expect(report.flowPath).toBe(flowPath)
+    expect(report.steps[0]).toMatchObject({ id: 'open', status: 'passed', healed: true })
+    expect(report.steps[0].error).toBeUndefined()
+    expect(report.steps[1]).toMatchObject({ id: 'after', status: 'passed' })
+    expect(device.calls).toContain('key:BACK')
+    expect(device.calls).toContain('input:ok')
+    const patchPath = join(dir, 'demo.flow.yaml.patch-1.yaml')
+    const patch = await readFile(patchPath, 'utf8')
+    expect(patch).toContain('stepId: open')
+    expect(patch).toContain('insert-before')
+    expect(patch).toContain('key: BACK')
+    expect(logs.some(message => message.includes(patchPath))).toBe(true)
+  })
+
+  it('keeps the original failure when the heal agent gives up', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'flow-heal-'))
+    const flowPath = join(dir, 'demo.flow.yaml')
+    await writeFlow(flowPath, healFlow)
+    const device = healableDevice(() => {})
+    const report = await replayFlow(healFlow, {
+      serial: 'test',
+      device,
+      timeoutMs: 10,
+      pollIntervalMs: 0,
+      settleMs: 0,
+      flowPath,
+      heal: { client: backClient, maxActions: 2 },
+    })
+    expect(report.status).toBe('failed')
+    expect(report.error).toContain('did not match within 10ms')
+    expect(report.steps[0]).toMatchObject({ id: 'open', status: 'failed' })
+    expect(report.steps[0].healed).toBeUndefined()
+    expect(device.calls).toContain('key:BACK')
+    expect(device.calls).not.toContain('input:ok')
+    expect(await readdir(dir)).toEqual(['demo.flow.yaml'])
+  })
+
+  it('leaves steps without expect on the normal failure path even when heal is configured', async () => {
+    const flow: FlowScript = { ...healFlow, steps: [{ id: 'open', do: 'tap', target: [{ resource_id: 'id/missing' }] }] }
+    const device = healableDevice(() => {})
+    const prompts: string[] = []
+    const client: HealLlmClient = {
+      complete: async (prompt) => {
+        prompts.push(prompt)
+        return { action: { tool: 'key', with: { key: 'BACK' } }, reason: '' }
+      },
+    }
+    const report = await replayFlow(flow, {
+      serial: 'test',
+      device,
+      timeoutMs: 10,
+      pollIntervalMs: 0,
+      settleMs: 0,
+      heal: { client },
+    })
+    expect(report.status).toBe('failed')
+    expect(report.steps[0].healed).toBeUndefined()
+    expect(prompts).toEqual([])
+  })
+
+  it('round-trips a written patch through applyPatch against the flow file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'flow-patch-'))
+    const flowPath = join(dir, 'demo.flow.yaml')
+    await writeFile(flowPath, stringifyFlow(healFlow))
+    const patchPath = join(dir, 'demo.flow.yaml.patch-1.yaml')
+    await writeFile(patchPath, `stepId: open\nmode: insert-before\nsteps:\n  - id: heal-1\n    intent: 关闭弹窗\n    do: key\n    with:\n      key: BACK\n`, 'utf8')
+    const healed = await applyPatch(flowPath, patchPath)
+    expect(healed.steps.map(step => step.id)).toEqual(['heal-1', 'open', 'after'])
+    expect(await readFile(flowPath, 'utf8')).toContain('id: open')
   })
 })

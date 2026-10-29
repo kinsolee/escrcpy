@@ -120,3 +120,90 @@ describe('withDeviceLease', () => {
     }
   })
 })
+
+describe('flow heal command', () => {
+  const FLOW_LLM_KEYS = ['FLOW_LLM_BASE_URL', 'FLOW_LLM_API_KEY', 'FLOW_LLM_MODEL', 'FLOW_LLM_API_TYPE']
+  const healableFlowYaml = `version: 1
+name: demo
+vars: {}
+defaults: {}
+interrupts: []
+steps:
+  - id: open
+    do: tap
+    target:
+      - resource_id: id/missing
+    expect:
+      visible:
+        content_desc: Settings
+        exact: true
+`
+
+  function withoutLlmEnv(): () => void {
+    const saved = Object.fromEntries(FLOW_LLM_KEYS.map(key => [key, process.env[key]]))
+    for (const key of FLOW_LLM_KEYS)
+      delete process.env[key]
+    return () => {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined)
+          delete process.env[key]
+        else
+          process.env[key] = value
+      }
+    }
+  }
+
+  async function failedReportDir(): Promise<{ dir: string, flowPath: string, reportPath: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'flow-cli-heal-'))
+    const flowPath = join(dir, 'demo.flow.yaml')
+    await writeFile(flowPath, healableFlowYaml, 'utf8')
+    const reportPath = join(dir, 'report.json')
+    const report = {
+      version: 1,
+      flow: 'demo',
+      serial: 'test',
+      status: 'failed',
+      startedAt: 1,
+      endedAt: 2,
+      durationMs: 1,
+      flowPath,
+      steps: [{ id: 'open', status: 'failed', durationMs: 1, drift: false, interrupts: 0, error: 'Target 1 did not match within 10ms' }],
+      error: 'Target 1 did not match within 10ms',
+    }
+    await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+    return { dir, flowPath, reportPath }
+  }
+
+  it('exposes the heal command and options in help', () => {
+    expect(HELP).toContain('heal <report.json> [--apply]')
+    expect(HELP).toContain('--heal')
+    expect(HELP).toContain('--apply')
+    expect(HELP).toContain('FLOW_LLM_BASE_URL')
+  })
+
+  it('fails fast with an env hint when --heal has no FLOW_LLM configuration', async () => {
+    const restore = withoutLlmEnv()
+    try {
+      const { dir, reportPath } = await failedReportDir()
+      await expect(runCli(['run', join(dir, 'demo.flow.yaml'), '--heal'])).rejects.toThrow(/FLOW_LLM_BASE_URL, FLOW_LLM_API_KEY and FLOW_LLM_MODEL/)
+      await expect(runCli(['heal', reportPath])).rejects.toThrow(/FLOW_LLM_BASE_URL, FLOW_LLM_API_KEY and FLOW_LLM_MODEL/)
+    }
+    finally {
+      restore()
+    }
+  })
+
+  it('rejects heal requests that have nothing to heal', async () => {
+    const restore = withoutLlmEnv()
+    try {
+      const { dir, reportPath } = await failedReportDir()
+      const completed = join(dir, 'completed.json')
+      await writeFile(completed, JSON.stringify({ version: 1, flow: 'demo', serial: 'test', status: 'completed', startedAt: 1, endedAt: 2, durationMs: 1, steps: [] }), 'utf8')
+      await expect(runCli(['heal', completed])).rejects.toThrow(/nothing to heal: report status is completed/)
+      await expect(runCli(['heal', reportPath, '--apply'])).rejects.toThrow(/FLOW_LLM_BASE_URL/)
+    }
+    finally {
+      restore()
+    }
+  })
+})

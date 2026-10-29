@@ -5,6 +5,8 @@ import { shellEscape, validateShellCommand } from '@escrcpy/shared'
 import type { FlowDevice, RatioPoint, Selector } from '@escrcpy/flow-device'
 import { extractRows } from './extract.js'
 import type { ExtractedRow, ExtractSpec } from './extract.js'
+import { buildPatch, runHealAgent, writePatch } from './heal.js'
+import type { HealLlmClient, HealLogger } from './heal.js'
 import { isImageTarget, isPointTarget, isSelectorTarget } from './schema.js'
 import { writeXlsx } from './xlsx.js'
 import type { FlowInterrupt, FlowScript, FlowStep, Target } from './schema.js'
@@ -34,6 +36,20 @@ export interface ReplayOptions {
   outputDir?: string
   now?: () => number
   device: ReplayDevice
+  /** Path of the flow YAML being replayed; heal patches are written beside it. */
+  flowPath?: string
+  /** L2 self-heal hook for failed steps with an `expect`; disabled unless provided. */
+  heal?: HealOptions
+}
+
+export interface HealOptions {
+  client: HealLlmClient
+  /** Cap on heal actions per failed step. Defaults to the heal agent's own limit. */
+  maxActions?: number
+  /** Compile healed actions into a patch file beside `flowPath`. */
+  writePatch?: boolean
+  /** Progress and patch-path log; healing stays silent without it. */
+  logger?: HealLogger
 }
 
 export type RunStatus = 'completed' | 'failed'
@@ -46,6 +62,8 @@ export interface StepReport {
   locatorIndex?: number
   drift: boolean
   interrupts: number
+  /** Set when the L2 heal agent recovered this step after a failure. */
+  healed?: boolean
   error?: string
   context?: { screenshot?: string, xml?: string }
 }
@@ -67,6 +85,8 @@ export interface RunReport {
   steps: StepReport[]
   /** Data produced by `extract` steps, keyed by step id. */
   outputs?: Record<string, StepOutput>
+  /** Path of the replayed flow YAML, when the caller provided one; lets `flow heal` find it. */
+  flowPath?: string
   error?: string
 }
 
@@ -95,6 +115,7 @@ export async function replayFlow(flow: FlowScript, options: ReplayOptions): Prom
     endedAt: startedAt,
     durationMs: 0,
     steps: [],
+    ...(options.flowPath ? { flowPath: options.flowPath } : {}),
   }
   try {
     const values = resolveVars(flow, options.vars ?? {})
@@ -111,16 +132,33 @@ export async function replayFlow(flow: FlowScript, options: ReplayOptions): Prom
         if (result.output)
           (report.outputs ??= {})[step.id] = result.output
         await settle(step.settle ?? runtimeOptions.settleMs!)
-        if (step.expect)
-          await assertExpect(step.expect, runtimeOptions.device, runtimeOptions.serial, values, runtimeOptions, now)
+        if (step.expect) {
+          try {
+            await assertExpect(step.expect, runtimeOptions.device, runtimeOptions.serial, values, runtimeOptions, now)
+          }
+          catch (error) {
+            const handled = await handleInterrupts(flow.interrupts, runtimeOptions.device, runtimeOptions.serial, values, runtimeOptions, now)
+            stepReport.interrupts += handled
+            if (!handled)
+              throw error
+            await assertExpect(step.expect, runtimeOptions.device, runtimeOptions.serial, values, runtimeOptions, now)
+          }
+        }
       }
       catch (error) {
         stepReport.status = step.optional ? 'skipped' : 'failed'
         stepReport.error = error instanceof Error ? error.message : String(error)
         stepReport.context = await saveContext(runtimeOptions, step.id, report.steps.length + 1)
-        report.steps.push({ ...stepReport, durationMs: now() - started })
-        if (!step.optional)
-          throw error
+        if (!step.optional && runtimeOptions.heal && step.expect && await healStep(flow, step, stepReport, runtimeOptions)) {
+          stepReport.status = 'passed'
+          stepReport.healed = true
+          stepReport.error = undefined
+        }
+        else {
+          report.steps.push({ ...stepReport, durationMs: now() - started })
+          if (!step.optional)
+            throw error
+        }
       }
       if (stepReport.status === 'passed')
         report.steps.push({ ...stepReport, durationMs: now() - started })
@@ -183,16 +221,25 @@ async function resolveTarget(targets: Target[], device: ReplayDevice, serial: st
         throw new ReplayError('Image targets are not implemented in M2', { target })
       if (isPointTarget(target))
         return { target, index: index + 1 }
-      const elapsedMs = now() - started
-      const remaining = Math.max(0, timeoutMs - elapsedMs)
-      const result = await device.waitFor(serial, target, { timeoutMs: remaining, intervalMs: 0 })
+      let result: Awaited<ReturnType<FlowDevice['waitFor']>>
+      try {
+        // One attempt per target per pass: a waitFor holding the whole remaining
+        // timeout would starve every backup locator of its turn.
+        result = await device.waitFor(serial, target, { timeoutMs: 0, intervalMs: 0 })
+      }
+      catch (error) {
+        // A failing dump (animated screen) must not abort the whole wait while
+        // backup locators still have time left; keep them in the race.
+        lastError = error instanceof Error ? error.message : String(error)
+        continue
+      }
       if (result.found)
         return { target, index: index + 1, result }
-      lastError = `Target ${index + 1} did not match within ${timeoutMs}ms`
+      lastError = `Target ${index + 1} did not match`
     }
     const elapsedMs = now() - started
     if (elapsedMs >= timeoutMs)
-      throw new ReplayError(lastError, { targets })
+      throw new ReplayError(`${lastError} within ${timeoutMs}ms`, { targets })
     await settle(Math.min(options.pollIntervalMs ?? 500, timeoutMs - elapsedMs))
   }
 }
@@ -336,14 +383,59 @@ async function handleInterrupts(interrupts: FlowInterrupt[], device: ReplayDevic
   return handled
 }
 
+/**
+ * L2 hook for a failed non-optional step with an `expect`: let the heal agent drive the
+ * device until the expect holds again, then optionally emit a reviewable patch beside the
+ * flow file. Returns false (keeping the original failure) whenever healing gives up.
+ */
+async function healStep(flow: FlowScript, step: FlowStep, stepReport: StepReport, options: ReplayOptions): Promise<boolean> {
+  const heal = options.heal!
+  const log = heal.logger ?? (() => {})
+  log(`heal: step ${step.id} failed — ${stepReport.error}`)
+  const result = await runHealAgent({
+    flow,
+    step,
+    serial: options.serial,
+    device: options.device,
+    client: heal.client,
+    ...(heal.maxActions !== undefined ? { maxActions: heal.maxActions } : {}),
+    logger: log,
+    error: stepReport.error,
+  })
+  if (!result.healed) {
+    log(`heal: gave up on step ${step.id} — ${result.reason ?? 'expect never held'}`)
+    return false
+  }
+  if (heal.writePatch) {
+    try {
+      if (!options.flowPath) {
+        log('heal: writePatch needs ReplayOptions.flowPath; skipping the patch file')
+      }
+      else {
+        const path = await writePatch(options.flowPath, buildPatch(flow, step.id, result.actions))
+        log(`heal: patch written to ${path}`)
+      }
+    }
+    catch (error) {
+      // The step recovered; a patch failure must not turn the run back into a failure.
+      log(`heal: patch write failed — ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return true
+}
+
 async function probeTarget(targets: Target[], device: ReplayDevice, serial: string, values: Record<string, unknown>, options: ReplayOptions): Promise<boolean> {
+  // A 0ms probe samples a single frame and misses popups that are still rendering;
+  // borrow the poll cadence, bounded to a short window, so `when` gets a fair check.
+  const intervalMs = options.pollIntervalMs ?? 500
+  const probeMs = Math.min(Math.max(intervalMs, 300), 1_000)
   for (const raw of targets) {
     const target = renderTarget(raw, values)
     if (isPointTarget(target))
       return true
     if (isImageTarget(target))
       continue
-    const result = await device.waitFor(serial, target, { timeoutMs: 0, intervalMs: 0 })
+    const result = await device.waitFor(serial, target, { timeoutMs: probeMs, intervalMs })
     if (result.found)
       return true
   }

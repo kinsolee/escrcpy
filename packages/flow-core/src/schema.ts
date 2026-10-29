@@ -85,7 +85,9 @@ export const stepSchema = z.object({
 }).passthrough()
 
 export const interruptSchema = z.object({
-  when: z.union([selectorSchema, targetListSchema]),
+  // Point `when` conditions always match and model a blind dismiss tap; image conditions
+  // stay excluded because probes cannot match them in M2.
+  when: z.union([selectorSchema, pointTargetSchema, targetListSchema]),
   do: actionSchema.default('tap'),
   target: targetListSchema.optional(),
   with: z.record(z.string(), z.unknown()).optional(),
