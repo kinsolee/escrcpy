@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { applyPatch, compileTrace, parseFlow, readFlow, replayFlow, stringifyFlow, writeFlow } from '../src/index.js'
 import type { HealLlmClient } from '../src/heal.js'
+import { parseHealDecision } from '../src/heal.js'
 import type { ReplayDevice } from '../src/replayer.js'
 import type { FlowScript } from '../src/schema.js'
 
@@ -477,6 +478,14 @@ describe('flow self-heal', () => {
   }
 
   const backClient: HealLlmClient = { complete: async () => ({ action: { tool: 'key', with: { key: 'BACK' } }, reason: '关闭弹窗' }) }
+
+  it('wraps a single target object from the model into a list', () => {
+    const decision = parseHealDecision('{"action":{"tool":"tap","target":{"resource_id":"search_action_bar"}},"reason":"点搜索栏"}')
+    expect(decision.action).toMatchObject({ tool: 'tap', target: [{ resource_id: 'search_action_bar' }] })
+    expect(decision.reason).toBe('点搜索栏')
+    const flat = parseHealDecision('{"action":"tap","target":{"text":"Search settings"},"reason":"点标题"}')
+    expect(flat.action).toMatchObject({ tool: 'tap', target: [{ text: 'Search settings' }] })
+  })
 
   it('heals a failed expect step, marks the report, writes a patch, and continues the flow', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'flow-heal-'))

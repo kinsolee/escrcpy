@@ -225,7 +225,9 @@ export function parseHealDecision(text: string): HealDecision {
   const value = parseLooseJson(text) as { action?: unknown, reason?: unknown, target?: unknown, with?: unknown }
   let action = value.action
   if (typeof action === 'string')
-    action = { tool: action, target: value.target, with: value.with }
+    action = { tool: action, target: normalizeTarget(value.target), with: value.with }
+  else if (action && typeof action === 'object')
+    action = { ...(action as Record<string, unknown>), target: normalizeTarget((action as { target?: unknown }).target) }
   const checked = healActionSchema.safeParse(action)
   if (!checked.success) {
     const described = action && typeof action === 'object' && typeof (action as { tool?: unknown }).tool === 'string'
@@ -234,6 +236,11 @@ export function parseHealDecision(text: string): HealDecision {
     throw new HealError(`动作不在自愈白名单内或格式无效: ${described ?? '(缺少 action)'}`)
   }
   return { action: checked.data, reason: typeof value.reason === 'string' ? value.reason : '' }
+}
+
+/** Models often return a single target object instead of a one-element list. */
+function normalizeTarget(target: unknown): unknown {
+  return target && typeof target === 'object' && !Array.isArray(target) ? [target] : target
 }
 
 function parseLooseJson(text: string): unknown {
@@ -290,6 +297,8 @@ export interface RunHealOptions {
   client: HealLlmClient
   /** Cap on heal actions per run. Default 8. */
   maxActions?: number
+  /** How long one expect probe or target lookup waits. Default `HEAL_PROBE_MS`. */
+  probeMs?: number
   logger?: HealLogger
   /** The replay error that triggered healing, shown to the model in the first prompt. */
   error?: string
@@ -306,12 +315,17 @@ export interface HealResult {
 
 export const DEFAULT_MAX_HEAL_ACTIONS = 8
 
-/** How long one expect probe or target lookup waits before moving on. */
-const HEAL_PROBE_MS = 1000
+/**
+ * How long one expect probe or target lookup waits before moving on.
+ * Must outlast a single UI dump — uiautomator takes ~2.2s per snapshot —
+ * or every probe times out before the first snapshot lands.
+ */
+const HEAL_PROBE_MS = 5000
 
 export async function runHealAgent(options: RunHealOptions): Promise<HealResult> {
   const { flow, step, serial, device, client } = options
   const maxActions = options.maxActions ?? DEFAULT_MAX_HEAL_ACTIONS
+  const probeMs = options.probeMs ?? HEAL_PROBE_MS
   const log = options.logger ?? (() => {})
   const attempts: HealAttempt[] = []
   const steps = () => attemptsToSteps(attempts)
@@ -334,7 +348,7 @@ export async function runHealAgent(options: RunHealOptions): Promise<HealResult>
     }
     const action = checked.data
     try {
-      await executeHealAction(action, flow, device, serial)
+      await executeHealAction(action, flow, device, serial, probeMs)
     }
     catch (error) {
       attempts.push({ action, reason: decision.reason, error: errorMessage(error) })
@@ -343,7 +357,7 @@ export async function runHealAgent(options: RunHealOptions): Promise<HealResult>
     }
     attempts.push({ action, reason: decision.reason })
     log(`heal ${index}/${maxActions}: ${action.tool} executed${decision.reason ? ` — ${decision.reason}` : ''}`)
-    if (await expectSatisfied(step.expect, device, serial, log)) {
+    if (await expectSatisfied(step.expect, device, serial, log, probeMs)) {
       log(`heal: expect of step ${step.id} is satisfied`)
       return { healed: true, actions: attempts, steps: steps() }
     }
@@ -364,10 +378,10 @@ async function captureHints(device: ReplayDevice, serial: string, log: HealLogge
 }
 
 /** Whether the step's expect holds right now; a step without expect counts as satisfied. */
-async function expectSatisfied(expect: Expect | undefined, device: ReplayDevice, serial: string, log: HealLogger): Promise<boolean> {
+async function expectSatisfied(expect: Expect | undefined, device: ReplayDevice, serial: string, log: HealLogger, probeMs: number = HEAL_PROBE_MS): Promise<boolean> {
   if (!expect)
     return true
-  if (expect.visible && !(await visibleSatisfied(expect.visible, device, serial)))
+  if (expect.visible && !(await visibleSatisfied(expect.visible, device, serial, probeMs)))
     return false
   if (expect.app) {
     if (!device.foregroundApp) {
@@ -386,7 +400,7 @@ async function expectSatisfied(expect: Expect | undefined, device: ReplayDevice,
   return true
 }
 
-async function visibleSatisfied(visible: Exclude<Expect['visible'], undefined>, device: ReplayDevice, serial: string): Promise<boolean> {
+async function visibleSatisfied(visible: Exclude<Expect['visible'], undefined>, device: ReplayDevice, serial: string, probeMs: number = HEAL_PROBE_MS): Promise<boolean> {
   const targets = Array.isArray(visible) ? visible : [visible]
   for (const target of targets) {
     if (isPointTarget(target))
@@ -394,7 +408,7 @@ async function visibleSatisfied(visible: Exclude<Expect['visible'], undefined>, 
     if (isImageTarget(target))
       continue
     try {
-      const result = await device.waitFor(serial, target, { timeoutMs: HEAL_PROBE_MS, intervalMs: 0 })
+      const result = await device.waitFor(serial, target, { timeoutMs: probeMs, intervalMs: 0 })
       if (result.found)
         return true
     }
@@ -405,14 +419,14 @@ async function visibleSatisfied(visible: Exclude<Expect['visible'], undefined>, 
   return false
 }
 
-async function executeHealAction(action: HealAction, flow: FlowScript, device: ReplayDevice, serial: string): Promise<void> {
+async function executeHealAction(action: HealAction, flow: FlowScript, device: ReplayDevice, serial: string, probeMs: number = HEAL_PROBE_MS): Promise<void> {
   const args = action.with ?? {}
   switch (action.tool) {
     case 'tap':
-      await healTap(action.target, device, serial)
+      await healTap(action.target, device, serial, probeMs)
       return
     case 'wait_for':
-      await healWaitFor(action.target, device, serial)
+      await healWaitFor(action.target, device, serial, probeMs)
       return
     case 'input_text':
       await device.inputText(serial, String(args.text ?? ''))
@@ -428,7 +442,7 @@ async function executeHealAction(action: HealAction, flow: FlowScript, device: R
   }
 }
 
-async function healTap(targets: Target[] | undefined, device: ReplayDevice, serial: string): Promise<void> {
+async function healTap(targets: Target[] | undefined, device: ReplayDevice, serial: string, probeMs: number = HEAL_PROBE_MS): Promise<void> {
   if (!targets?.length)
     throw new HealError('tap requires target')
   for (const target of targets) {
@@ -438,7 +452,7 @@ async function healTap(targets: Target[] | undefined, device: ReplayDevice, seri
       await device.tap(serial, ratioToPoint(target.point))
       return
     }
-    const result = await device.waitFor(serial, target, { timeoutMs: HEAL_PROBE_MS, intervalMs: 0 })
+    const result = await device.waitFor(serial, target, { timeoutMs: probeMs, intervalMs: 0 })
     if (result.found) {
       await device.tap(serial, target, { snapshot: result.snapshot.id })
       return
@@ -447,7 +461,7 @@ async function healTap(targets: Target[] | undefined, device: ReplayDevice, seri
   throw new HealError('tap found no target on the current screen', { targets })
 }
 
-async function healWaitFor(targets: Target[] | undefined, device: ReplayDevice, serial: string): Promise<void> {
+async function healWaitFor(targets: Target[] | undefined, device: ReplayDevice, serial: string, probeMs: number = HEAL_PROBE_MS): Promise<void> {
   if (!targets?.length)
     throw new HealError('wait_for requires target')
   for (const target of targets) {
@@ -455,7 +469,7 @@ async function healWaitFor(targets: Target[] | undefined, device: ReplayDevice, 
       return
     if (isImageTarget(target))
       continue
-    const result = await device.waitFor(serial, target, { timeoutMs: HEAL_PROBE_MS, intervalMs: 0 })
+    const result = await device.waitFor(serial, target, { timeoutMs: probeMs, intervalMs: 0 })
     if (result.found)
       return
   }
