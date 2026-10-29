@@ -67,9 +67,10 @@ export function listReports(limit = 20) {
 
 /**
  * Replay one flow on one device behind the shared cross-process lease.
- * Healing pulls the active model from the shared LLM config when enabled.
+ * Healing pulls the active model from the shared LLM config when enabled;
+ * `healGoal` additionally runs goal-driven recovery when the run still fails.
  */
-export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal = false }) {
+export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal = false, healGoal = false }) {
   const flow = await readFlow(flowPath)
   const adb = adbkit.Adb.createClient()
   const adbx = createAdbx({ adb, yadbPath: process.env.YADB_PATH ?? '' })
@@ -87,7 +88,7 @@ export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal 
   const reportDir = join(flowReportsDir(), flow.name, serial, new Date().toISOString().replace(/[:.]/g, '-'))
   mkdirSync(reportDir, { recursive: true })
   try {
-    const resolved = heal ? resolveLlm(loadLlmConfig()) : undefined
+    const resolved = (heal || healGoal) ? resolveLlm(loadLlmConfig()) : undefined
     const report = await replayFlow(flow, {
       serial,
       device,
@@ -95,7 +96,7 @@ export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal 
       flowPath,
       reportDir,
       outputDir: reportDir,
-      ...(resolved ? { heal: { client: resolved.client, writePatch: true } } : {}),
+      ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(healGoal ? { goal: true } : {}) } } : {}),
     })
     return { report, reportDir }
   }
@@ -116,13 +117,13 @@ export async function exportOfficialAutomation(flowPath) {
  * rows run sequentially per device, all behind the shared lease. Mirrors the
  * original app's batch dialog (variable table) but multi-device.
  */
-export async function runFlowBatch({ path: flowPath, serials, rows, heal = false, onProgress }) {
+export async function runFlowBatch({ path: flowPath, serials, rows, heal = false, healGoal = false, onProgress }) {
   const flow = await readFlow(flowPath)
   const adb = adbkit.Adb.createClient()
   const adbx = createAdbx({ adb, yadbPath: process.env.YADB_PATH ?? '' })
   const device = { ...createFlowDevice({ adbx }), shell: (serial_, command) => adbx.shell(serial_, command) }
   const lease = createDeviceLease()
-  const resolved = heal ? resolveLlm(loadLlmConfig()) : undefined
+  const resolved = (heal || healGoal) ? resolveLlm(loadLlmConfig()) : undefined
   const results = []
   const total = serials.length * rows.length
   let done = 0
@@ -156,7 +157,7 @@ export async function runFlowBatch({ path: flowPath, serials, rows, heal = false
             flowPath,
             reportDir,
             outputDir: reportDir,
-            ...(resolved ? { heal: { client: resolved.client, writePatch: true } } : {}),
+            ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(healGoal ? { goal: true } : {}) } } : {}),
           })
           results.push({ serial, row, status: result.status, durationMs: result.durationMs, reportDir })
           report({ serial, status: result.status })

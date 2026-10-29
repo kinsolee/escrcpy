@@ -1,6 +1,7 @@
 export * from './automation.js'
 export * from './compiler.js'
 export * from './extract.js'
+export * from './goal.js'
 export * from './heal.js'
 export * from './llm-config.js'
 export * from './replayer.js'

@@ -5,8 +5,9 @@ import { shellEscape, validateShellCommand } from '@escrcpy/shared'
 import type { FlowDevice, RatioPoint, Selector } from '@escrcpy/flow-device'
 import { extractRows } from './extract.js'
 import type { ExtractedRow, ExtractSpec } from './extract.js'
+import { proposeGoalPatch, runGoalAgent } from './goal.js'
 import { buildPatch, runHealAgent, writePatch } from './heal.js'
-import type { HealLlmClient, HealLogger } from './heal.js'
+import type { HealAttempt, HealLlmClient, HealLogger } from './heal.js'
 import { isImageTarget, isPointTarget, isSelectorTarget } from './schema.js'
 import { writeXlsx } from './xlsx.js'
 import type { FlowInterrupt, FlowScript, FlowStep, Target } from './schema.js'
@@ -50,6 +51,12 @@ export interface HealOptions {
   writePatch?: boolean
   /** Progress and patch-path log; healing stays silent without it. */
   logger?: HealLogger
+  /**
+   * Goal-driven recovery: when the run still fails after step healing (or step
+   * healing does not apply), explore toward `flow.description` to complete the
+   * task and write a repair patch for the failed step. `true` or a tuning object.
+   */
+  goal?: boolean | { maxActions?: number }
 }
 
 export type RunStatus = 'completed' | 'failed'
@@ -74,6 +81,15 @@ export interface StepOutput {
   file?: string
 }
 
+/** What the goal agent did after a failed run: exploration journal plus any repair patch. */
+export interface GoalRecoveryReport {
+  achieved: boolean
+  reason?: string
+  durationMs: number
+  actions: HealAttempt[]
+  patchPath?: string
+}
+
 export interface RunReport {
   version: 1
   flow: string
@@ -87,6 +103,8 @@ export interface RunReport {
   outputs?: Record<string, StepOutput>
   /** Path of the replayed flow YAML, when the caller provided one; lets `flow heal` find it. */
   flowPath?: string
+  /** Set when goal-driven recovery ran after a failure. */
+  goal?: GoalRecoveryReport
   error?: string
 }
 
@@ -167,6 +185,15 @@ export async function replayFlow(flow: FlowScript, options: ReplayOptions): Prom
   catch (error) {
     report.status = 'failed'
     report.error = error instanceof Error ? error.message : String(error)
+    if (runtimeOptions.heal?.goal) {
+      try {
+        report.goal = await goalRecover(flow, report, runtimeOptions)
+      }
+      catch (goalError) {
+        // Recovery must not mask the original failure or break report writing.
+        runtimeOptions.heal.logger?.(`goal: recovery failed — ${goalError instanceof Error ? goalError.message : String(goalError)}`)
+      }
+    }
   }
   report.endedAt = now()
   report.durationMs = report.endedAt - report.startedAt
@@ -422,6 +449,51 @@ async function healStep(flow: FlowScript, step: FlowStep, stepReport: StepReport
     }
   }
   return true
+}
+
+/**
+ * Last-resort recovery: explore toward the flow's goal until the agent declares it
+ * done (or the budget runs out), then write a repair patch for the step that broke.
+ * The run report stays `failed` — only `report.goal` records what happened.
+ */
+async function goalRecover(flow: FlowScript, report: RunReport, options: ReplayOptions): Promise<GoalRecoveryReport> {
+  const heal = options.heal!
+  const log = heal.logger ?? (() => {})
+  const failedReport = [...report.steps].reverse().find(step => step.status === 'failed')
+  const step = failedReport ? flow.steps.find(item => item.id === failedReport.id) : undefined
+  const goalText = flow.description?.trim() || `完成流程「${flow.name}」的任务目标`
+  log(`goal: run failed — exploring toward "${goalText}"`)
+  const result = await runGoalAgent({
+    goal: goalText,
+    flow,
+    serial: options.serial,
+    device: options.device,
+    client: heal.client,
+    ...(typeof heal.goal === 'object' && heal.goal.maxActions !== undefined ? { maxActions: heal.goal.maxActions } : {}),
+    logger: log,
+    ...(report.error !== undefined ? { error: report.error } : {}),
+    ...(step ? { context: `脚本失败步骤 ${step.id} (${step.do})${step.intent ? `: ${step.intent}` : ''}` } : {}),
+  })
+  let patchPath: string | undefined
+  if (step && options.flowPath && result.achieved) {
+    try {
+      const patch = await proposeGoalPatch({ flow, stepId: step.id, journal: result.actions, client: heal.client, goal: goalText })
+      if (patch) {
+        patchPath = await writePatch(options.flowPath, patch)
+        log(`goal: patch written to ${patchPath}`)
+      }
+    }
+    catch (error) {
+      log(`goal: patch write failed — ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  return {
+    achieved: result.achieved,
+    ...(result.reason !== undefined ? { reason: result.reason } : {}),
+    durationMs: result.durationMs,
+    actions: result.actions,
+    ...(patchPath !== undefined ? { patchPath } : {}),
+  }
 }
 
 async function probeTarget(targets: Target[], device: ReplayDevice, serial: string, values: Record<string, unknown>, options: ReplayOptions): Promise<boolean> {

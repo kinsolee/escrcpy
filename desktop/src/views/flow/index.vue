@@ -59,6 +59,11 @@
               :active-text="$t('flow.run.heal')"
               size="small"
             />
+            <el-switch
+              v-model="healGoal"
+              :active-text="$t('flow.run.healGoal')"
+              size="small"
+            />
             <div class="flex-1" />
             <el-button size="small" :loading="running" :disabled="!serial" @click="runFlow">
               {{ running ? $t('flow.run.running') : $t('flow.run.name') }}
@@ -87,6 +92,15 @@
             <span class="opacity-60">{{ report.durationMs }}ms</span>
             <span class="flex-1 truncate text-xs opacity-60" :title="reportDir">
               {{ reportDir }}
+            </span>
+          </div>
+          <div v-if="report.goal" class="flex items-center gap-2 text-sm">
+            <el-tag :type="report.goal.achieved ? 'success' : 'warning'" size="small">
+              {{ report.goal.achieved ? $t('flow.run.goalAchieved') : $t('flow.run.goalFailed') }}
+            </el-tag>
+            <span class="truncate opacity-60">{{ report.goal.reason }}</span>
+            <span v-if="report.goal.patchPath" class="truncate text-xs opacity-60" :title="report.goal.patchPath">
+              {{ report.goal.patchPath }}
             </span>
           </div>
           <el-table :data="report.steps" size="small" border>
@@ -210,6 +224,7 @@ const scriptsDir = ref('')
 const current = ref(null)
 const serial = ref('')
 const heal = ref(false)
+const healGoal = ref(false)
 const vars = ref({})
 const running = ref(false)
 const report = ref(null)
@@ -312,6 +327,7 @@ async function runBatch() {
       serials: batchSerials.value,
       rows: batchRows.value,
       heal: heal.value,
+      healGoal: healGoal.value,
       onProgress: info => (batchDone.value = info.done),
     })
     if (error) {
@@ -341,6 +357,7 @@ async function runFlow() {
       serial: serial.value,
       vars: Object.fromEntries(Object.entries(vars.value).filter(([, value]) => value !== '')),
       heal: heal.value,
+      healGoal: healGoal.value,
     })
     if (error) {
       ElMessage.error(error)

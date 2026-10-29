@@ -132,7 +132,7 @@ export function buildHealPrompt(ctx: HealPromptContext): string {
   return lines.join('\n')
 }
 
-function describeHint(hint: HealElementHint): string {
+export function describeHint(hint: HealElementHint): string {
   const parts: string[] = []
   if (hint.text)
     parts.push(`text="${hint.text}"`)
@@ -144,7 +144,7 @@ function describeHint(hint: HealElementHint): string {
   return parts.join(' ')
 }
 
-function describeAttempt(attempt: HealAttempt): string {
+export function describeAttempt(attempt: HealAttempt): string {
   if (!attempt.action)
     return `无效响应(${attempt.error ?? '被拒绝'})`
   const { action } = attempt
@@ -171,6 +171,8 @@ export interface HealDecision {
 /** Any model backend that turns a heal prompt into one decision. */
 export interface HealLlmClient {
   complete: (prompt: string) => Promise<HealDecision>
+  /** Raw model text for prompts whose output is not a heal decision (goal runs, patch proposals). */
+  completeText?: (prompt: string) => Promise<string>
 }
 
 export interface HealLlmEnv {
@@ -210,38 +212,41 @@ export function createLlmClient(endpoint: HealLlmEndpoint): HealLlmClient | unde
   if (!baseUrl || !apiKey || !model)
     return undefined
   const apiType = normalizeLlmApiType(endpoint.apiType)
+  async function requestText(prompt: string): Promise<string> {
+    // Reasoning models can burn ~1k tokens thinking before the JSON decision lands.
+    const body = JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'user', content: prompt }] })
+    const request = apiType === 'responses'
+      ? { url: `${baseUrl}/v1/responses`, body: JSON.stringify({ model, input: prompt }) }
+      : apiType === 'chat_completions'
+        ? { url: `${baseUrl}/v1/chat/completions`, body }
+        : { url: `${baseUrl}/v1/messages`, body }
+    let response: Response
+    try {
+      response = await fetch(request.url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'authorization': `Bearer ${apiKey}`,
+          ...(apiType === 'messages' ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } : {}),
+        },
+        body: request.body,
+      })
+    }
+    catch (error) {
+      throw new HealError(`LLM request failed: ${errorMessage(error)}`, { url: request.url })
+    }
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      throw new HealError(`LLM request returned ${response.status}: ${detail.slice(0, 200)}`, { url: request.url, status: response.status })
+    }
+    const data: unknown = await response.json()
+    return apiType === 'responses' ? responsesText(data) : apiType === 'chat_completions' ? chatText(data) : messagesText(data)
+  }
   return {
     async complete(prompt) {
-      // Reasoning models can burn ~1k tokens thinking before the JSON decision lands.
-      const messagesBody = JSON.stringify({ model, max_tokens: 2048, messages: [{ role: 'user', content: prompt }] })
-      const request = apiType === 'responses'
-        ? { url: `${baseUrl}/v1/responses`, body: JSON.stringify({ model, input: prompt }) }
-        : apiType === 'chat_completions'
-          ? { url: `${baseUrl}/v1/chat/completions`, body: messagesBody }
-          : { url: `${baseUrl}/v1/messages`, body: messagesBody }
-      let response: Response
-      try {
-        response = await fetch(request.url, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'authorization': `Bearer ${apiKey}`,
-            ...(apiType === 'messages' ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } : {}),
-          },
-          body: request.body,
-        })
-      }
-      catch (error) {
-        throw new HealError(`LLM request failed: ${errorMessage(error)}`, { url: request.url })
-      }
-      if (!response.ok) {
-        const detail = await response.text().catch(() => '')
-        throw new HealError(`LLM request returned ${response.status}: ${detail.slice(0, 200)}`, { url: request.url, status: response.status })
-      }
-      const data: unknown = await response.json()
-      const text = apiType === 'responses' ? responsesText(data) : apiType === 'chat_completions' ? chatText(data) : messagesText(data)
-      return parseHealDecision(text)
+      return parseHealDecision(await requestText(prompt))
     },
+    completeText: requestText,
   }
 }
 
@@ -274,11 +279,11 @@ export function parseHealDecision(text: string): HealDecision {
 }
 
 /** Models often return a single target object instead of a one-element list. */
-function normalizeTarget(target: unknown): unknown {
+export function normalizeTarget(target: unknown): unknown {
   return target && typeof target === 'object' && !Array.isArray(target) ? [target] : target
 }
 
-function parseLooseJson(text: string): unknown {
+export function parseLooseJson(text: string): unknown {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)
   const stripped = (fenced ? fenced[1] : text).trim()
   try {
@@ -379,7 +384,7 @@ export const DEFAULT_MAX_HEAL_ACTIONS = 8
  * Must outlast a single UI dump — uiautomator takes ~2.2s per snapshot —
  * or every probe times out before the first snapshot lands.
  */
-const HEAL_PROBE_MS = 5000
+export const HEAL_PROBE_MS = 5000
 
 export async function runHealAgent(options: RunHealOptions): Promise<HealResult> {
   const { flow, step, serial, device, client } = options
@@ -424,7 +429,7 @@ export async function runHealAgent(options: RunHealOptions): Promise<HealResult>
   return { healed: false, actions: attempts, steps: steps(), reason: `未能在 ${maxActions} 个动作内让步骤 ${step.id} 的期望成立` }
 }
 
-async function captureHints(device: ReplayDevice, serial: string, log: HealLogger): Promise<HealElementHint[] | undefined> {
+export async function captureHints(device: ReplayDevice, serial: string, log: HealLogger): Promise<HealElementHint[] | undefined> {
   if (!device.snapshot)
     return undefined
   try {
@@ -478,7 +483,7 @@ async function visibleSatisfied(visible: Exclude<Expect['visible'], undefined>, 
   return false
 }
 
-async function executeHealAction(action: HealAction, flow: FlowScript, device: ReplayDevice, serial: string, probeMs: number = HEAL_PROBE_MS): Promise<void> {
+export async function executeHealAction(action: HealAction, flow: FlowScript, device: ReplayDevice, serial: string, probeMs: number = HEAL_PROBE_MS): Promise<void> {
   const args = action.with ?? {}
   switch (action.tool) {
     case 'tap':
@@ -547,7 +552,7 @@ async function healAppStart(args: Record<string, unknown>, flow: FlowScript, dev
     throw new HealError(report.error ?? 'app_start failed')
 }
 
-function attemptsToSteps(attempts: HealAttempt[]): FlowStep[] {
+export function attemptsToSteps(attempts: HealAttempt[]): FlowStep[] {
   const executed = attempts.filter(attempt => attempt.action && !attempt.error)
   return executed.map((attempt, index) => healActionStep(attempt.action!, attempt.reason, `heal-${index + 1}`))
 }

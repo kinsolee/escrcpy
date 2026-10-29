@@ -47,10 +47,13 @@ Run options:
   --out-dir <dir>               Directory for files written by extract steps (default: report dir, else .)
   --no-lease                    Skip the cross-process device lease acquire/release around the run
   --heal                        Let the L2 heal agent recover failed steps that have an expect
+  --heal-goal                   When the run still fails, let the LLM explore toward the
+                                flow's goal description and write a repair patch (implies --heal)
 
 Heal options:
   --flow <path>                 Flow YAML for flow heal (default: the flowPath saved in the report)
   --apply                       Apply each produced patch to the flow file in place
+  --heal-goal                   Also attempt goal-driven recovery if step healing cannot fix the run
 
 Fleet options:
   --dry-run                     Print the expanded plan (device -> task queue) without touching devices
@@ -105,6 +108,7 @@ interface CliValues {
   'on-busy'?: string
   'no-lease'?: boolean
   'heal'?: boolean
+  'heal-goal'?: boolean
   'apply'?: boolean
   'flow'?: string
 }
@@ -145,6 +149,7 @@ const CLI_OPTIONS = {
   'report-root': { type: 'string' },
   'on-busy': { type: 'string' },
   'heal': { type: 'boolean' },
+  'heal-goal': { type: 'boolean' },
   'apply': { type: 'boolean' },
   'flow': { type: 'string' },
 } as const
@@ -335,7 +340,7 @@ async function runCommand(input: string, values: CliValues): Promise<void> {
   if (!input)
     throw new Error('flow run requires a flow YAML path')
   const flow = await readFlow(input)
-  const healClient = values.heal ? requireHealClient() : undefined
+  const healClient = (values.heal || values['heal-goal']) ? requireHealClient() : undefined
   const adbx = adbBackend(values)
   const device = createFlowDevice({ adbx })
   const serial = await selectedSerial(adbx, values)
@@ -347,7 +352,7 @@ async function runCommand(input: string, values: CliValues): Promise<void> {
     vars: parseVars(values),
     ...(reportDir ? { reportDir } : {}),
     ...(values['out-dir'] ? { outputDir: values['out-dir'] } : {}),
-    ...(healClient ? { flowPath: input, heal: { client: healClient, writePatch: true, logger: (message: string) => console.error(message) } } : {}),
+    ...(healClient ? { flowPath: input, heal: { client: healClient, writePatch: true, logger: (message: string) => console.error(message), ...(values['heal-goal'] ? { goal: true } : {}) } } : {}),
   }))
   if (reportPath?.toLowerCase().endsWith('.json'))
     await writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8')
@@ -358,6 +363,8 @@ async function runCommand(input: string, values: CliValues): Promise<void> {
     if (step.healed)
       console.log(`healed ${step.id}`)
   }
+  if (report.goal)
+    console.log(`goal: ${report.goal.achieved ? 'achieved' : 'not achieved'} — ${report.goal.reason ?? ''}${report.goal.patchPath ? ` (patch: ${report.goal.patchPath})` : ''}`)
   if (reportPath)
     console.log(`report: ${reportPath}${reportDir ? '/report.json' : ''}`)
   if (report.status === 'failed')
@@ -409,13 +416,15 @@ async function healCommand(reportPath: string, values: CliValues): Promise<void>
     serial,
     vars: parseVars(values),
     flowPath,
-    heal: { client, writePatch: true, logger: (message: string) => console.error(message) },
+    heal: { client, writePatch: true, logger: (message: string) => console.error(message), ...(values['heal-goal'] ? { goal: true } : {}) },
   }))
   const patches = (await listPatches(flowPath)).filter(path => !before.has(path))
   for (const stepReport of healed.steps) {
     if (stepReport.healed)
       console.log(`healed ${stepReport.id}`)
   }
+  if (healed.goal)
+    console.log(`goal: ${healed.goal.achieved ? 'achieved' : 'not achieved'} — ${healed.goal.reason ?? ''}${healed.goal.patchPath ? ` (patch: ${healed.goal.patchPath})` : ''}`)
   for (const patch of patches) {
     console.log(`patch: ${patch}`)
     if (values.apply) {
