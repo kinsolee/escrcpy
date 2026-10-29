@@ -1,6 +1,6 @@
 import type { Adbx } from '@escrcpy/adbx'
-import type { FlowDevice, RatioPoint, Selector, Snapshot, Target, UiElement } from '@escrcpy/flow-device'
-import { closestClickable, FlowDeviceError, hitTest } from '@escrcpy/flow-device'
+import type { DeviceLease, FlowDevice, LeaseInfo, RatioPoint, Selector, Snapshot, Target, UiElement } from '@escrcpy/flow-device'
+import { closestClickable, FlowDeviceError, hitTest, LeaseBusyError } from '@escrcpy/flow-device'
 import type { FlowTraceRecorder, TraceCall, TraceDevice, TraceTarget } from './recorder.js'
 
 export interface AdbxLike {
@@ -9,6 +9,10 @@ export interface AdbxLike {
 
 export interface FlowMcpContext {
   device: FlowDevice
+  /** Cross-process lease behind device_claim/device_release and device_list lease annotations. */
+  lease?: DeviceLease
+  /** Set after an explicit flow_record_stop so FLOW_TRACE_DIR auto-recording does not restart. */
+  autoRecordingDismissed?: boolean
   recorder?: FlowTraceRecorder
   defaultSerial?: string
   resolveSerial?: (serial?: string) => Promise<string>
@@ -29,7 +33,14 @@ export function json(value: unknown): { content: [{ type: 'text', text: string }
   return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent }
 }
 
+/** The lease fields exposed to agents; the serial lives on the device entry itself. */
+export function leaseDetails(info: LeaseInfo): { holder: string, pid: number, acquiredAt: number } {
+  return { holder: info.holder, pid: info.pid, acquiredAt: info.acquiredAt }
+}
+
 export function asError(error: unknown): { message: string, details?: Record<string, unknown> } {
+  if (error instanceof LeaseBusyError)
+    return { message: error.message, details: { lease: leaseDetails(error.lease) } }
   if (error instanceof FlowDeviceError)
     return { message: error.message, details: error.details }
   return { message: error instanceof Error ? error.message : String(error) }
@@ -107,7 +118,14 @@ export async function deviceInfo(context: FlowMcpContext, serial: string): Promi
 export async function prepareBefore(context: FlowMcpContext, serial: string): Promise<Snapshot | undefined> {
   if (!context.recorder?.isActive)
     return undefined
-  return context.device.snapshot(serial)
+  try {
+    return await context.device.snapshot(serial)
+  }
+  catch {
+    // Some screens never go idle (looping animation) and cannot be dumped. The action
+    // is still recorded, without a locator, so replay falls back to its coordinates.
+    return undefined
+  }
 }
 
 export async function record(context: FlowMcpContext, call: Omit<TraceCall, 'durationMs'> & { startedAt: number }): Promise<void> {
@@ -117,14 +135,14 @@ export async function record(context: FlowMcpContext, call: Omit<TraceCall, 'dur
 }
 
 export async function hitTarget(context: FlowMcpContext, serial: string, point: RatioPoint, before?: Snapshot): Promise<TraceTarget | undefined> {
-  const snapshot = before ?? (context.recorder?.isActive ? await context.device.snapshot(serial) : undefined)
-  if (!snapshot)
+  // Only the pre-action snapshot describes what was tapped; the screen has changed since.
+  if (!before)
     return undefined
-  const x = point.x * snapshot.tree.size.width
-  const y = point.y * snapshot.tree.size.height
-  const node = hitTest(snapshot.tree, { x, y })
-  const clickable = node ? closestClickable(snapshot.tree, node) : undefined
-  return elementTarget(snapshot, { node: clickable ?? node, point: { x, y }, ratio: point })
+  const x = point.x * before.tree.size.width
+  const y = point.y * before.tree.size.height
+  const node = hitTest(before.tree, { x, y })
+  const clickable = node ? closestClickable(before.tree, node) : undefined
+  return elementTarget(before, { node: clickable ?? node, point: { x, y }, ratio: point })
 }
 
 export interface ToolExecutionResult {

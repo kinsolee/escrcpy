@@ -9,7 +9,8 @@ import type { FlowScript, FlowStep, Target } from '@escrcpy/flow-core'
 import { compileTraceFile, readFlow, readTrace, replayFlow, writeFlow } from '@escrcpy/flow-core'
 import { startFlowMcpServer } from '@escrcpy/flow-mcp'
 import type { Selector, UiElement } from '@escrcpy/flow-device'
-import { createFlowDevice, FlowDeviceError } from '@escrcpy/flow-device'
+import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError } from '@escrcpy/flow-device'
+import { runFleet } from './fleet.js'
 
 export const HELP = `flow — record once, replay without a model
 
@@ -28,6 +29,7 @@ Commands:
   compile <trace.jsonl> -o <flow.yaml>
                                 Compile a recorded trace into a flow
   run <flow.yaml> -s <serial>   Replay a flow on an Android device
+  fleet run <manifest.yaml>     Replay a manifest of flows across a device fleet
   export <flow.yaml> -o <file>  Export a flow as compatible JSON
 
 Compile options:
@@ -39,6 +41,13 @@ Compile options:
 Run options:
   --var <name=value>            Set a required flow variable (repeatable)
   --report <path>               Write the run report to a JSON file or directory
+  --out-dir <dir>               Directory for files written by extract steps (default: report dir, else .)
+  --no-lease                    Skip the cross-process device lease acquire/release around the run
+
+Fleet options:
+  --dry-run                     Print the expanded plan (device -> task queue) without touching devices
+  --report-root <dir>           Root for fleet reports <flow>/<serial>/<timestamp>/report.json (default: reports)
+  --on-busy <wait|skip>         Handle devices leased elsewhere: wait for release or skip (default: skip)
 
 Selector options:
   --text <s>  --desc <s>  --id <s>  --class <s>  --exact  --index <n>
@@ -78,7 +87,12 @@ interface CliValues {
   'description'?: string
   'annotate'?: boolean
   'report'?: string
+  'out-dir'?: string
   'format'?: string
+  'dry-run'?: boolean
+  'report-root'?: string
+  'on-busy'?: string
+  'no-lease'?: boolean
 }
 
 export interface ParsedCliArgs {
@@ -101,6 +115,7 @@ const CLI_OPTIONS = {
   'xml': { type: 'boolean' },
   'json': { type: 'boolean' },
   'no-yadb': { type: 'boolean' },
+  'no-lease': { type: 'boolean' },
   'help': { type: 'boolean', short: 'h' },
   'trace-dir': { type: 'string' },
   'adb-path': { type: 'string' },
@@ -110,7 +125,11 @@ const CLI_OPTIONS = {
   'description': { type: 'string' },
   'annotate': { type: 'boolean' },
   'report': { type: 'string' },
+  'out-dir': { type: 'string' },
   'format': { type: 'string' },
+  'dry-run': { type: 'boolean' },
+  'report-root': { type: 'string' },
+  'on-busy': { type: 'string' },
 } as const
 
 export function parseCliArgs(argv: string[] = process.argv.slice(2)): ParsedCliArgs {
@@ -260,6 +279,30 @@ async function compileCommand(input: string, values: CliValues): Promise<void> {
   console.log(`compiled ${input} -> ${values.output} (${result.flow.steps.length} steps)`)
 }
 
+/**
+ * Wrap a replay in the cross-process device lease so two agents cannot drive one
+ * device at once. `--no-lease` opts out; a busy device fails fast with its holder.
+ */
+export async function withDeviceLease<T>(serial: string, values: CliValues, run: () => Promise<T>): Promise<T> {
+  if (values['no-lease'])
+    return run()
+  const lease = createDeviceLease()
+  try {
+    await lease.acquire(serial, { holder: process.env.FLOW_AGENT_NAME ?? 'flow-run' })
+  }
+  catch (error) {
+    if (error instanceof LeaseBusyError)
+      throw new Error(`device busy: ${serial} is leased by ${error.lease.holder} (pid ${error.lease.pid}); retry after release or pass --no-lease`)
+    throw error
+  }
+  try {
+    return await run()
+  }
+  finally {
+    await lease.release(serial)
+  }
+}
+
 async function runCommand(input: string, values: CliValues): Promise<void> {
   if (!input)
     throw new Error('flow run requires a flow YAML path')
@@ -269,18 +312,46 @@ async function runCommand(input: string, values: CliValues): Promise<void> {
   const serial = await selectedSerial(adbx, values)
   const reportPath = values.report
   const reportDir = reportPath && !reportPath.toLowerCase().endsWith('.json') ? reportPath : undefined
-  const report = await replayFlow(flow, {
+  const report = await withDeviceLease(serial, values, () => replayFlow(flow, {
     device: { ...device, shell: (serial, command) => adbx.shell(serial, command) },
     serial,
     vars: parseVars(values),
     ...(reportDir ? { reportDir } : {}),
-  })
+    ...(values['out-dir'] ? { outputDir: values['out-dir'] } : {}),
+  }))
   if (reportPath?.toLowerCase().endsWith('.json'))
     await writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8')
   console.log(`${report.status}: ${flow.name} on ${serial} (${report.durationMs} ms)`)
+  for (const [id, output] of Object.entries(report.outputs ?? {}))
+    console.log(`extract ${id}: ${output.rows.length} rows${output.file ? ` -> ${output.file}` : ''}`)
   if (reportPath)
     console.log(`report: ${reportPath}${reportDir ? '/report.json' : ''}`)
   if (report.status === 'failed')
+    process.exitCode = 1
+}
+
+async function fleetCommand(manifestPath: string, values: CliValues): Promise<void> {
+  const onBusy = values['on-busy'] ?? 'skip'
+  if (onBusy !== 'wait' && onBusy !== 'skip')
+    throw new Error(`Unsupported --on-busy: ${onBusy}; expected wait or skip`)
+  // Build the adb backend lazily so --dry-run never touches adb or the devices.
+  let backend: ReturnType<typeof adbBackend> | undefined
+  const adb = () => (backend ??= adbBackend(values))
+  const summary = await runFleet(manifestPath, {
+    ...(values['dry-run'] ? { dryRun: true } : {}),
+    ...(values['report-root'] ? { reportRoot: values['report-root'] } : {}),
+    onBusy,
+  }, {
+    // Each fleet task replays through the same device path as `flow run`.
+    replay: (flow, options) => {
+      const adbx = adb()
+      const device = createFlowDevice({ adbx })
+      return replayFlow(flow, { ...options, device: { ...device, shell: (serial, command) => adbx.shell(serial, command) } })
+    },
+    listOnlineSerials: async () => (await adb().getDevices()).filter(entry => entry.type === 'device').map(entry => entry.id),
+    screenSize: serial => createFlowDevice({ adbx: adb() }).screenSize(serial),
+  })
+  if (summary.failed > 0)
     process.exitCode = 1
 }
 
@@ -371,7 +442,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   if (command === 'mcp') {
     await startFlowMcpServer({
       adbPath: values['adb-path'] ?? process.env.ADB_PATH,
-      yadbPath: values['yadb-path'] ?? process.env.YADB_PATH,
+      yadbPath: values['no-yadb'] ? '' : values['yadb-path'] ?? process.env.YADB_PATH,
       defaultSerial: values.serial ?? process.env.ANDROID_SERIAL,
       traceDir: values['trace-dir'] ?? process.env.FLOW_TRACE_DIR,
     })
@@ -386,6 +457,14 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   }
   if (command === 'run') {
     await runCommand(positionals[1], values)
+    return
+  }
+  if (command === 'fleet') {
+    if (positionals[1] !== 'run')
+      throw new Error(`Unknown fleet command: ${positionals[1] ?? '(none)'}. Run flow --help.`)
+    if (!positionals[2])
+      throw new Error('flow fleet run requires a manifest YAML path')
+    await fleetCommand(positionals[2], values)
     return
   }
   if (command === 'export') {

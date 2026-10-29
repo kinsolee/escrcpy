@@ -27,6 +27,7 @@
     "@devicefarmer/adbkit": "*",
     "@escrcpy/adbx": "workspace:*",
     "@escrcpy/flow-device": "workspace:*",
+    "@escrcpy/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "1.32.2",
     "zod": "*"
   },

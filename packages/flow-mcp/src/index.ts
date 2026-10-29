@@ -4,11 +4,13 @@ import { pathToFileURL } from 'node:url'
 import adbkit from '@devicefarmer/adbkit'
 import { createAdbx } from '@escrcpy/adbx'
 import type { Adbx } from '@escrcpy/adbx'
+import { shellEscape, validateShellCommand } from '@escrcpy/shared'
 import {
+  createDeviceLease,
   createFlowDevice,
 
 } from '@escrcpy/flow-device'
-import type { FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
+import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
@@ -19,6 +21,7 @@ import {
 
   hitTarget,
   json,
+  leaseDetails,
   prepareBefore,
   runTool,
   serialFor,
@@ -35,6 +38,8 @@ export const TRACE_DIR_ENV = 'FLOW_TRACE_DIR'
 export interface FlowMcpOptions {
   device: FlowDevice
   adbx?: Adbx
+  /** Cross-process device lease; defaults to createDeviceLease() with FLOW_LEASE_DIR defaults. */
+  lease?: DeviceLease
   recorder?: FlowTraceRecorder
   traceDir?: string
   defaultSerial?: string
@@ -65,10 +70,13 @@ const selectorShape = {
   index: z.number().int().optional(),
 }
 
+const settleShape = z.number().int().min(0).max(5000).optional()
+
 const pointShape = {
   serial: z.string().optional(),
   x: z.number().min(0).max(1),
   y: z.number().min(0).max(1),
+  settle: settleShape,
 }
 
 const selectorSchema = z.object(selectorShape)
@@ -100,12 +108,26 @@ function loggerFor(options: FlowMcpServer): (message: string, error?: unknown) =
 }
 
 async function ensureAutoRecording(context: FlowMcpServer['context'], args: Record<string, unknown>): Promise<void> {
-  if (!context.autoTraceDir || !context.recorder || context.recorder.isActive)
+  if (!context.autoTraceDir || context.autoRecordingDismissed || !context.recorder || context.recorder.isActive)
     return
   const serialArg = typeof args.serial === 'string' ? args.serial : undefined
   const serial = await serialFor(context, serialArg)
   const device = await deviceInfo(context, serial)
   await context.recorder.start({ name: 'auto', task: 'Automatic FLOW_TRACE_DIR recording', vars: {}, device })
+}
+
+async function settle(ms: unknown): Promise<void> {
+  if (typeof ms === 'number' && ms > 0)
+    await new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function shellQuote(value: string): string {
+  return `'${shellEscape(value)}'`
+}
+
+function safeShell(command: string): string {
+  validateShellCommand(command)
+  return command
 }
 
 async function invoke(
@@ -118,9 +140,17 @@ async function invoke(
 ) {
   const { context } = flow
   try {
-    if (tool !== 'flow_record_start' && tool !== 'flow_record_stop' && tool !== 'flow_step')
+    if (tool !== 'flow_record_start' && tool !== 'flow_record_stop')
       await ensureAutoRecording(context, args)
     const serial = opts.serial ?? (typeof args.serial === 'string' ? await serialFor(context, args.serial) : undefined)
+    // Policy B (design 10.2): actions refuse a device leased by another process, but never acquire one.
+    if (kind === 'action' && serial && context.lease) {
+      const lease = await context.lease.info(serial)
+      if (lease && lease.pid !== process.pid)
+        throw new Error(`DEVICE_BUSY: ${serial} is leased by ${lease.holder} (pid ${lease.pid}); wait for device_release or claim another device`)
+      if (lease)
+        await context.lease.refresh(serial).catch(() => {})
+    }
     const before = opts.before && serial ? await prepareBefore(context, serial) : undefined
     const value = await runTool(context, tool, args, () => handler(serial!, before), kind, before)
     return ok(value)
@@ -145,15 +175,40 @@ function registerTool(flow: FlowMcpServer, name: string, description: string, in
 
 function registerFlowTools(flow: FlowMcpServer): void {
   const { context } = flow
-  registerTool(flow, 'device_list', 'List connected Android devices.', {}, async () => {
+  registerTool(flow, 'device_list', 'List connected Android devices with their lease state.', {}, async () => {
     const devices = context.adbx ? await context.adbx.getDevices() : []
-    return ok(devices)
+    const listed = await Promise.all(devices.map(async (device) => {
+      // An unreadable lock file must not hide the device; report it as unleased.
+      const lease = context.lease ? await context.lease.info(device.id).catch(() => undefined) : undefined
+      return { ...device, lease: lease ? leaseDetails(lease) : null }
+    }))
+    return ok(listed)
   })
 
   registerTool(flow, 'device_select', 'Select the default Android device for subsequent calls.', { serial: z.string() }, async ({ serial }) => {
     const selected = await serialFor(context, serial)
     context.defaultSerial = selected
     return ok({ serial: selected })
+  })
+
+  // Claim/release are recorded as meta: they coordinate agents, not the device UI,
+  // so compileTrace produces no replay steps for them.
+  registerTool(flow, 'device_claim', 'Claim an exclusive cross-process lease on a device.', { serial: selectorShape.serial, holder: z.string().optional().describe('Holder name recorded in the lease; defaults to the agent pid') }, async (args) => {
+    const serial = await serialFor(context, args.serial)
+    return invoke(flow, 'device_claim', args, 'meta', async () => {
+      if (!context.lease)
+        throw new Error('Lease is unavailable; provide a lease')
+      return context.lease.acquire(serial, { holder: args.holder })
+    }, { serial })
+  })
+
+  registerTool(flow, 'device_release', 'Release the lease on a device.', { serial: selectorShape.serial }, async (args) => {
+    const serial = await serialFor(context, args.serial)
+    return invoke(flow, 'device_release', args, 'meta', async () => {
+      if (!context.lease)
+        throw new Error('Lease is unavailable; provide a lease')
+      return context.lease.release(serial)
+    }, { serial })
   })
 
   registerTool(flow, 'device_info', 'Return device identity and screen information.', { serial: selectorShape.serial }, async (args) => {
@@ -213,9 +268,10 @@ function registerFlowTools(flow: FlowMcpServer): void {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'ui_tap', args, 'action', async (_serial, before) => {
       const target = selectorOf(args)
-      const result = await context.device.tap(serial, target, { snapshot: before?.id ?? 'fresh' })
-      const traceTarget = before ? elementTarget(before, result) : undefined
-      return { value: { ...result, point: result.point, ratio: result.ratio }, target: traceTarget }
+      const value = await context.device.tap(serial, target, { snapshot: before?.id ?? 'fresh' })
+      const traceTarget = before ? elementTarget(before, value) : undefined
+      await settle(args.settle)
+      return { value: { ...value, point: value.point, ratio: value.ratio }, target: traceTarget }
     }, { serial, before: true })
   })
 
@@ -224,6 +280,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
     return invoke(flow, 'tap', args, 'action', async (_serial, before) => {
       const point = pointOf(args)
       await context.device.tap(serial, point)
+      await settle(args.settle)
       return { value: { serial, ratio: point }, target: await hitTarget(context, serial, point, before) }
     }, { serial, before: true })
   })
@@ -241,15 +298,20 @@ function registerFlowTools(flow: FlowMcpServer): void {
     return invoke(flow, 'swipe', args, 'action', async () => context.device.swipe(serial, pointOf({ x: args.x1, y: args.y1 }), pointOf({ x: args.x2, y: args.y2 }), args.duration_ms), { serial, before: true })
   })
 
-  registerTool(flow, 'key_event', 'Send a key event by Android key name or numeric code.', { serial: selectorShape.serial, keycode: z.union([z.string(), z.number()]) }, async (args) => {
+  registerTool(flow, 'key_event', 'Send a key event by Android key name or numeric code.', { serial: selectorShape.serial, keycode: z.union([z.string(), z.number()]), settle: settleShape }, async (args) => {
     const serial = await serialFor(context, args.serial)
-    return invoke(flow, 'key_event', args, 'action', async () => ({ keycode: await context.device.key(serial, args.keycode) }), { serial, before: true })
+    return invoke(flow, 'key_event', args, 'action', async () => {
+      const keycode = await context.device.key(serial, args.keycode)
+      await settle(args.settle)
+      return { keycode }
+    }, { serial, before: true })
   })
 
-  registerTool(flow, 'input_text', 'Type text into the focused field.', { serial: selectorShape.serial, text: z.string() }, async (args) => {
+  registerTool(flow, 'input_text', 'Type text into the focused field.', { serial: selectorShape.serial, text: z.string(), settle: settleShape }, async (args) => {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'input_text', args, 'action', async () => {
       await context.device.inputText(serial, args.text)
+      await settle(args.settle)
       return { serial, length: args.text.length }
     }, { serial, before: true })
   })
@@ -260,11 +322,12 @@ function registerFlowTools(flow: FlowMcpServer): void {
       if (!context.adbx)
         throw new Error('app_start requires an ADB backend')
       if (args.restart)
-        await context.adbx.shell(serial, `am force-stop ${args.package}`)
+        await context.adbx.shell(serial, safeShell(`am force-stop ${shellQuote(args.package)}`))
       const component = args.activity ? `${args.package}/${args.activity}` : undefined
-      await context.adbx.shell(serial, component ? `am start -n ${component}` : `monkey -p ${args.package} -c android.intent.category.LAUNCHER 1`)
+      await context.adbx.shell(serial, component ? safeShell(`am start -n ${shellQuote(component)}`) : safeShell(`monkey -p ${shellQuote(args.package)} -c android.intent.category.LAUNCHER 1`))
+      await settle(args.settle)
       return { serial, package: args.package, activity: args.activity }
-    }, { serial, before: true })
+    }, { serial })
   })
 
   registerTool(flow, 'app_stop', 'Stop an Android application.', { serial: selectorShape.serial, package: z.string(), settle: z.number().int().min(0).max(5000).optional() }, async (args) => {
@@ -272,7 +335,8 @@ function registerFlowTools(flow: FlowMcpServer): void {
     return invoke(flow, 'app_stop', args, 'action', async () => {
       if (!context.adbx)
         throw new Error('app_stop requires an ADB backend')
-      await context.adbx.shell(serial, `am force-stop ${args.package}`)
+      await context.adbx.shell(serial, safeShell(`am force-stop ${shellQuote(args.package)}`))
+      await settle(args.settle)
       return { serial, package: args.package }
     }, { serial, before: true })
   })
@@ -282,8 +346,9 @@ function registerFlowTools(flow: FlowMcpServer): void {
     return invoke(flow, 'open_url', args, 'action', async () => {
       if (!context.adbx)
         throw new Error('open_url requires an ADB backend')
-      const escaped = args.url.replaceAll('\'', '\'\\\'\'')
-      await context.adbx.shell(serial, `am start -a android.intent.action.VIEW -d '${escaped}'`)
+      const escaped = shellQuote(args.url)
+      await context.adbx.shell(serial, safeShell(`am start -a android.intent.action.VIEW -d ${escaped}`))
+      await settle(args.settle)
       return { serial, url: args.url }
     }, { serial, before: true })
   })
@@ -312,7 +377,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
     return invoke(flow, 'shell_exec', args, 'action', async () => {
       if (!context.adbx)
         throw new Error('shell_exec requires an ADB backend')
-      return { output: await context.adbx.shell(serial, args.command) }
+      return { output: await context.adbx.shell(serial, safeShell(args.command)) }
     }, { serial, before: true })
   })
 
@@ -336,6 +401,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
   registerTool(flow, 'flow_record_stop', 'Stop recording and return the trace path.', { outcome: z.string().default('completed') }, async ({ outcome }) => {
     if (!context.recorder)
       throw new Error('Recording is unavailable; set FLOW_TRACE_DIR or provide a recorder')
+    context.autoRecordingDismissed = true
     return ok(await context.recorder.stop(outcome))
   })
 
@@ -359,6 +425,7 @@ export function createFlowMcpServer(options: FlowMcpOptions): FlowMcpServer {
   const recorder = options.recorder ?? (traceDir ? new FlowTraceRecorder({ dir: traceDir }) : undefined)
   const context: FlowMcpServer['context'] = {
     device: options.device,
+    lease: options.lease ?? createDeviceLease(),
     recorder,
     defaultSerial: options.defaultSerial ?? process.env.ANDROID_SERIAL,
     resolveSerial: options.resolveSerial ?? (async (serial) => {

@@ -1,8 +1,9 @@
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { exportFlow, HELP, parseCliArgs, runCli } from '../src/index.js'
+import { createDeviceLease } from '@escrcpy/flow-device'
+import { exportFlow, HELP, parseCliArgs, runCli, withDeviceLease } from '../src/index.js'
 
 const trace = [
   {
@@ -94,5 +95,28 @@ describe('flow compile/export commands', () => {
       description: 'Open settings',
       steps: [{ id: 'tap-1', action: 'tap', intent: 'open settings', target: [{ content_desc: 'Settings', exact: true }] }],
     })
+  })
+})
+
+describe('withDeviceLease', () => {
+  it('acquires, releases, and fails fast on a busy device', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'flow-cli-lease-'))
+    process.env.FLOW_LEASE_DIR = dir
+    process.env.FLOW_AGENT_NAME = 'cli-test'
+    try {
+      expect(await withDeviceLease('serial-a', {}, async () => 'ran')).toBe('ran')
+      expect(await createDeviceLease().info('serial-a')).toBeUndefined()
+
+      const owner = createDeviceLease({ dir })
+      await owner.acquire('serial-a', { holder: 'someone-else' })
+      await expect(withDeviceLease('serial-a', {}, async () => 'ran')).rejects.toThrow(/device busy.*someone-else/s)
+      expect(await withDeviceLease('serial-a', { 'no-lease': true }, async () => 'ran')).toBe('ran')
+      await owner.release('serial-a')
+    }
+    finally {
+      delete process.env.FLOW_LEASE_DIR
+      delete process.env.FLOW_AGENT_NAME
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 })

@@ -167,6 +167,7 @@ export class FlowTraceRecorder {
       await this.saveSnapshot(call.before)
     if (call.snapshot)
       await this.saveSnapshot(call.snapshot)
+    const intent = call.intent ?? (call.kind === 'action' ? this.intent : undefined)
     const event: CallEvent = {
       type: 'call',
       seq: ++this.seq,
@@ -179,10 +180,12 @@ export class FlowTraceRecorder {
       ...(call.target ? { target: call.target } : {}),
       ...(call.snapshotRef ? { snapshotRef: call.snapshotRef } : {}),
       durationMs: call.durationMs,
-      ...(call.intent ?? this.intent ? { intent: call.intent ?? this.intent } : {}),
+      ...(intent ? { intent } : {}),
       ...(call.error ? { error: call.error } : {}),
     }
     await this.append(event)
+    if (call.kind === 'action' && call.ok)
+      this.intent = undefined
   }
 
   async stop(outcome: string): Promise<TraceResult | undefined> {
