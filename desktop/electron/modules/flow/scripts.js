@@ -110,3 +110,66 @@ export async function exportOfficialAutomation(flowPath) {
   const { script, skipped } = toAutomationScript(flow)
   return { script, skipped }
 }
+
+/**
+ * One flow across several devices and variable rows: devices run in parallel,
+ * rows run sequentially per device, all behind the shared lease. Mirrors the
+ * original app's batch dialog (variable table) but multi-device.
+ */
+export async function runFlowBatch({ path: flowPath, serials, rows, heal = false, onProgress }) {
+  const flow = await readFlow(flowPath)
+  const adb = adbkit.Adb.createClient()
+  const adbx = createAdbx({ adb, yadbPath: process.env.YADB_PATH ?? '' })
+  const device = { ...createFlowDevice({ adbx }), shell: (serial_, command) => adbx.shell(serial_, command) }
+  const lease = createDeviceLease()
+  const resolved = heal ? resolveLlm(loadLlmConfig()) : undefined
+  const results = []
+  const total = serials.length * rows.length
+  let done = 0
+  const report = (extra) => {
+    done++
+    onProgress?.({ done, total, ...extra })
+  }
+  await Promise.all(serials.map(async (serial) => {
+    try {
+      await lease.acquire(serial, { holder: 'escrcpy-desktop' })
+    }
+    catch (error) {
+      const busy = error instanceof LeaseBusyError
+        ? `leased by ${error.lease.holder} (pid ${error.lease.pid})`
+        : error.message
+      for (const row of rows) {
+        results.push({ serial, row, status: 'skipped', error: `device busy: ${busy}` })
+        report({ serial, status: 'skipped' })
+      }
+      return
+    }
+    try {
+      for (const row of rows) {
+        const reportDir = join(flowReportsDir(), flow.name, serial, new Date().toISOString().replace(/[:.]/g, '-'))
+        mkdirSync(reportDir, { recursive: true })
+        try {
+          const result = await replayFlow(flow, {
+            serial,
+            device,
+            vars: row,
+            flowPath,
+            reportDir,
+            outputDir: reportDir,
+            ...(resolved ? { heal: { client: resolved.client, writePatch: true } } : {}),
+          })
+          results.push({ serial, row, status: result.status, durationMs: result.durationMs, reportDir })
+          report({ serial, status: result.status })
+        }
+        catch (error) {
+          results.push({ serial, row, status: 'failed', error: error.message, reportDir })
+          report({ serial, status: 'failed' })
+        }
+      }
+    }
+    finally {
+      await lease.release(serial)
+    }
+  }))
+  return { results, total }
+}

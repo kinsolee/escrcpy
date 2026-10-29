@@ -102,6 +102,72 @@
           </el-table>
         </div>
 
+        <div v-if="current" class="border rounded p-3 flex flex-col gap-2">
+          <div class="text-sm font-medium">
+            {{ $t('flow.batch.title') }}
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <el-select
+              v-model="batchSerials"
+              multiple
+              collapse-tags
+              :placeholder="$t('flow.batch.devices')"
+              size="small"
+              class="w-72"
+            >
+              <el-option
+                v-for="device in devices"
+                :key="device.id"
+                :label="`${device.name || device.id} (${device.id})`"
+                :value="device.id"
+              />
+            </el-select>
+            <el-button size="small" @click="addBatchRow">
+              {{ $t('flow.batch.addRow') }}
+            </el-button>
+            <el-button size="small" plain @click="csvInput?.click()">
+              {{ $t('flow.batch.importCsv') }}
+            </el-button>
+            <el-button size="small" text type="danger" @click="batchRows = []">
+              {{ $t('flow.batch.clear') }}
+            </el-button>
+            <div class="flex-1" />
+            <el-button
+              size="small"
+              type="primary"
+              :loading="batchRunning"
+              :disabled="!batchSerials.length || !batchRows.length"
+              @click="runBatch"
+            >
+              {{ batchRunning ? `${batchDone}/${batchTotal}` : $t('flow.batch.run') }}
+            </el-button>
+          </div>
+          <div v-if="batchRows.length" class="flex flex-col gap-1">
+            <div v-if="current.vars?.length" class="flex gap-1 text-xs opacity-60">
+              <span v-for="name in current.vars" :key="name" class="w-44 truncate">{{ name }}</span>
+              <span class="w-8" />
+            </div>
+            <div v-for="(row, index) in batchRows" :key="index" class="flex gap-1 items-center">
+              <el-input
+                v-for="name in current.vars?.length ? current.vars : ['value']"
+                :key="name"
+                v-model="row[name]"
+                size="small"
+                class="w-44"
+              />
+              <el-button size="small" text type="danger" circle @click="batchRows.splice(index, 1)">
+                <template #icon>
+                  <el-icon-close />
+                </template>
+              </el-button>
+            </div>
+          </div>
+          <div v-if="batchSummary" class="text-xs" :class="batchAllOk ? 'text-success' : 'text-danger'">
+            {{ batchSummary }}
+          </div>
+          <input ref="csvInput" type="file" accept=".csv,text/csv" class="hidden" @change="onCsvChange">
+        </div>
+
         <div class="border rounded p-3 flex flex-col gap-2">
           <div class="text-sm font-medium">
             {{ $t('flow.run.reports') }}
@@ -149,6 +215,15 @@ const running = ref(false)
 const report = ref(null)
 const reportDir = ref('')
 
+const batchSerials = ref([])
+const batchRows = ref([])
+const batchRunning = ref(false)
+const batchDone = ref(0)
+const batchTotal = ref(0)
+const batchSummary = ref('')
+const batchAllOk = ref(true)
+const csvInput = ref(null)
+
 const devices = computed(() => deviceStore.list.filter(device => device.status === 'device'))
 
 function invoke(channel, payload) {
@@ -178,7 +253,81 @@ function selectFlow(item) {
     return
   current.value = item
   vars.value = Object.fromEntries((item.vars ?? []).map(name => [name, '']))
+  batchRows.value = []
+  batchSummary.value = ''
   report.value = null
+}
+
+function addBatchRow() {
+  const names = current.value?.vars?.length ? current.value.vars : ['value']
+  batchRows.value.push(Object.fromEntries(names.map(name => [name, ''])))
+}
+
+function splitCsvLine(line) {
+  return line.split(',').map(cell => cell.trim().replace(/^"|"$/g, ''))
+}
+
+function onCsvChange(event) {
+  const file = event.target.files?.[0]
+  event.target.value = ''
+  if (!file || !current.value)
+    return
+  const reader = new FileReader()
+  reader.onload = () => {
+    const lines = String(reader.result).split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    if (!lines.length)
+      return
+    const names = current.value.vars ?? []
+    const header = splitCsvLine(lines[0])
+    if (names.length && header.length && header.every(name => names.includes(name.trim()))) {
+      batchRows.value = lines.slice(1).map((line) => {
+        const cells = splitCsvLine(line)
+        return Object.fromEntries(names.map((name, index) => [name, cells[index] ?? '']))
+      })
+    }
+    else if (names.length <= 1) {
+      // Single-variable flows accept a plain value-per-line file without a header.
+      batchRows.value = lines.map(line => ({ [names[0] ?? 'value']: line }))
+    }
+    else {
+      ElMessage.error(window.t('flow.batch.csvMismatch', { expected: names.join(', ') }))
+      return
+    }
+    ElMessage.success(window.t('flow.batch.loaded', { count: batchRows.value.length }))
+  }
+  reader.readAsText(file)
+}
+
+async function runBatch() {
+  if (!current.value)
+    return
+
+  batchRunning.value = true
+  batchDone.value = 0
+  batchTotal.value = batchSerials.value.length * batchRows.value.length
+  batchSummary.value = ''
+  try {
+    const { success, completed, total, error } = await invoke('flow:run-batch', {
+      path: current.value.path,
+      serials: batchSerials.value,
+      rows: batchRows.value,
+      heal: heal.value,
+      onProgress: info => (batchDone.value = info.done),
+    })
+    if (error) {
+      ElMessage.error(error)
+      return
+    }
+    batchDone.value = total
+    batchAllOk.value = success
+    batchSummary.value = window.t('flow.batch.done', { ok: completed, total })
+    if (!success)
+      ElMessage.warning(window.t('flow.run.failed'))
+    loadReports()
+  }
+  finally {
+    batchRunning.value = false
+  }
 }
 
 async function runFlow() {

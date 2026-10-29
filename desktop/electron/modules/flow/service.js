@@ -2,7 +2,7 @@ import { dialog } from 'electron'
 import { writeFileSync } from 'node:fs'
 import { ipcxMain } from '@escrcpy/electron-ipcx/main'
 import { createLlmClient, listLlmModels, llmConfigSchema, loadLlmConfig, saveLlmConfig } from '@escrcpy/flow-core'
-import { exportOfficialAutomation, flowReportsDir, flowScriptsDir, listFlows, listReports, runFlowOnDevice } from './scripts.js'
+import { exportOfficialAutomation, flowReportsDir, flowScriptsDir, listFlows, listReports, runFlowBatch, runFlowOnDevice } from './scripts.js'
 
 // Kept tiny on purpose: the round-trip proves auth, wire format and JSON-decision
 // parsing together, which is exactly what the heal agent depends on.
@@ -49,6 +49,13 @@ const handlers = {
       return { success: false, error: 'path and serial are required' }
     const { report, reportDir } = await runFlowOnDevice(payload)
     return { success: report.status === 'completed', report, reportDir }
+  },
+  'flow:run-batch': async (_event, payload) => {
+    if (!payload?.path || !payload?.serials?.length || !payload?.rows?.length)
+      return { success: false, error: 'path, serials and rows are required' }
+    const { results, total } = await runFlowBatch({ ...payload, onProgress: payload.onProgress })
+    const completed = results.filter(item => item.status === 'completed').length
+    return { success: completed === total, completed, total, results }
   },
   'flow:reports': async () => {
     return { success: true, dir: flowReportsDir(), reports: listReports() }
