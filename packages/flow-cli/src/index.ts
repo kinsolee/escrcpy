@@ -49,6 +49,7 @@ Run options:
   --heal                        Let the L2 heal agent recover failed steps that have an expect
   --heal-goal                   When the run still fails, let the LLM explore toward the
                                 flow's goal description and write a repair patch (implies --heal)
+  --goal-max <n>                Cap goal-recovery exploration actions (default 30)
 
 Heal options:
   --flow <path>                 Flow YAML for flow heal (default: the flowPath saved in the report)
@@ -109,6 +110,7 @@ interface CliValues {
   'no-lease'?: boolean
   'heal'?: boolean
   'heal-goal'?: boolean
+  'goal-max'?: string
   'apply'?: boolean
   'flow'?: string
 }
@@ -150,6 +152,7 @@ const CLI_OPTIONS = {
   'on-busy': { type: 'string' },
   'heal': { type: 'boolean' },
   'heal-goal': { type: 'boolean' },
+  'goal-max': { type: 'string' },
   'apply': { type: 'boolean' },
   'flow': { type: 'string' },
 } as const
@@ -336,6 +339,19 @@ function requireHealClient(): HealLlmClient {
   return client
 }
 
+/** `--heal-goal` with an optional `--goal-max` cap; NaN/nonpositive budgets are rejected here. */
+function goalHealOption(values: CliValues): boolean | { maxActions: number } | undefined {
+  if (!values['heal-goal'])
+    return undefined
+  const raw = values['goal-max']
+  if (raw === undefined)
+    return true
+  const maxActions = Number(raw)
+  if (!Number.isInteger(maxActions) || maxActions < 1)
+    throw new Error(`--goal-max expects a positive integer, got ${raw}`)
+  return { maxActions }
+}
+
 async function runCommand(input: string, values: CliValues): Promise<void> {
   if (!input)
     throw new Error('flow run requires a flow YAML path')
@@ -352,7 +368,7 @@ async function runCommand(input: string, values: CliValues): Promise<void> {
     vars: parseVars(values),
     ...(reportDir ? { reportDir } : {}),
     ...(values['out-dir'] ? { outputDir: values['out-dir'] } : {}),
-    ...(healClient ? { flowPath: input, heal: { client: healClient, writePatch: true, logger: (message: string) => console.error(message), ...(values['heal-goal'] ? { goal: true } : {}) } } : {}),
+    ...(healClient ? { flowPath: input, heal: { client: healClient, writePatch: true, logger: (message: string) => console.error(message), ...(goalHealOption(values) ? { goal: goalHealOption(values) } : {}) } } : {}),
   }))
   if (reportPath?.toLowerCase().endsWith('.json'))
     await writeFile(reportPath, JSON.stringify(report, null, 2), 'utf8')
@@ -416,7 +432,7 @@ async function healCommand(reportPath: string, values: CliValues): Promise<void>
     serial,
     vars: parseVars(values),
     flowPath,
-    heal: { client, writePatch: true, logger: (message: string) => console.error(message), ...(values['heal-goal'] ? { goal: true } : {}) },
+    heal: { client, writePatch: true, logger: (message: string) => console.error(message), ...(goalHealOption(values) ? { goal: goalHealOption(values) } : {}) },
   }))
   const patches = (await listPatches(flowPath)).filter(path => !before.has(path))
   for (const stepReport of healed.steps) {

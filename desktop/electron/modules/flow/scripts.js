@@ -20,7 +20,8 @@ export function listFlows() {
   if (!existsSync(dir))
     return []
   return readdirSync(dir)
-    .filter(file => /\.ya?ml$/.test(file))
+    // Only flow scripts (*.flow.yaml); patch files (<flow>.flow.yaml.patch-N.yaml) are not flows.
+    .filter(file => /\.flow\.ya?ml$/.test(file))
     .map((file) => {
       const path = join(dir, file)
       try {
@@ -68,7 +69,8 @@ export function listReports(limit = 20) {
 /**
  * Replay one flow on one device behind the shared cross-process lease.
  * Healing pulls the active model from the shared LLM config when enabled;
- * `healGoal` additionally runs goal-driven recovery when the run still fails.
+ * `healGoal` (boolean, or a number capping exploration actions) additionally
+ * runs goal-driven recovery when the run still fails.
  */
 export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal = false, healGoal = false }) {
   const flow = await readFlow(flowPath)
@@ -89,6 +91,7 @@ export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal 
   mkdirSync(reportDir, { recursive: true })
   try {
     const resolved = (heal || healGoal) ? resolveLlm(loadLlmConfig()) : undefined
+    const goal = typeof healGoal === 'number' ? { maxActions: healGoal } : true
     const report = await replayFlow(flow, {
       serial,
       device,
@@ -96,7 +99,7 @@ export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal 
       flowPath,
       reportDir,
       outputDir: reportDir,
-      ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(healGoal ? { goal: true } : {}) } } : {}),
+      ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(healGoal ? { goal } : {}) } } : {}),
     })
     return { report, reportDir }
   }
@@ -124,6 +127,7 @@ export async function runFlowBatch({ path: flowPath, serials, rows, heal = false
   const device = { ...createFlowDevice({ adbx }), shell: (serial_, command) => adbx.shell(serial_, command) }
   const lease = createDeviceLease()
   const resolved = (heal || healGoal) ? resolveLlm(loadLlmConfig()) : undefined
+  const goal = typeof healGoal === 'number' ? { maxActions: healGoal } : true
   const results = []
   const total = serials.length * rows.length
   let done = 0
@@ -157,7 +161,7 @@ export async function runFlowBatch({ path: flowPath, serials, rows, heal = false
             flowPath,
             reportDir,
             outputDir: reportDir,
-            ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(healGoal ? { goal: true } : {}) } } : {}),
+            ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(healGoal ? { goal } : {}) } } : {}),
           })
           results.push({ serial, row, status: result.status, durationMs: result.durationMs, reportDir })
           report({ serial, status: result.status })

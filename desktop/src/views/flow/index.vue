@@ -64,6 +64,15 @@
               :active-text="$t('flow.run.healGoal')"
               size="small"
             />
+            <el-input-number
+              v-if="healGoal"
+              v-model="goalMax"
+              :min="1"
+              :max="100"
+              size="small"
+              class="w-28"
+              :title="$t('flow.run.goalMax')"
+            />
             <div class="flex-1" />
             <el-button size="small" :loading="running" :disabled="!serial" @click="runFlow">
               {{ running ? $t('flow.run.running') : $t('flow.run.name') }}
@@ -102,6 +111,15 @@
             <span v-if="report.goal.patchPath" class="truncate text-xs opacity-60" :title="report.goal.patchPath">
               {{ report.goal.patchPath }}
             </span>
+            <el-button
+              v-if="report.goal.patchPath && current"
+              size="small"
+              type="warning"
+              plain
+              @click="applyGoalPatch"
+            >
+              {{ $t('flow.run.applyPatch') }}
+            </el-button>
           </div>
           <el-table :data="report.steps" size="small" border>
             <el-table-column prop="id" label="ID" min-width="120" />
@@ -214,7 +232,7 @@
 </template>
 
 <script setup>
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const deviceStore = useDeviceStore()
 
@@ -225,6 +243,7 @@ const current = ref(null)
 const serial = ref('')
 const heal = ref(false)
 const healGoal = ref(false)
+const goalMax = ref(30)
 const vars = ref({})
 const running = ref(false)
 const report = ref(null)
@@ -327,7 +346,7 @@ async function runBatch() {
       serials: batchSerials.value,
       rows: batchRows.value,
       heal: heal.value,
-      healGoal: healGoal.value,
+      healGoal: healGoal.value ? goalMax.value : false,
       onProgress: info => (batchDone.value = info.done),
     })
     if (error) {
@@ -357,7 +376,7 @@ async function runFlow() {
       serial: serial.value,
       vars: Object.fromEntries(Object.entries(vars.value).filter(([, value]) => value !== '')),
       heal: heal.value,
-      healGoal: healGoal.value,
+      healGoal: healGoal.value ? goalMax.value : false,
     })
     if (error) {
       ElMessage.error(error)
@@ -372,6 +391,44 @@ async function runFlow() {
   finally {
     running.value = false
   }
+}
+
+const escapeHtml = text => text.replace(/[&<>]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[ch])
+
+/** Preview the goal patch (path + YAML), confirm, then rewrite the flow file in place. */
+async function applyGoalPatch() {
+  const patchPath = report.value?.goal?.patchPath
+  if (!patchPath || !current.value)
+    return
+
+  const { success: read, content = '', error: readError } = await invoke('flow:patch-read', { patchPath })
+  if (!read) {
+    ElMessage.error(readError)
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `<div class="text-xs opacity-60 break-all">${escapeHtml(patchPath)}</div>`
+      + `<pre class="m-0 mt-2 text-xs" style="max-height:220px;overflow:auto">${escapeHtml(content)}</pre>`,
+      window.t('flow.run.applyPatch'),
+      {
+        type: 'warning',
+        dangerouslyUseHTMLString: true,
+        confirmButtonText: window.t('common.confirm'),
+        cancelButtonText: window.t('common.cancel'),
+      },
+    )
+  }
+  catch {
+    return
+  }
+  const { success, error } = await invoke('flow:patch-apply', { flowPath: current.value.path, patchPath })
+  if (!success) {
+    ElMessage.error(error)
+    return
+  }
+  ElMessage.success(window.t('flow.run.patchApplied'))
+  loadFlows()
 }
 
 async function exportOfficial() {

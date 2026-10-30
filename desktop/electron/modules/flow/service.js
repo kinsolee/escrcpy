@@ -1,7 +1,7 @@
+import { readFileSync, writeFileSync } from 'node:fs'
 import { dialog } from 'electron'
-import { writeFileSync } from 'node:fs'
 import { ipcxMain } from '@escrcpy/electron-ipcx/main'
-import { createLlmClient, listLlmModels, llmConfigSchema, loadLlmConfig, saveLlmConfig } from '@escrcpy/flow-core'
+import { applyPatch, createLlmClient, listLlmModels, llmConfigSchema, loadLlmConfig, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
 import { exportOfficialAutomation, flowReportsDir, flowScriptsDir, listFlows, listReports, runFlowBatch, runFlowOnDevice } from './scripts.js'
 
 // Kept tiny on purpose: the round-trip proves auth, wire format and JSON-decision
@@ -63,6 +63,17 @@ const handlers = {
   },
   'flow:reports': async () => {
     return { success: true, dir: flowReportsDir(), reports: listReports() }
+  },
+  'flow:patch-read': async (_event, payload) => {
+    if (!payload?.patchPath)
+      return { success: false, error: 'patchPath is required' }
+    return { success: true, content: readFileSync(payload.patchPath, 'utf8') }
+  },
+  'flow:patch-apply': async (_event, payload) => {
+    if (!payload?.flowPath || !payload?.patchPath)
+      return { success: false, error: 'flowPath and patchPath are required' }
+    await writeFlow(payload.flowPath, await applyPatch(payload.flowPath, payload.patchPath))
+    return { success: true }
   },
   'flow:export': async (event, payload) => {
     if (!payload?.path)
