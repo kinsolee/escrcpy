@@ -57,6 +57,10 @@ const tabsModel = [
     value: '/flow',
   },
   {
+    label: 'menus.copilot.name',
+    value: '/copilot',
+  },
+  {
     label: 'menus.preference.name',
     value: '/preference',
   },

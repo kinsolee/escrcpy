@@ -11,6 +11,10 @@ import type { DeviceLease, FlowDevice, LeaseInfo, Snapshot } from '@escrcpy/flow
 import { LeaseBusyError, parseUiTree } from '@escrcpy/flow-device'
 import { fixture } from '../../flow-device/test/helpers.js'
 
+// The real factory builds an adb client; vitest's CJS interop hides adbkit's
+// namespace, so stub it — nothing in these tests should reach a device anyway.
+vi.mock('@devicefarmer/adbkit', () => ({ default: { Adb: { createClient: () => ({}) } } }))
+
 function snapshot(serial: string): Snapshot {
   return {
     id: 'snap_fixture',
@@ -282,5 +286,22 @@ describe('flow MCP lease tools', () => {
     expect(warnings.join('\n')).not.toContain('device_release')
     await client.close()
     await flow.server.close()
+  })
+})
+
+describe('createInProcessFlowMcp', () => {
+  it('lists the full tool surface and rejects unknown tools without touching a device', async () => {
+    const { createInProcessFlowMcp } = await import('../src/index.js')
+    const mcp = await createInProcessFlowMcp({})
+    try {
+      const names = mcp.tools.map(tool => tool.name)
+      expect(names.length).toBeGreaterThan(25)
+      expect(names).toContain('device_select')
+      expect(names).toContain('flow_record_start')
+      await expect(mcp.callTool('definitely_not_a_tool', {})).rejects.toThrow()
+    }
+    finally {
+      await mcp.close()
+    }
   })
 })

@@ -1,3 +1,4 @@
+export * from './agent.js'
 export * from './automation.js'
 export * from './compiler.js'
 export * from './extract.js'

@@ -39,6 +39,7 @@ import {
 
 import {
   controlModule,
+  copilotModule,
   explorerModule,
   flowModule,
   mainModule,
@@ -80,6 +81,7 @@ mainApp.use(shortcutsService)
 mainApp.use(controlModule)
 mainApp.use(explorerModule)
 mainApp.use(flowModule)
+mainApp.use(copilotModule)
 mainApp.use(terminalModule)
 
 app.whenReady().then(() => {

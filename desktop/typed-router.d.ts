@@ -38,6 +38,13 @@ declare module 'vue-router/auto-routes' {
       Record<never, never>,
       | never
     >,
+    '/copilot/': RouteRecordInfo<
+      '/copilot/',
+      '/copilot',
+      Record<never, never>,
+      Record<never, never>,
+      | never
+    >,
     '/device/': RouteRecordInfo<
       '/device/',
       '/device',
@@ -75,6 +82,14 @@ declare module 'vue-router/auto-routes' {
     'src/views/about/index.vue': {
       routes:
         | '/about/'
+      views:
+        | never
+      pathParamNames:
+        | never
+    }
+    'src/views/copilot/index.vue': {
+      routes:
+        | '/copilot/'
       views:
         | never
       pathParamNames:

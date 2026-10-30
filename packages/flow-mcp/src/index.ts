@@ -14,6 +14,8 @@ import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@e
 import { llmConfigPath, loadLlmConfig, saveLlmConfig } from '@escrcpy/flow-core'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { z } from 'zod'
 import {
   asError,
@@ -483,6 +485,53 @@ export function createRealFlowMcpServer(options: RealFlowMcpOptions = {}): FlowM
   const adbx = createAdbx({ adb: adb as never, yadbPath: options.yadbPath ?? process.env.YADB_PATH })
   const device = createFlowDevice({ adbx })
   return createFlowMcpServer({ ...options, adbx, device })
+}
+
+/** MCP tool surface as the copilot agent loop sees it. */
+export interface InProcessTool {
+  name: string
+  description?: string
+  inputSchema?: Record<string, unknown>
+}
+
+export interface InProcessFlowMcp {
+  tools: InProcessTool[]
+  /** Runs one tool; resolves with its text content, rejects on isError. */
+  callTool: (name: string, args: Record<string, unknown>) => Promise<string>
+  close: () => Promise<void>
+}
+
+/**
+ * Same real MCP server the CLI exposes over stdio, wired to an in-memory client
+ * so the desktop copilot can drive it without spawning a subprocess.
+ */
+export async function createInProcessFlowMcp(options: RealFlowMcpOptions = {}): Promise<InProcessFlowMcp> {
+  const flow = createRealFlowMcpServer(options)
+  const client = new Client({ name: 'escrcpy-copilot', version: '0.0.0' })
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+  await Promise.all([
+    flow.server.connect(serverTransport),
+    client.connect(clientTransport),
+  ])
+  const listed = await client.listTools()
+  return {
+    tools: listed.tools.map(tool => ({
+      name: tool.name,
+      ...(tool.description ? { description: tool.description } : {}),
+      inputSchema: tool.inputSchema as Record<string, unknown>,
+    })),
+    callTool: async (name, args) => {
+      const result = await client.callTool({ name, arguments: args })
+      const content = (result.content ?? []) as Array<{ type?: string, text?: string }>
+      const text = content.map(item => item.text ?? '').join('\n').trim()
+      if (result.isError)
+        throw new Error(text || `tool ${name} failed`)
+      return text || JSON.stringify(result.structuredContent ?? '') || 'ok'
+    },
+    close: async () => {
+      await client.close()
+    },
+  }
 }
 
 export async function startFlowMcpServer(options: RealFlowMcpOptions = {}): Promise<void> {
