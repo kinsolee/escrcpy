@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync } from 'node:fs'
 import { dialog } from 'electron'
 import { ipcxMain } from '@escrcpy/electron-ipcx/main'
 import { applyPatch, createLlmClient, listLlmModels, llmConfigSchema, loadLlmConfig, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
+import { yadbPath } from '$electron/configs/extra/index.js'
 import { exportOfficialAutomation, flowReportsDir, flowScriptsDir, listFlows, listReports, runFlowBatch, runFlowOnDevice } from './scripts.js'
 
 // Kept tiny on purpose: the round-trip proves auth, wire format and JSON-decision
@@ -51,13 +52,13 @@ const handlers = {
   'flow:run': async (_event, payload) => {
     if (!payload?.path || !payload?.serial)
       return { success: false, error: 'path and serial are required' }
-    const { report, reportDir } = await runFlowOnDevice(payload)
+    const { report, reportDir } = await runFlowOnDevice({ yadbPath, ...payload })
     return { success: report.status === 'completed', report, reportDir }
   },
   'flow:run-batch': async (_event, payload) => {
     if (!payload?.path || !payload?.serials?.length || !payload?.rows?.length)
       return { success: false, error: 'path, serials and rows are required' }
-    const { results, total } = await runFlowBatch({ ...payload, onProgress: payload.onProgress })
+    const { results, total } = await runFlowBatch({ yadbPath, ...payload, onProgress: payload.onProgress })
     const completed = results.filter(item => item.status === 'completed').length
     return { success: completed === total, completed, total, results }
   },

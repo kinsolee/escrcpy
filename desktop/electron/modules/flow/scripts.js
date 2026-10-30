@@ -72,10 +72,10 @@ export function listReports(limit = 20) {
  * `healGoal` (boolean, or a number capping exploration actions) additionally
  * runs goal-driven recovery when the run still fails.
  */
-export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal = false, healGoal = false }) {
+export async function runFlowOnDevice({ path: flowPath, serial, vars = {}, heal = false, healGoal = false, yadbPath = process.env.YADB_PATH ?? '' }) {
   const flow = await readFlow(flowPath)
   const adb = adbkit.Adb.createClient()
-  const adbx = createAdbx({ adb, yadbPath: process.env.YADB_PATH ?? '' })
+  const adbx = createAdbx({ adb, yadbPath })
   // app_start/app_stop/shell steps go through adbx.shell; createFlowDevice does not wire it.
   const device = { ...createFlowDevice({ adbx }), shell: (serial_, command) => adbx.shell(serial_, command) }
   const lease = createDeviceLease()
@@ -120,10 +120,10 @@ export async function exportOfficialAutomation(flowPath) {
  * rows run sequentially per device, all behind the shared lease. Mirrors the
  * original app's batch dialog (variable table) but multi-device.
  */
-export async function runFlowBatch({ path: flowPath, serials, rows, heal = false, healGoal = false, onProgress }) {
+export async function runFlowBatch({ path: flowPath, serials, rows, heal = false, healGoal = false, yadbPath = process.env.YADB_PATH ?? '', onProgress }) {
   const flow = await readFlow(flowPath)
   const adb = adbkit.Adb.createClient()
-  const adbx = createAdbx({ adb, yadbPath: process.env.YADB_PATH ?? '' })
+  const adbx = createAdbx({ adb, yadbPath })
   const device = { ...createFlowDevice({ adbx }), shell: (serial_, command) => adbx.shell(serial_, command) }
   const lease = createDeviceLease()
   const resolved = (heal || healGoal) ? resolveLlm(loadLlmConfig()) : undefined
