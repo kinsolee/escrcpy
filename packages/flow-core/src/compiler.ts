@@ -5,6 +5,12 @@ import type { Snapshot, UiNode } from '@escrcpy/flow-device'
 import type { FlowScript, FlowStep, Selector, Target } from './schema.js'
 import { FLOW_SCHEMA_VERSION, flowSchema } from './schema.js'
 
+/**
+ * Session task written by FLOW_TRACE_DIR auto-recording. It says nothing about what
+ * the user wanted, so it never becomes a flow description (the goal-recovery target).
+ */
+export const AUTO_RECORDING_TASK = 'Automatic FLOW_TRACE_DIR recording'
+
 export interface TraceSessionEvent {
   type: 'session'
   id: string
@@ -157,9 +163,13 @@ export function compileTrace(input: string | TraceEvent[], options: CompileTrace
   const steps = mergeInputText(rawSteps, values)
   for (const [index, step] of steps.entries()) {
     const next = steps[index + 1]
-    const visible = next?.target?.[0] ?? (index === steps.length - 1 ? lastVisibleSelector(compiledCalls.at(-1), snapshots, calls) : undefined)
-    if (visible && !step.expect)
-      steps[index] = { ...step, expect: { visible } }
+    if (step.expect)
+      continue
+    const expect = next?.target?.[0]
+      ? { visible: next.target[0] }
+      : index === steps.length - 1 ? finalExpect(compiledCalls.at(-1), snapshots, calls) : undefined
+    if (expect)
+      steps[index] = { ...step, expect }
   }
 
   const firstApp = actionCalls.find(call => call.before?.app)?.before?.app
@@ -168,7 +178,7 @@ export function compileTrace(input: string | TraceEvent[], options: CompileTrace
   const flow = flowSchema.parse({
     version: FLOW_SCHEMA_VERSION,
     name: options.name ?? session.name,
-    description: options.description ?? session.task,
+    description: options.description ?? (session.task === AUTO_RECORDING_TASK ? undefined : session.task),
     ...(app ? { app } : {}),
     recordedOn: {
       ...(device.model ? { model: device.model } : {}),
@@ -280,19 +290,38 @@ function targetIndex(matches: UiNode[], target: TraceTarget): number {
   return matches.findIndex(node => node.bounds.left === bounds[0] && node.bounds.top === bounds[1] && node.bounds.right === bounds[2] && node.bounds.bottom === bounds[3])
 }
 
-function lastVisibleSelector(call: TraceCallEvent | undefined, snapshots: TraceSnapshots | undefined, calls: TraceCallEvent[]): Target | undefined {
+/**
+ * The last step has no successor target to wait for, so its expect comes from the
+ * screen observed after it. The foreground package is what carries over to other
+ * devices: text is locale-bound, and a layout id may exist only on one OEM build
+ * (a Pixel-recorded `android:id/content` never appears in a HyperOS dump).
+ * Only when the package is unknown does it fall back to a visible element.
+ */
+function finalExpect(call: TraceCallEvent | undefined, snapshots: TraceSnapshots | undefined, calls: TraceCallEvent[]): FlowStep['expect'] {
   const snapshotId = call?.snapshotRef ?? calls.find(event => event.seq > (call?.seq ?? -1) && event.kind === 'observe' && event.ok)?.snapshotRef
   const snapshot = snapshotId ? getSnapshot(snapshots, snapshotId) : undefined
-  const node = snapshot?.tree.nodes.find(node => node.contentDesc || node.text || node.resourceId)
-  if (!node)
-    return undefined
-  if (node.resourceId && !looksObfuscatedResourceId(node.resourceId))
-    return { resource_id: node.resourceId }
-  if (node.contentDesc)
-    return { content_desc: node.contentDesc, exact: true }
-  if (node.text)
-    return { text: node.text, exact: true }
+  const pkg = snapshot?.app?.package ?? call?.before?.app?.package
+  if (pkg)
+    return { app: { package: pkg } }
+  const visible = snapshot ? meaningfulSelector(snapshot.tree.nodes) : undefined
+  return visible ? { visible } : undefined
+}
+
+function meaningfulSelector(nodes: UiNode[]): Target | undefined {
+  for (const node of nodes) {
+    if (node.resourceId && !isStructuralResourceId(node.resourceId) && !looksObfuscatedResourceId(node.resourceId))
+      return { resource_id: node.resourceId }
+    if (node.contentDesc)
+      return { content_desc: node.contentDesc, exact: true }
+    if (node.text && !/\d/.test(node.text))
+      return { text: node.text, exact: true }
+  }
   return undefined
+}
+
+/** Framework layout containers: present on every screen of some builds and absent on others. */
+function isStructuralResourceId(value: string): boolean {
+  return /^android:id\/(?:content|list_container|statusBarBackground|navigationBarBackground|action_bar\w*|decor\w*)$/.test(value)
 }
 
 function getSnapshot(snapshots: TraceSnapshots | undefined, id: string): Snapshot | undefined {

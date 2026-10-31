@@ -58,7 +58,7 @@ const handlers = {
     const sessionId = `copilot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const traceDir = join(COPILOT_TRACES_DIR(), sessionId)
     const mcp = await createInProcessFlowMcp({ defaultSerial: payload.serial, traceDir, yadbPath })
-    sessions.set(sessionId, { mcp, traceDir, serial: payload.serial, messages: [], controller: null, createdAt: Date.now() })
+    sessions.set(sessionId, { mcp, traceDir, serial: payload.serial, messages: [], tasks: [], controller: null, createdAt: Date.now() })
     return { success: true, sessionId, toolCount: mcp.tools.length }
   },
 
@@ -72,6 +72,7 @@ const handlers = {
     if (!resolved)
       return { success: false, error: 'no AI model configured; set one up in Preferences' }
     session.messages.push({ role: 'user', content: payload.message })
+    session.tasks.push(payload.message)
     session.controller = new AbortController()
     try {
       const result = await runAgentLoop({
@@ -119,12 +120,19 @@ const handlers = {
     const tracePath = latestTrace(session)
     const { flow, warnings } = await compileTraceFile(tracePath, {
       name: payload.name || undefined,
-      description: payload.description || undefined,
+      // Auto-recorded traces carry no task text; what the user asked for is the goal
+      // that failed-run recovery explores toward.
+      description: payload.description || taskDescription(session) || undefined,
     })
     const path = join(flowScriptsDir(), `${flow.name}.flow.yaml`)
     await writeFlow(path, flow)
     return { success: true, path, name: flow.name, steps: flow.steps.length, warnings }
   },
+}
+
+function taskDescription(session) {
+  const text = session.tasks.map(task => String(task).trim()).filter(Boolean).join('；')
+  return text.length > 500 ? `${text.slice(0, 500)}…` : text
 }
 
 export default {

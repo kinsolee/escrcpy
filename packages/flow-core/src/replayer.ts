@@ -71,8 +71,17 @@ export interface StepReport {
   interrupts: number
   /** Set when the L2 heal agent recovered this step after a failure. */
   healed?: boolean
+  /** Heal agent journal for this step, whether or not it recovered. */
+  heal?: StepHealReport
   error?: string
   context?: { screenshot?: string, xml?: string }
+}
+
+export interface StepHealReport {
+  durationMs: number
+  actions: HealAttempt[]
+  /** Why healing gave up, when it did. */
+  reason?: string
 }
 
 export interface StepOutput {
@@ -419,6 +428,7 @@ async function healStep(flow: FlowScript, step: FlowStep, stepReport: StepReport
   const heal = options.heal!
   const log = heal.logger ?? (() => {})
   log(`heal: step ${step.id} failed — ${stepReport.error}`)
+  const started = Date.now()
   const result = await runHealAgent({
     flow,
     step,
@@ -429,6 +439,11 @@ async function healStep(flow: FlowScript, step: FlowStep, stepReport: StepReport
     logger: log,
     error: stepReport.error,
   })
+  stepReport.heal = {
+    durationMs: Date.now() - started,
+    actions: result.actions,
+    ...(result.reason !== undefined ? { reason: result.reason } : {}),
+  }
   if (!result.healed) {
     log(`heal: gave up on step ${step.id} — ${result.reason ?? 'expect never held'}`)
     return false

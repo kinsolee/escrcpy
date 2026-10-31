@@ -14,7 +14,7 @@ import {
 
 } from '@escrcpy/flow-device'
 import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
-import { compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, resolveLlm, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
+import { AUTO_RECORDING_TASK, compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, resolveLlm, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -120,7 +120,7 @@ async function ensureAutoRecording(context: FlowMcpServer['context'], args: Reco
   const serialArg = typeof args.serial === 'string' ? args.serial : undefined
   const serial = await serialFor(context, serialArg)
   const device = await deviceInfo(context, serial)
-  await context.recorder.start({ name: 'auto', task: 'Automatic FLOW_TRACE_DIR recording', vars: {}, device })
+  await context.recorder.start({ name: 'auto', task: AUTO_RECORDING_TASK, vars: {}, device })
 }
 
 async function settle(ms: unknown): Promise<void> {

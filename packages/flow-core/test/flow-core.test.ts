@@ -76,6 +76,26 @@ describe('trace compiler', () => {
     expect(result.flow.steps[1].with?.text).toBe('{{user}}')
     expect(result.warnings).toEqual([])
   })
+
+  const swipeTrace = (task: string, observeRef?: string) => [
+    { type: 'session', id: 'tr-2', name: 'scroll', task, device: { serial: 'test' }, startedAt: 1 },
+    { type: 'call', seq: 1, ts: 2, tool: 'swipe', args: { x1: 0.5, y1: 0.8, x2: 0.5, y2: 0.2 }, ok: true, kind: 'action' },
+    { type: 'call', seq: 2, ts: 3, tool: 'get_screen_state', args: {}, ok: true, kind: 'observe', ...(observeRef ? { snapshotRef: observeRef } : {}) },
+  ]
+
+  it('expects the observed foreground app after the final step', () => {
+    const result = compileTrace(swipeTrace('打开设置并下滑', 'snap-1') as never, { snapshots: { 'snap-1': snapshot as never } })
+    expect(result.flow.steps.at(-1)?.expect).toEqual({ app: { package: 'com.example.launcher' } })
+    expect(result.flow.description).toBe('打开设置并下滑')
+  })
+
+  it('skips framework containers when the final screen has no known package', () => {
+    const container = { ...targetNode, id: 0, resourceId: 'android:id/content', contentDesc: '', text: '' }
+    const bare = { ...snapshot, app: undefined, tree: { ...snapshot.tree, nodes: [container, targetNode] } }
+    const result = compileTrace(swipeTrace('Automatic FLOW_TRACE_DIR recording', 'snap-1') as never, { snapshots: { 'snap-1': bare as never } })
+    expect(result.flow.steps.at(-1)?.expect).toEqual({ visible: { resource_id: 'com.example:id/settings' } })
+    expect(result.flow.description).toBeUndefined()
+  })
 })
 
 describe('flow replayer', () => {
@@ -508,6 +528,7 @@ describe('flow self-heal', () => {
     expect(report.status).toBe('completed')
     expect(report.flowPath).toBe(flowPath)
     expect(report.steps[0]).toMatchObject({ id: 'open', status: 'passed', healed: true })
+    expect(report.steps[0].heal?.actions).toHaveLength(1)
     expect(report.steps[0].error).toBeUndefined()
     expect(report.steps[1]).toMatchObject({ id: 'after', status: 'passed' })
     expect(device.calls).toContain('key:BACK')
@@ -538,6 +559,8 @@ describe('flow self-heal', () => {
     expect(report.error).toContain('did not match within 10ms')
     expect(report.steps[0]).toMatchObject({ id: 'open', status: 'failed' })
     expect(report.steps[0].healed).toBeUndefined()
+    expect(report.steps[0].heal?.actions).toHaveLength(2)
+    expect(report.steps[0].heal?.reason).toBeTruthy()
     expect(device.calls).toContain('key:BACK')
     expect(device.calls).not.toContain('input:ok')
     expect(await readdir(dir)).toEqual(['demo.flow.yaml'])
