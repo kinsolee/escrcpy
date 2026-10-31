@@ -489,6 +489,11 @@ async function deviceCommand(command: string, positionals: string[], values: Cli
     return
   }
   const serial = await selectedSerial(adbx, values)
+  // Ad-hoc commands intentionally bypass the lease (they are for humans poking
+  // at a device), but say so when another process holds one.
+  const held = await createDeviceLease().info(serial).catch(() => undefined)
+  if (held)
+    console.error(`note: ${serial} is currently leased by ${held.holder} (pid ${held.pid}); this ad-hoc command bypasses the lease`)
   const device = createFlowDevice({ adbx })
   const via = adbx.yadb.isAvailable() ? 'yadb' : 'uiautomator'
 

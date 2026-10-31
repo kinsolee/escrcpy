@@ -161,14 +161,19 @@ export function createAdbx(options: AdbxOptions) {
     },
     ui: {
       async dumpLayout(serial: string): Promise<string> {
+        // Unique per-dump remote path: two processes dumping the same device
+        // concurrently must not read (or clobber) each other's file. yadb
+        // accepts an explicit output path; uiautomator takes it as an argument.
+        const unique = `${process.pid.toString(36)}${Date.now().toString(36)}`
         if (yadb.isAvailable()) {
-          const remotePath = '/data/local/tmp/yadb_layout_dump.xml'
-          await yadb.exec(serial, ['-layout'])
+          const remotePath = `/data/local/tmp/yadb_layout_${unique}.xml`
+          await yadb.exec(serial, ['-layout', remotePath])
           const xml = await shell(serial, `cat ${remotePath}`)
           await shell(serial, `rm -f ${remotePath}`).catch(() => {})
           return xml
         }
-        const raw = await shell(serial, 'uiautomator dump --compressed /sdcard/escrcpy-window.xml >/dev/null 2>&1 && cat /sdcard/escrcpy-window.xml; rm -f /sdcard/escrcpy-window.xml')
+        const remotePath = `/sdcard/escrcpy-window_${unique}.xml`
+        const raw = await shell(serial, `uiautomator dump --compressed ${remotePath} >/dev/null 2>&1 && cat ${remotePath}; rm -f ${remotePath}`)
         const xmlMatch = raw.match(/(<hierarchy[\s\S]*?<\/hierarchy>)/i)
         return xmlMatch ? xmlMatch[1] : raw
       },
