@@ -10,7 +10,7 @@ import type { FlowScript, FlowStep, HealLlmClient, RunReport, Target } from '@es
 import { applyPatch, compileTraceFile, createEnvLlmClient, loadLlmConfig, readFlow, readTrace, replayFlow, resolveLlm, toAutomationScript, writeFlow } from '@escrcpy/flow-core'
 import { startFlowMcpServer } from '@escrcpy/flow-mcp'
 import type { Selector, UiElement } from '@escrcpy/flow-device'
-import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError } from '@escrcpy/flow-device'
+import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError, resolveYadbPath } from '@escrcpy/flow-device'
 import { runFleet } from './fleet.js'
 
 export const HELP = `flow — record once, replay without a model
@@ -66,11 +66,12 @@ Selector options:
 
 Common options:
   -s, --serial <serial>   Device (default: ANDROID_SERIAL, or the only device)
-  --no-yadb               Use plain adb even when YADB_PATH is set
+  --no-yadb               Use plain adb even when yadb is set or found
 
 Environment:
   ADB_PATH         adb binary (default: adb on PATH)
   YADB_PATH        yadb binary, enables faster dumps and Unicode input
+                   (default: the copy bundled with Escrcpy, when found)
   ANDROID_SERIAL   default Android device serial
   FLOW_TRACE_DIR   trace directory used by flow mcp automatic recording
   FLOW_LLM_CONFIG  Path to the shared LLM config (default ~/.escrcpy/flow/llm.json, the desktop AI-model dialog)
@@ -233,9 +234,14 @@ function parseVars(values: CliValues): Record<string, unknown> {
   return result
 }
 
+/** --no-yadb > --yadb-path > YADB_PATH > a bundled/installed copy; '' means plain adb. */
+function cliYadbPath(values: CliValues): string {
+  return values['no-yadb'] ? '' : resolveYadbPath(values['yadb-path'])
+}
+
 function adbBackend(values: CliValues) {
   const adb = adbkit.Adb.createClient({ bin: values['adb-path'] ?? process.env.ADB_PATH })
-  return createAdbx({ adb: adb as never, yadbPath: values['no-yadb'] ? '' : values['yadb-path'] ?? process.env.YADB_PATH })
+  return createAdbx({ adb: adb as never, yadbPath: cliYadbPath(values) })
 }
 
 async function selectedSerial(adbx: ReturnType<typeof adbBackend>, values: CliValues): Promise<string> {
@@ -573,7 +579,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   if (command === 'mcp') {
     await startFlowMcpServer({
       adbPath: values['adb-path'] ?? process.env.ADB_PATH,
-      yadbPath: values['no-yadb'] ? '' : values['yadb-path'] ?? process.env.YADB_PATH,
+      yadbPath: cliYadbPath(values),
       defaultSerial: values.serial ?? process.env.ANDROID_SERIAL,
       traceDir: values['trace-dir'] ?? process.env.FLOW_TRACE_DIR,
     })

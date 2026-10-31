@@ -286,12 +286,28 @@ describe('heal patch', () => {
     const patch = buildPatch(baseFlow, 'open-settings', attempts)
     expect(patch.mode).toBe('replace')
     expect(patch.stepId).toBe('open-settings')
-    expect(patch.steps.map(step => step.id)).toEqual(['heal-1', 'heal-2'])
+    expect(patch.steps.map(step => step.id)).toEqual(['open-settings-heal-1', 'open-settings'])
     expect(patch.steps[0].intent).toBe('点新的设置入口')
+    // The replacing step keeps the failed step's id, intent and expect, with the healed locator.
+    expect(patch.steps[1]).toEqual({
+      id: 'open-settings',
+      intent: '打开设置',
+      do: 'tap',
+      target: [{ resource_id: 'id/settings-new' }],
+      expect: { visible: { content_desc: 'Settings', exact: true } },
+    })
 
     const prep = buildPatch(baseFlow, 'input', [{ action: { tool: 'key', with: { key: 'BACK' } }, reason: '关闭弹窗' }])
     expect(prep.mode).toBe('insert-before')
-    expect(mergePatch(baseFlow, prep).steps.map(step => step.id)).toEqual(['open-settings', 'heal-1', 'input'])
+    const merged = mergePatch(baseFlow, prep)
+    expect(merged.steps.map(step => step.id)).toEqual(['open-settings', 'input-heal-1', 'input'])
+    // A second heal of the same step must not reuse an id already in the flow.
+    expect(buildPatch(merged, 'input', [{ action: { tool: 'key', with: { key: 'BACK' } } }]).steps.map(step => step.id)).toEqual(['input-heal-2'])
+  })
+
+  it('drops an empty with from healed steps', () => {
+    const patch = buildPatch(baseFlow, 'open-settings', [{ action: { tool: 'tap', target: [{ text: '设置' }], with: {} } }])
+    expect(patch.steps[0]).not.toHaveProperty('with')
   })
 
   it('writes numbered patch files and applies a patch without touching the flow file', async () => {
@@ -305,7 +321,7 @@ describe('heal patch', () => {
     expect((await readFile(first, 'utf8')).startsWith('stepId: open-settings')).toBe(true)
 
     const merged = await applyPatch(flowPath, first)
-    expect(merged.steps.map(step => step.id)).toEqual(['heal-1', 'heal-2', 'input'])
+    expect(merged.steps.map(step => step.id)).toEqual(['open-settings-heal-1', 'open-settings', 'input'])
     expect(merged.steps[0].intent).toBe('点新的设置入口')
     expect((await readFlow(flowPath)).steps.map(step => step.id)).toEqual(['open-settings', 'input'])
   })

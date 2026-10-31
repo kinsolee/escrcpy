@@ -563,7 +563,7 @@ function healActionStep(action: HealAction, reason: string | undefined, id: stri
     ...(reason ? { intent: reason } : {}),
     do: action.tool,
     ...(action.target?.length ? { target: action.target } : {}),
-    ...(action.with ? { with: action.with } : {}),
+    ...(action.with && Object.keys(action.with).length ? { with: action.with } : {}),
   }
 }
 
@@ -598,6 +598,11 @@ export type HealPatch = z.infer<typeof healPatchSchema>
  * Compiles executed heal actions into a reviewable patch. When the last healed
  * action matches the failed step's own action, the patch replaces that step;
  * otherwise the actions only prepared the screen and are inserted before it.
+ *
+ * A replacing step takes over the failed step's id, intent, expect and timing, so
+ * the patched flow still asserts the same outcome and later heals, patches and run
+ * reports keep addressing it by its original id. Preparatory steps get
+ * `<stepId>-heal-N` ids that stay unique when a flow is patched more than once.
  */
 export function buildPatch(flow: FlowScript, stepId: string, actions: HealAttempt[]): HealPatch {
   const step = flow.steps.find(step => step.id === stepId)
@@ -606,8 +611,33 @@ export function buildPatch(flow: FlowScript, stepId: string, actions: HealAttemp
   const steps = attemptsToSteps(actions)
   if (!steps.length)
     throw new HealError('No executed heal actions to patch')
-  const lastTool = actions.filter(attempt => attempt.action && !attempt.error).at(-1)!.action!.tool
-  return { stepId, mode: lastTool === step.do ? 'replace' : 'insert-before', steps }
+  const mode = steps.at(-1)!.do === step.do ? 'replace' : 'insert-before'
+  const prep = mode === 'replace' ? steps.slice(0, -1) : steps
+  const taken = new Set(flow.steps.map(item => item.id))
+  let n = 0
+  const renamed = prep.map((item) => {
+    n += 1
+    while (taken.has(`${stepId}-heal-${n}`))
+      n += 1
+    const id = `${stepId}-heal-${n}`
+    taken.add(id)
+    return { ...item, id }
+  })
+  if (mode === 'insert-before')
+    return { stepId, mode, steps: renamed }
+  const healed = steps.at(-1)!
+  const { target: _target, with: _with, ...kept } = step
+  const intent = step.intent ?? healed.intent
+  return {
+    stepId,
+    mode,
+    steps: [...renamed, {
+      ...kept,
+      ...(intent ? { intent } : {}),
+      ...(healed.target ? { target: healed.target } : {}),
+      ...(healed.with ? { with: healed.with } : {}),
+    }],
+  }
 }
 
 /** Writes `<dir>/<name>.flow.yaml.patch-<n>.yaml`; `n` defaults to the existing patch count + 1. */

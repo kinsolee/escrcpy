@@ -11,7 +11,7 @@ import { shellEscape, validateShellCommand } from '@escrcpy/shared'
 import {
   createDeviceLease,
   createFlowDevice,
-
+  resolveYadbPath,
 } from '@escrcpy/flow-device'
 import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
 import { AUTO_RECORDING_TASK, compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, resolveLlm, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
@@ -225,7 +225,7 @@ async function runFlowReplay(context: FlowMcpServer['context'], args: FlowRunArg
   // an ADB backend and go through adbx when one exists.
   const base = context.device ?? (() => {
     const adb = adbkit.Adb.createClient()
-    return createFlowDevice({ adbx: createAdbx({ adb, yadbPath: process.env.YADB_PATH }) })
+    return createFlowDevice({ adbx: createAdbx({ adb, yadbPath: resolveYadbPath() }) })
   })()
   const device = {
     ...base,
@@ -663,7 +663,7 @@ export function createFlowMcpServer(options: FlowMcpOptions): FlowMcpServer {
 
 export function createRealFlowMcpServer(options: RealFlowMcpOptions = {}): FlowMcpServer {
   const adb = adbkit.Adb.createClient(options.adbPath ? { bin: options.adbPath } : {})
-  const adbx = createAdbx({ adb: adb as never, yadbPath: options.yadbPath ?? process.env.YADB_PATH })
+  const adbx = createAdbx({ adb: adb as never, yadbPath: resolveYadbPath(options.yadbPath) })
   const device = createFlowDevice({ adbx })
   return createFlowMcpServer({ ...options, adbx, device })
 }
