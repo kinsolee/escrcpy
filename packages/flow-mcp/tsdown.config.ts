@@ -13,12 +13,20 @@ export default defineConfig([
   },
   // Self-contained build for external agents (the desktop app ships this as
   // extra/common/flow-mcp/agent.mjs): every dependency inlined so a plain
-  // `node agent.mjs` works outside the workspace.
+  // `node agent.mjs` works outside the workspace. tsdown keeps plain
+  // `dependencies` external by default, so alwaysBundle forces them all
+  // into the single file.
   {
     entry: { agent: 'src/index.ts' },
     outDir: 'dist',
     dts: false,
     publint: false,
     platform: 'node',
+    deps: {
+      alwaysBundle: /.*/,
+    },
+    // The lazy sharp import must not split into extra chunks: the agent
+    // artifact has to stay a single self-contained file.
+    outputOptions: { inlineDynamicImports: true },
   },
 ])
