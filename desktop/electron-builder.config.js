@@ -26,6 +26,13 @@ export default {
       to: 'extra/common/madb',
       filter: ['index.mjs'],
     },
+    {
+      // Self-contained flow MCP server for external agents (see the Copilot
+      // page's "connect an agent" dialog); runs with a plain `node`.
+      from: '../packages/flow-mcp/dist',
+      to: 'extra/common/flow-mcp',
+      filter: ['agent.mjs'],
+    },
   ],
 
   win,

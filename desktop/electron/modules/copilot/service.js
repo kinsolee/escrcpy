@@ -1,6 +1,7 @@
 import { existsSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
+import { app } from 'electron'
 import { ipcxMain } from '@escrcpy/electron-ipcx/main'
 import { compileTraceFile, loadLlmConfig, resolveLlm, runAgentLoop, writeFlow } from '@escrcpy/flow-core'
 import { createInProcessFlowMcp } from '@escrcpy/flow-mcp'
@@ -41,6 +42,16 @@ function latestTrace(session) {
 }
 
 const handlers = {
+  'copilot:mcp-info': async () => {
+    // Location of the self-contained flow MCP server handed to external agents.
+    // Probe instead of trusting app.isPackaged: some dev setups report it as true.
+    const packagedPath = join(process.resourcesPath, 'extra', 'common', 'flow-mcp', 'agent.mjs')
+    const serverPath = existsSync(packagedPath)
+      ? packagedPath
+      : resolve(app.getAppPath(), '../packages/flow-mcp/dist/agent.mjs')
+    return { success: true, serverPath, exists: existsSync(serverPath), node: process.version }
+  },
+
   'copilot:start': async (_event, payload) => {
     if (!payload?.serial)
       return { success: false, error: 'serial is required' }

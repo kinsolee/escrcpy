@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import process from 'node:process'
 import { pathToFileURL } from 'node:url'
 import adbkit from '@devicefarmer/adbkit'
@@ -11,7 +14,7 @@ import {
 
 } from '@escrcpy/flow-device'
 import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
-import { llmConfigPath, loadLlmConfig, saveLlmConfig } from '@escrcpy/flow-core'
+import { compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, resolveLlm, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -174,6 +177,83 @@ function registerTool(flow: FlowMcpServer, name: string, description: string, in
       return formatError(error)
     }
   })
+}
+
+/** Where saved *.flow.yaml scripts live; shared with the desktop app and the CLI. */
+function flowScriptsDir(): string {
+  return process.env.FLOW_SCRIPTS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'scripts')
+}
+
+/** Accept an absolute path to a .flow.yaml or a bare flow name inside the scripts dir. */
+async function resolveFlowPath(pathOrName: string): Promise<string> {
+  if (/[\\/]/.test(pathOrName) || pathOrName.endsWith('.yaml') || pathOrName.endsWith('.yml'))
+    return pathOrName
+  const dir = flowScriptsDir()
+  for (const candidate of [`${pathOrName}.flow.yaml`, `${pathOrName}.flow.yml`, `${pathOrName}.yaml`]) {
+    const path = join(dir, candidate)
+    if (existsSync(path))
+      return path
+  }
+  throw new Error(`flow not found in ${dir}: ${pathOrName}`)
+}
+
+const healGoalShape = z.union([z.boolean(), z.number().int().min(1).max(100)]).optional().describe('After healing fails, free-explore toward the flow description (true, or an action budget number) and patch the script')
+
+interface FlowRunArgs {
+  flowPath: string
+  script: Awaited<ReturnType<typeof readFlow>>
+  serial: string
+  vars?: Record<string, unknown>
+  heal?: boolean
+  healGoal?: boolean | number
+}
+
+/**
+ * Replay one flow on one device behind the shared lease, mirroring the
+ * desktop run path: adb device + shell capability, optional LLM heal and
+ * goal-driven recovery from the shared llm.json, reports under
+ * ~/.escrcpy/flow/reports.
+ */
+async function runFlowReplay(context: FlowMcpServer['context'], args: FlowRunArgs): Promise<unknown> {
+  const { flowPath, script, serial } = args
+  // Prefer the injected device (real server or test fake); shell steps need
+  // an ADB backend and go through adbx when one exists.
+  const base = context.device ?? (() => {
+    const adb = adbkit.Adb.createClient()
+    return createFlowDevice({ adbx: createAdbx({ adb, yadbPath: process.env.YADB_PATH }) })
+  })()
+  const device = {
+    ...base,
+    shell: (serial_: string, command: string) => {
+      if (!context.adbx)
+        return Promise.reject(new Error('flow_run shell steps require an ADB backend'))
+      return context.adbx.shell(serial_, command)
+    },
+  }
+  const lease = context.lease ?? createDeviceLease()
+  await lease.acquire(serial, { holder: 'flow-mcp' })
+  const reportDir = join(process.env.FLOW_REPORTS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'reports'), script.name, serial, new Date().toISOString().replace(/[:.]/g, '-'))
+  mkdirSync(reportDir, { recursive: true })
+  try {
+    const wantsHeal = args.heal || args.healGoal
+    const resolved = wantsHeal ? resolveLlm(loadLlmConfig()) : undefined
+    if (wantsHeal && !resolved)
+      throw new Error('heal requested but no LLM is configured; set one with llm_config_set_active or llm_config_set')
+    const goal = typeof args.healGoal === 'number' ? { maxActions: args.healGoal } : true
+    const report = await replayFlow(script, {
+      serial,
+      device,
+      vars: args.vars,
+      flowPath,
+      reportDir,
+      outputDir: reportDir,
+      ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(args.healGoal ? { goal } : {}) } } : {}),
+    })
+    return { report, reportDir }
+  }
+  finally {
+    await lease.release(serial)
+  }
 }
 
 function registerFlowTools(flow: FlowMcpServer): void {
@@ -410,6 +490,93 @@ function registerFlowTools(flow: FlowMcpServer): void {
         throw new Error('shell_exec requires an ADB backend')
       return { output: await context.adbx.shell(serial, safeShell(args.command)) }
     }, { serial, before: true })
+  })
+
+  registerTool(flow, 'app_install', 'Install a local APK file onto the device.', { serial: selectorShape.serial, path: z.string().describe('Absolute path to the .apk on this machine'), reinstall: z.boolean().optional().describe('Pass true to keep app data when replacing an installed package (pm install -r)') }, async (args) => {
+    const serial = await serialFor(context, args.serial)
+    return invoke(flow, 'app_install', args, 'action', async () => {
+      if (!context.adbx)
+        throw new Error('app_install requires an ADB backend')
+      if (!existsSync(args.path))
+        throw new Error(`APK not found: ${args.path}`)
+      const remote = `/data/local/tmp/escrcpy-install-${Date.now()}.apk`
+      await context.adbx.push(serial, args.path, remote)
+      try {
+        const flags = args.reinstall ? ' -r' : ''
+        const output = await context.adbx.shell(serial, safeShell(`pm install${flags} ${shellQuote(remote)}`), { stderr: true })
+        if (/\bFailure\b|INSTALL_FAILED/.test(output))
+          throw new Error(output.trim())
+        return { serial, output: output.trim() || 'Success' }
+      }
+      finally {
+        await context.adbx.shell(serial, safeShell(`rm -f ${shellQuote(remote)}`)).catch(() => {})
+      }
+    }, { serial, before: true })
+  })
+
+  registerTool(flow, 'app_uninstall', 'Uninstall a package from the device.', { serial: selectorShape.serial, package: z.string(), keep_data: z.boolean().optional().describe('Pass true for pm uninstall -k (remove the app but keep its data and caches)') }, async (args) => {
+    const serial = await serialFor(context, args.serial)
+    return invoke(flow, 'app_uninstall', args, 'action', async () => {
+      if (!context.adbx)
+        throw new Error('app_uninstall requires an ADB backend')
+      const flags = args.keep_data ? ' -k' : ''
+      const output = await context.adbx.shell(serial, safeShell(`pm uninstall${flags} ${shellQuote(args.package)}`))
+      if (!/^Success$/m.test(output.trim()))
+        throw new Error(output.trim())
+      return { serial, package: args.package }
+    }, { serial, before: true })
+  })
+
+  registerTool(flow, 'flow_list', 'List saved replayable flow scripts (*.flow.yaml).', {}, async () => {
+    const dir = flowScriptsDir()
+    if (!existsSync(dir))
+      return ok({ dir, flows: [] })
+    const flows = readdirSync(dir)
+      .filter(file => /\.flow\.ya?ml$/.test(file))
+      .map((file) => {
+        const path = join(dir, file)
+        try {
+          const script = parseFlow(readFileSync(path, 'utf8'))
+          return { file, path, name: script.name, description: script.description ?? '', vars: Object.keys(script.vars ?? {}), steps: script.steps.length }
+        }
+        catch (error) {
+          return { file, path, error: asError(error).message }
+        }
+      })
+      .sort((a, b) => a.file.localeCompare(b.file))
+    return ok({ dir, flows })
+  })
+
+  registerTool(flow, 'flow_run', 'Replay a saved flow script on a device (deterministic, no LLM unless healing is on).', {
+    serial: selectorShape.serial,
+    path: z.string().describe('Absolute path to the .flow.yaml; a bare name resolves inside the scripts dir'),
+    vars: z.record(z.string(), z.unknown()).optional(),
+    heal: z.boolean().optional().describe('Retry failed steps with the configured LLM and write a patch file'),
+    heal_goal: healGoalShape,
+  }, async (args) => {
+    const flowPath = await resolveFlowPath(args.path)
+    const script = await readFlow(flowPath)
+    const serial = await serialFor(context, args.serial)
+    return invoke(flow, 'flow_run', args, 'action', async () => runFlowReplay(context, {
+      flowPath,
+      script,
+      serial,
+      vars: args.vars,
+      heal: args.heal,
+      healGoal: args.heal_goal,
+    }), { serial })
+  })
+
+  registerTool(flow, 'flow_compile', 'Compile a recorded JSONL trace into a replayable flow script saved next to the others.', {
+    trace_path: z.string().describe('Absolute path to the JSONL trace (see flow_record_stop)'),
+    name: z.string().regex(/^[\w-]+$/, 'name may only contain letters, digits and hyphens').optional().describe('Defaults to the trace session name'),
+    description: z.string().optional(),
+  }, async (args) => {
+    const { flow: compiled, warnings } = await compileTraceFile(args.trace_path, { name: args.name, description: args.description })
+    const path = join(flowScriptsDir(), `${compiled.name}.flow.yaml`)
+    mkdirSync(flowScriptsDir(), { recursive: true })
+    await writeFlow(path, compiled)
+    return ok({ path, name: compiled.name, steps: compiled.steps.length, warnings })
   })
 
   registerTool(flow, 'flow_record_start', 'Start recording calls to a JSONL trace.', { name: z.string(), task: z.string(), vars: z.record(z.string(), z.unknown()).optional(), serial: selectorShape.serial }, async (args) => {

@@ -1,5 +1,5 @@
 import { readdir, readFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { findAll } from '@escrcpy/flow-device'
 import type { Snapshot, UiNode } from '@escrcpy/flow-device'
 import type { FlowScript, FlowStep, Selector, Target } from './schema.js'
@@ -87,7 +87,9 @@ export async function readTrace(path: string): Promise<TraceEvent[]> {
 
 export async function compileTraceFile(path: string, options: CompileTraceOptions = {}): Promise<CompileResult> {
   const snapshots = await loadSnapshots(options.snapshots ?? join(dirname(path), 'snapshots'))
-  return compileTrace(await readTrace(path), { ...options, snapshots, name: options.name ?? basename(path).replace(/\.jsonl$/, '') })
+  // No name fallback here: compileTrace already prefers session.name, and the
+  // file id (tr_xxx) is only a worse last resort than the recorded name.
+  return compileTrace(await readTrace(path), { ...options, snapshots })
 }
 
 async function loadSnapshots(source: TraceSnapshots | string): Promise<TraceSnapshots> {

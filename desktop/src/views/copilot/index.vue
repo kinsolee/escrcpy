@@ -27,6 +27,9 @@
           {{ $t('copilot.clear') }}
         </el-button>
         <div class="flex-1" />
+        <el-button size="small" plain @click="openAgentDialog">
+          {{ $t('copilot.agent.name') }}
+        </el-button>
         <el-button size="small" type="primary" plain :disabled="busy" @click="saveAsFlow">
           {{ $t('copilot.saveFlow') }}
         </el-button>
@@ -86,6 +89,31 @@
         {{ busy ? $t('copilot.working') : $t('copilot.send') }}
       </el-button>
     </div>
+
+    <el-dialog v-model="agentDialog" :title="$t('copilot.agent.name')" width="680">
+      <div class="flex flex-col gap-3 text-sm">
+        <div class="opacity-70">
+          {{ $t('copilot.agent.desc') }}
+        </div>
+        <div class="flex items-center gap-2 text-xs">
+          <span class="opacity-60 flex-none">{{ $t('copilot.agent.serverPath') }}</span>
+          <el-tag size="small" :type="mcpInfo.exists ? 'success' : 'danger'">
+            {{ mcpInfo.exists ? $t('copilot.agent.ready') : $t('copilot.agent.missing') }}
+          </el-tag>
+          <span class="truncate opacity-60" :title="mcpInfo.serverPath">{{ mcpInfo.serverPath }}</span>
+        </div>
+        <div v-for="block in agentBlocks" :key="block.label" class="flex flex-col gap-1">
+          <div class="flex items-center gap-2">
+            <span class="text-xs font-medium">{{ block.label }}</span>
+            <div class="flex-1" />
+            <el-button size="small" text @click="copyText(block.text)">
+              {{ $t('copilot.agent.copy') }}
+            </el-button>
+          </div>
+          <pre class="m-0 p-2 border rounded text-xs leading-relaxed overflow-auto max-h-48 whitespace-pre-wrap break-all bg-primary-50 dark:bg-primary-900">{{ block.text }}</pre>
+        </div>
+      </div>
+    </el-dialog>
   </div>
 </template>
 
@@ -175,6 +203,46 @@ async function stopChat() {
 async function clearChat() {
   chat.value = []
   await invoke('copilot:clear', { sessionId: sessionId.value })
+}
+
+/** Hand the bundled flow MCP server to external agents (Claude Code, etc.). */
+const agentDialog = ref(false)
+const mcpInfo = ref({ serverPath: '', exists: false })
+
+const agentBlocks = computed(() => {
+  const path = mcpInfo.value.serverPath
+  if (!path)
+    return []
+  const json = JSON.stringify({ mcpServers: { 'escrcpy-flow': { command: 'node', args: [path] } } }, null, 2)
+  return [
+    {
+      label: window.t('copilot.agent.cli'),
+      text: `claude mcp add escrcpy-flow -- node "${path}"`,
+    },
+    {
+      label: window.t('copilot.agent.json'),
+      text: json,
+    },
+    {
+      label: window.t('copilot.agent.prompt'),
+      text: window.t('copilot.agent.promptText'),
+    },
+  ]
+})
+
+async function openAgentDialog() {
+  const { success, serverPath, exists, error } = await invoke('copilot:mcp-info')
+  if (!success) {
+    ElMessage.error(error)
+    return
+  }
+  mcpInfo.value = { serverPath, exists }
+  agentDialog.value = true
+}
+
+async function copyText(text) {
+  await navigator.clipboard.writeText(text)
+  ElMessage.success(window.t('copilot.agent.copied'))
 }
 
 /** Compile the session's newest device trace into a reusable flow script. */

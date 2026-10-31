@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
@@ -295,13 +295,100 @@ describe('createInProcessFlowMcp', () => {
     const mcp = await createInProcessFlowMcp({})
     try {
       const names = mcp.tools.map(tool => tool.name)
-      expect(names.length).toBeGreaterThan(25)
+      expect(names.length).toBeGreaterThan(30)
       expect(names).toContain('device_select')
       expect(names).toContain('flow_record_start')
+      for (const agentTool of ['app_install', 'app_uninstall', 'flow_list', 'flow_run', 'flow_compile'])
+        expect(names).toContain(agentTool)
       await expect(mcp.callTool('definitely_not_a_tool', {})).rejects.toThrow()
     }
     finally {
       await mcp.close()
     }
+  })
+
+  it('installs a local apk via push + pm install and uninstalls via pm', async () => {
+    const { createFlowMcpServer } = await import('../src/index.js')
+    const apk = join(await mkdtemp(join(tmpdir(), 'apk-')), 'demo.apk')
+    const { writeFile } = await import('node:fs/promises')
+    await writeFile(apk, 'PK\x03\x04fake')
+    const shell = vi.fn(async (_serial: string, command: string) => (command.includes('pm install') || command.includes('pm uninstall') ? 'Success' : ''))
+    const push = vi.fn(async () => {})
+    const adbx = { shell, push, deviceInfo: { getScreenSize: async () => ({ width: 100, height: 100 }), getOrientation: async () => 0 } } as never
+    const flow = createFlowMcpServer({ device: fakeDevice(), adbx, defaultSerial: 'fake-1' })
+    const client = new Client({ name: 'flow-mcp-install-test', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([flow.server.connect(serverTransport), client.connect(clientTransport)])
+    const installed = await client.callTool({ name: 'app_install', arguments: { serial: 'fake-1', path: apk, reinstall: true } })
+    expect(installed.isError).not.toBe(true)
+    expect(push).toHaveBeenCalledTimes(1)
+    const pushArgs = push.mock.calls[0] as unknown[]
+    expect(String(pushArgs[2])).toContain('/data/local/tmp/escrcpy-install-')
+    const installCommand = shell.mock.calls.find(call => String(call[1]).includes('pm install'))?.[1] as string
+    expect(installCommand).toContain('pm install -r')
+    const cleanup = shell.mock.calls.filter(call => String(call[1]).includes('rm -f'))
+    expect(cleanup.length).toBe(1)
+    const uninstalled = await client.callTool({ name: 'app_uninstall', arguments: { serial: 'fake-1', package: 'com.example.app' } })
+    expect(uninstalled.isError).not.toBe(true)
+    expect(shell.mock.calls.at(-1)?.[1]).toBe('pm uninstall \'com.example.app\'')
+    const missing = await client.callTool({ name: 'app_install', arguments: { serial: 'fake-1', path: '/definitely/missing.apk' } })
+    expect(missing.isError).toBe(true)
+    await client.close()
+    await flow.server.close()
+  })
+
+  it('compiles a trace into the scripts dir via flow_compile and lists it via flow_list', async () => {
+    const { createFlowMcpServer } = await import('../src/index.js')
+    const dir = await mkdtemp(join(tmpdir(), 'flow-mcp-compile-'))
+    const recorder = new FlowTraceRecorder({ dir, id: 'tr_compile' })
+    const before = snapshot('fake-1')
+    await recorder.start({ name: 'agent-flow', task: 'tap settings', vars: {}, device: { serial: 'fake-1', width: 1000, height: 2000 } })
+    await recorder.recordCall({ tool: 'ui_tap', args: { content_desc: '图库：1条消息未读' }, ok: true, kind: 'action', before, target: { text: '', contentDesc: '图库：1条消息未读', resourceId: '', className: 'android.widget.TextView', bounds: [0, 0, 100, 100] }, durationMs: 2 })
+    const { tracePath } = (await recorder.stop('completed'))!
+    process.env.FLOW_SCRIPTS_DIR = join(dir, 'scripts')
+    const flow = createFlowMcpServer({ device: fakeDevice(), defaultSerial: 'fake-1' })
+    const client = new Client({ name: 'flow-mcp-compile-test', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([flow.server.connect(serverTransport), client.connect(clientTransport)])
+    const compileRaw = String((await client.callTool({ name: 'flow_compile', arguments: { trace_path: tracePath } })).content![0].text)
+    console.error('COMPILE_RAW:', compileRaw.slice(0, 300))
+    const compiled = JSON.parse(compileRaw)
+    expect(compiled.name).toBe('agent-flow')
+    expect(compiled.steps).toBe(1)
+    expect(compiled.path).toMatch(/\.flow\.yaml$/)
+    const listed = JSON.parse(String((await client.callTool({ name: 'flow_list', arguments: {} })).content![0].text))
+    expect(listed.flows.map((item: { file: string }) => item.file)).toContain(`${compiled.name}.flow.yaml`)
+    delete process.env.FLOW_SCRIPTS_DIR
+    await client.close()
+    await flow.server.close()
+  })
+
+  it('runs a saved flow end-to-end against the fake device via flow_run', async () => {
+    const { createFlowMcpServer } = await import('../src/index.js')
+    const dir = await mkdtemp(join(tmpdir(), 'flow-mcp-run-'))
+    process.env.FLOW_SCRIPTS_DIR = dir
+    process.env.FLOW_REPORTS_DIR = join(dir, 'reports')
+    await writeFile(join(dir, 'tap-settings.flow.yaml'), [
+      'version: 1',
+      'name: tap-settings',
+      'description: tap settings',
+      'vars: {}',
+      'steps:',
+      '  - id: step-1',
+      '    do: tap',
+      '    target:',
+      '      - content_desc: 图库：1条消息未读',
+    ].join('\n'), 'utf8')
+    const flow = createFlowMcpServer({ device: fakeDevice(), defaultSerial: 'fake-1' })
+    const client = new Client({ name: 'flow-mcp-run-test', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([flow.server.connect(serverTransport), client.connect(clientTransport)])
+    const ran = JSON.parse(String((await client.callTool({ name: 'flow_run', arguments: { serial: 'fake-1', path: 'tap-settings' } })).content![0].text))
+    expect(ran.report.status).toBe('completed')
+    expect(ran.report.steps[0].status).toBe('passed')
+    delete process.env.FLOW_SCRIPTS_DIR
+    delete process.env.FLOW_REPORTS_DIR
+    await client.close()
+    await flow.server.close()
   })
 })
