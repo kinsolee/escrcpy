@@ -33,6 +33,23 @@ export function json(value: unknown): { content: [{ type: 'text', text: string }
   return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent }
 }
 
+export type McpContentBlock =
+  | { type: 'text', text: string }
+  | { type: 'image', data: string, mimeType: string }
+
+/** Marker result that makes invoke() return native MCP content blocks (e.g. images) instead of a text JSON wrapper. */
+export interface McpContentResult {
+  __mcpContent__: McpContentBlock[]
+}
+
+export function mcpContent(...blocks: McpContentBlock[]): McpContentResult {
+  return { __mcpContent__: blocks }
+}
+
+export function isMcpContentResult(value: unknown): value is McpContentResult {
+  return Boolean(value && typeof value === 'object' && '__mcpContent__' in value && Array.isArray((value as McpContentResult).__mcpContent__))
+}
+
 /** The lease fields exposed to agents; the serial lives on the device entry itself. */
 export function leaseDetails(info: LeaseInfo): { holder: string, pid: number, acquiredAt: number } {
   return { holder: info.holder, pid: info.pid, acquiredAt: info.acquiredAt }
@@ -85,13 +102,13 @@ export function elementTarget(snapshot: Snapshot, target: { node?: Snapshot['tre
   }
 }
 
-export function stateResult(snapshot: Snapshot, elements: UiElement[], screenshot?: { data: Buffer, width: number, height: number }): Record<string, unknown> {
+export function stateResult(snapshot: Snapshot, elements: UiElement[], screenshot?: { data: Buffer, mimeType: string, width: number, height: number }): Record<string, unknown> {
   return {
     snapshotId: snapshot.id,
     app: snapshot.app,
     size: snapshot.tree.size,
     elements,
-    ...(screenshot ? { screenshot: { data: screenshot.data.toString('base64'), mimeType: 'image/jpeg', width: screenshot.width, height: screenshot.height } } : {}),
+    ...(screenshot ? { screenshot: { data: screenshot.data.toString('base64'), mimeType: screenshot.mimeType, width: screenshot.width, height: screenshot.height } } : {}),
   }
 }
 

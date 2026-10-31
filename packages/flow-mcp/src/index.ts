@@ -24,17 +24,18 @@ import {
   asError,
   deviceInfo,
   elementTarget,
-
   hitTarget,
+  isMcpContentResult,
   json,
   leaseDetails,
+  mcpContent,
   prepareBefore,
   runTool,
   serialFor,
   stateResult,
 
 } from './context.js'
-import type { FlowMcpContext, ToolExecutionResult } from './context.js'
+import type { FlowMcpContext, McpContentBlock, ToolExecutionResult } from './context.js'
 import { FlowTraceRecorder } from './recorder.js'
 import type { TraceDevice } from './recorder.js'
 
@@ -76,7 +77,7 @@ const selectorShape = {
   index: z.number().int().optional(),
 }
 
-const settleShape = z.number().int().min(0).max(5000).optional()
+const settleShape = z.number().int().min(0).max(5000).optional().describe('Milliseconds to wait after the action completes, so the UI can settle (integer 0-5000, default 300)')
 
 const pointShape = {
   serial: z.string().optional(),
@@ -159,6 +160,8 @@ async function invoke(
     }
     const before = opts.before && serial ? await prepareBefore(context, serial) : undefined
     const value = await runTool(context, tool, args, () => handler(serial!, before), kind, before)
+    if (isMcpContentResult(value))
+      return { content: value.__mcpContent__, isError: false } as { content: McpContentBlock[], isError: false }
     return ok(value)
   }
   catch (error) {
@@ -167,8 +170,10 @@ async function invoke(
   }
 }
 
-function registerTool(flow: FlowMcpServer, name: string, description: string, inputSchema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ReturnType<typeof ok> | ReturnType<typeof formatError>>) {
-  flow.server.registerTool(name, { description, inputSchema }, async (args): Promise<ReturnType<typeof ok> | ReturnType<typeof formatError>> => {
+type ToolResponse = ReturnType<typeof ok> | ReturnType<typeof formatError> | { content: McpContentBlock[], isError: false }
+
+function registerTool(flow: FlowMcpServer, name: string, description: string, inputSchema: Record<string, z.ZodTypeAny>, handler: (args: any) => Promise<ToolResponse>) {
+  flow.server.registerTool(name, { description, inputSchema }, async (args): Promise<ToolResponse> => {
     try {
       return await handler(args)
     }
@@ -329,7 +334,12 @@ function registerFlowTools(flow: FlowMcpServer): void {
 
   registerTool(flow, 'get_foreground_app', 'Return the foreground application.', { serial: selectorShape.serial }, async (args) => {
     const serial = await serialFor(context, args.serial)
-    return invoke(flow, 'get_foreground_app', args, 'observe', async () => context.device.foregroundApp(serial))
+    return invoke(flow, 'get_foreground_app', args, 'observe', async () => {
+      const app = await context.device.foregroundApp(serial)
+      // No resumed activity is a valid answer (screen off / locked); json(undefined)
+      // would fail MCP response validation, so report it structurally.
+      return app ?? { app: null, note: 'no resumed activity reported; the screen may be off or locked' }
+    })
   })
 
   registerTool(flow, 'get_screen_state', 'Dump the current UI tree and list interactive elements.', { serial: selectorShape.serial, include_screenshot: z.boolean().optional() }, async (args) => {
@@ -367,15 +377,19 @@ function registerFlowTools(flow: FlowMcpServer): void {
     })
   })
 
-  registerTool(flow, 'screenshot', 'Capture a JPEG screenshot as base64.', { serial: selectorShape.serial }, async (args) => {
+  registerTool(flow, 'screenshot', 'Capture the current screen and return it as a native MCP image content block (clients can view it directly).', { serial: selectorShape.serial }, async (args) => {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'screenshot', args, 'observe', async () => {
       const image = await context.device.screenshot(serial)
-      return { data: image.data.toString('base64'), mimeType: 'image/jpeg', width: image.width, height: image.height, sourceWidth: image.sourceWidth, sourceHeight: image.sourceHeight }
+      const meta = { mimeType: image.mimeType, width: image.width, height: image.height, sourceWidth: image.sourceWidth, sourceHeight: image.sourceHeight }
+      return mcpContent(
+        { type: 'image', data: image.data.toString('base64'), mimeType: image.mimeType },
+        { type: 'text', text: JSON.stringify(meta) },
+      )
     })
   })
 
-  registerTool(flow, 'ui_tap', 'Find one UI element and tap its center.', { ...selectorShape, settle: z.number().int().min(0).max(5000).optional() }, async (args) => {
+  registerTool(flow, 'ui_tap', 'Find one UI element and tap its center.', { ...selectorShape, settle: settleShape }, async (args) => {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'ui_tap', args, 'action', async (_serial, before) => {
       const target = selectorOf(args)
@@ -427,7 +441,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
     }, { serial, before: true })
   })
 
-  registerTool(flow, 'app_start', 'Start an Android application.', { serial: selectorShape.serial, package: z.string(), activity: z.string().optional(), restart: z.boolean().optional(), settle: z.number().int().min(0).max(5000).optional() }, async (args) => {
+  registerTool(flow, 'app_start', 'Start an Android application.', { serial: selectorShape.serial, package: z.string(), activity: z.string().optional(), restart: z.boolean().optional(), settle: settleShape }, async (args) => {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'app_start', args, 'action', async () => {
       if (!context.adbx)
@@ -441,7 +455,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
     }, { serial })
   })
 
-  registerTool(flow, 'app_stop', 'Stop an Android application.', { serial: selectorShape.serial, package: z.string(), settle: z.number().int().min(0).max(5000).optional() }, async (args) => {
+  registerTool(flow, 'app_stop', 'Stop an Android application.', { serial: selectorShape.serial, package: z.string(), settle: settleShape }, async (args) => {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'app_stop', args, 'action', async () => {
       if (!context.adbx)
@@ -452,7 +466,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
     }, { serial, before: true })
   })
 
-  registerTool(flow, 'open_url', 'Open a URL on the Android device.', { serial: selectorShape.serial, url: z.string(), settle: z.number().int().min(0).max(5000).optional() }, async (args) => {
+  registerTool(flow, 'open_url', 'Open a URL on the Android device.', { serial: selectorShape.serial, url: z.string(), settle: settleShape }, async (args) => {
     const serial = await serialFor(context, args.serial)
     return invoke(flow, 'open_url', args, 'action', async () => {
       if (!context.adbx)

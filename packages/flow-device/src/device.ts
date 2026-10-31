@@ -79,15 +79,25 @@ export function isRatioPoint(target: Target): target is RatioPoint {
   return typeof (target as RatioPoint).x === 'number' && typeof (target as RatioPoint).y === 'number'
 }
 
-const RESUMED_RE = /(?:topResumedActivity|mResumedActivity|ResumedActivity)[:=]\s*ActivityRecord\{[^}]*?\s([\w.]+)\/([\w.$]+)/
+// Screen-off / locked devices report the resumed activity under other line
+// spellings (e.g. `ResumedActivity:` without the `m` prefix), so try the
+// most specific labels first and fall back to the bare one.
+const RESUMED_PATTERNS = [
+  /topResumedActivity[:=]\s*ActivityRecord\{[^}]*?\s([\w.]+)\/([\w.$]+)/,
+  /\bmResumedActivity[:=]\s*ActivityRecord\{[^}]*?\s([\w.]+)\/([\w.$]+)/,
+  /(?:^|[^a-zA-Z])ResumedActivity[:=]\s*ActivityRecord\{[^}]*?\s([\w.]+)\/([\w.$]+)/,
+]
 
 /** Parse the resumed activity out of `dumpsys activity activities`. */
 export function parseForegroundApp(output: string): ForegroundApp | undefined {
-  const match = output.match(RESUMED_RE)
-  if (!match)
-    return undefined
-  const [, pkg, activity] = match
-  return { package: pkg, activity: activity.startsWith('.') ? pkg + activity : activity }
+  for (const pattern of RESUMED_PATTERNS) {
+    const match = output.match(pattern)
+    if (!match)
+      continue
+    const [, pkg, activity] = match
+    return { package: pkg, activity: activity.startsWith('.') ? pkg + activity : activity }
+  }
+  return undefined
 }
 
 const MAX_HINT_ELEMENTS = 15
@@ -130,7 +140,7 @@ export function createFlowDevice(options: FlowDeviceOptions) {
   }
 
   async function foregroundApp(serial: string): Promise<ForegroundApp | undefined> {
-    const output = await withTimeout(adbx.shell(serial, 'dumpsys activity activities | grep -E "topResumedActivity|mResumedActivity"'), dumpTimeoutMs, 'foreground app lookup')
+    const output = await withTimeout(adbx.shell(serial, 'dumpsys activity activities | grep -E "ResumedActivity"'), dumpTimeoutMs, 'foreground app lookup')
     return parseForegroundApp(output)
   }
 

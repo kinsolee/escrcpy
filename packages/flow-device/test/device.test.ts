@@ -298,6 +298,18 @@ describe('helpers', () => {
     expect(parseForegroundApp('')).toBeUndefined()
   })
 
+  it('parses the bare ResumedActivity spelling and prefers the specific labels', () => {
+    // Screen-off devices report the line without the m/top prefix.
+    expect(parseForegroundApp('  ResumedActivity: ActivityRecord{f00d u0 com.example.app/.MainActivity t42}'))
+      .toEqual({ package: 'com.example.app', activity: 'com.example.app.MainActivity' })
+    // Noise lines (mLastResumedActivity) must not win over the real one.
+    expect(parseForegroundApp('    mLastResumedActivity: ActivityRecord{dead u0 com.old/.A t1}\n    mResumedActivity: ActivityRecord{beef u0 com.current/.B t2}'))
+      .toEqual({ package: 'com.current', activity: 'com.current.B' })
+    // topResumedActivity wins when both spellings appear.
+    expect(parseForegroundApp('    mResumedActivity: ActivityRecord{beef u0 com.current/.B t2}\n    topResumedActivity: ActivityRecord{aaaa u0 com.top/.C t3}'))
+      .toEqual({ package: 'com.top', activity: 'com.top.C' })
+  })
+
   it('tells ratio points from selectors', () => {
     expect(isRatioPoint({ x: 0.1, y: 0.2 })).toBe(true)
     expect(isRatioPoint({ text: 'x' })).toBe(false)

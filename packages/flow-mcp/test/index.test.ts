@@ -29,7 +29,10 @@ function snapshot(serial: string): Snapshot {
 
 function fakeDevice(): FlowDevice {
   const current = snapshot('fake-1')
+  // Mutable so tests can simulate a screen-off (no resumed activity) state.
+  const controls = { foreground: current.app as { package: string, activity: string } | undefined }
   const device = {
+    controls,
     snapshots: { latest: () => current },
     snapshot: async () => current,
     getSnapshot: async () => current,
@@ -44,7 +47,7 @@ function fakeDevice(): FlowDevice {
       centerX: (node.bounds.left + node.bounds.right) / 2,
       centerY: (node.bounds.top + node.bounds.bottom) / 2,
     })),
-    foregroundApp: async () => current.app,
+    foregroundApp: async () => controls.foreground,
     screenSize: async () => current.tree.size,
     find: async () => ({ snapshot: current, matches: [current.tree.nodes.find(node => node.contentDesc === 'Settings')!] }),
     waitFor: async () => ({ found: true, snapshot: current, match: { node: current.tree.nodes[0], matchCount: 1 }, attempts: 1, elapsedMs: 1 }),
@@ -54,7 +57,7 @@ function fakeDevice(): FlowDevice {
     swipe: async () => undefined,
     inputText: async () => undefined,
     key: async () => 4,
-    screenshot: async () => ({ data: Buffer.from('jpeg'), width: 100, height: 100, sourceWidth: 100, sourceHeight: 100 }),
+    screenshot: async () => ({ data: Buffer.from('jpeg'), mimeType: 'image/jpeg', width: 100, height: 100, sourceWidth: 100, sourceHeight: 100 }),
     screencap: async () => Buffer.from('png'),
   } as unknown as FlowDevice
   return device
@@ -144,6 +147,37 @@ describe('flow MCP server', () => {
     expect(lines.map(line => line.type)).toEqual(['session', 'call', 'call', 'end'])
     expect(lines[1].snapshotRef).toBe('snap_fixture')
     expect(lines[2].target.ratio).toEqual({ x: 0.1, y: 0.1 })
+    await client.close()
+    await flow.server.close()
+  })
+
+  it('reports a null foreground app on screen-off and returns screenshots as MCP image content', async () => {
+    const flow = createFlowMcpServer({ device: fakeDevice(), defaultSerial: 'fake-1' })
+    const client = new Client({ name: 'flow-mcp-image-test', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([flow.server.connect(serverTransport), client.connect(clientTransport)])
+
+    const normal = await client.callTool({ name: 'get_foreground_app', arguments: {} })
+    expect(normal.isError).not.toBe(true)
+    expect(JSON.parse((normal.content as [{ type: 'text', text: string }])[0].text))
+      .toEqual({ package: 'com.example.launcher', activity: '.MainActivity' })
+
+    // Screen off: no resumed activity is a valid structured answer, not an error.
+    ;(flow.context.device as unknown as { controls: { foreground: unknown } }).controls.foreground = undefined
+    const off = await client.callTool({ name: 'get_foreground_app', arguments: {} })
+    expect(off.isError).not.toBe(true)
+    const offBody = JSON.parse((off.content as [{ type: 'text', text: string }])[0].text)
+    expect(offBody.app).toBeNull()
+    expect(offBody.note).toContain('off or locked')
+
+    const shot = await client.callTool({ name: 'screenshot', arguments: {} })
+    expect(shot.isError).not.toBe(true)
+    const blocks = shot.content as Array<{ type: string, data?: string, mimeType?: string, text?: string }>
+    const image = blocks.find(block => block.type === 'image')
+    expect(image?.mimeType).toBe('image/jpeg')
+    expect(image?.data).toBe(Buffer.from('jpeg').toString('base64'))
+    expect(blocks.some(block => block.type === 'text')).toBe(true)
+
     await client.close()
     await flow.server.close()
   })
