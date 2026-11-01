@@ -33,9 +33,9 @@ export function json(value: unknown): { content: [{ type: 'text', text: string }
   return { content: [{ type: 'text', text: JSON.stringify(value) }], structuredContent }
 }
 
-export type McpContentBlock =
-  | { type: 'text', text: string }
-  | { type: 'image', data: string, mimeType: string }
+export type McpContentBlock
+  = | { type: 'text', text: string }
+    | { type: 'image', data: string, mimeType: string }
 
 /** Marker result that makes invoke() return native MCP content blocks (e.g. images) instead of a text JSON wrapper. */
 export interface McpContentResult {
