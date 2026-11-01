@@ -92,7 +92,7 @@
 
 <script>
 import { controlBarHeight } from '$control/configs/index.js'
-import Install from './install/index.vue'
+import InstallApp from './install/index.vue'
 import Launch from './launch/index.vue'
 import Explorer from './explorer/index.vue'
 import Gnirehtet from './gnirehtet/index.vue'
@@ -104,7 +104,7 @@ import Volume from './volume/index.vue'
 export default {
   components: {
     Screenshot,
-    Install,
+    InstallApp,
     Launch,
     Gnirehtet,
     Rotation,
@@ -210,7 +210,7 @@ export default {
         install: {
           label: 'device.control.install',
           fontIcon: 'i-bi-file-arrow-up',
-          component: 'Install',
+          component: 'InstallApp',
         },
         explorer: {
           label: 'device.control.file.name',
