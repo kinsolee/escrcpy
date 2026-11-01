@@ -11,6 +11,8 @@
   "scripts": {
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "typecheck": "turbo typecheck --filter=\"@escrcpy/flow-*\"",
+    "test": "turbo test --filter=\"@escrcpy/flow-*\"",
     "dev": "turbo dev",
     "build": "turbo build:electron",
     "build:win": "turbo build:electron -- --win",
