@@ -195,11 +195,11 @@ export function normalizeLlmApiType(value: string | undefined): LlmApiType {
   return 'messages'
 }
 
-/** One model endpoint, e.g. one row of the UI provider list. */
+/** One model endpoint, e.g. one row of the UI provider list. Missing or blank fields make `createLlmClient` return undefined. */
 export interface HealLlmEndpoint {
-  baseUrl: string
-  apiKey: string
-  model: string
+  baseUrl?: string
+  apiKey?: string
+  model?: string
   /** See `normalizeLlmApiType`; defaults to `messages`. */
   apiType?: string
 }
