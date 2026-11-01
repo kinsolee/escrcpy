@@ -15,6 +15,8 @@ export interface FlowMcpContext {
   autoRecordingDismissed?: boolean
   recorder?: FlowTraceRecorder
   defaultSerial?: string
+  /** When set, the server only operates on this serial (see FlowMcpOptions.lockedSerial). */
+  lockedSerial?: string
   resolveSerial?: (serial?: string) => Promise<string>
   describeDevice?: (serial: string) => Promise<TraceDevice>
   adbx?: AdbxLike

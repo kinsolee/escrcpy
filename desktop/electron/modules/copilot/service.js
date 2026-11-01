@@ -8,8 +8,10 @@ import { createInProcessFlowMcp } from '@escrcpy/flow-mcp'
 import { yadbPath } from '$electron/configs/extra/index.js'
 import { flowScriptsDir } from '../flow/scripts.js'
 
-const COPILOT_SYSTEM = [
+/** The session is bound to one device; the MCP server also refuses any other serial (SERIAL_LOCKED). */
+const copilotSystem = serial => [
   '你是 Escrcpy 的 Android 设备助手(Copilot),通过工具直接控制一台已连接的 Android 设备。',
+  `本会话绑定设备 ${serial}:所有工具都在这台设备上执行,不要 device_select 或传入其他 serial;用户要换设备时请他在页面上切换。`,
   '规则:',
   '- 动手前先用 get_screen_state 或 ui_elements 观察屏幕,根据 resource_id / text / content_desc 定位控件。',
   '- 关键操作后按需再观察一次确认结果。',
@@ -57,7 +59,7 @@ const handlers = {
       return { success: false, error: 'serial is required' }
     const sessionId = `copilot_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const traceDir = join(COPILOT_TRACES_DIR(), sessionId)
-    const mcp = await createInProcessFlowMcp({ defaultSerial: payload.serial, traceDir, yadbPath })
+    const mcp = await createInProcessFlowMcp({ lockedSerial: payload.serial, traceDir, yadbPath })
     sessions.set(sessionId, { mcp, traceDir, serial: payload.serial, messages: [], tasks: [], controller: null, createdAt: Date.now() })
     return { success: true, sessionId, toolCount: mcp.tools.length }
   },
@@ -77,7 +79,7 @@ const handlers = {
     try {
       const result = await runAgentLoop({
         endpoint: { ...resolved.vendor, model: resolved.model },
-        system: COPILOT_SYSTEM,
+        system: copilotSystem(session.serial),
         messages: session.messages,
         tools: session.mcp.tools,
         callTool: call => session.mcp.callTool(call.name, call.args),

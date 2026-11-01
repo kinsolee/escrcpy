@@ -50,6 +50,8 @@ export interface FlowMcpOptions {
   recorder?: FlowTraceRecorder
   traceDir?: string
   defaultSerial?: string
+  /** Binds the server to one device: every tool runs on it and any other serial is refused with SERIAL_LOCKED. */
+  lockedSerial?: string
   resolveSerial?: (serial?: string) => Promise<string>
   describeDevice?: (serial: string) => Promise<TraceDevice>
   logger?: (message: string, error?: unknown) => void
@@ -59,6 +61,8 @@ export interface RealFlowMcpOptions {
   adbPath?: string
   yadbPath?: string
   defaultSerial?: string
+  /** See FlowMcpOptions.lockedSerial. */
+  lockedSerial?: string
   traceDir?: string
 }
 
@@ -632,6 +636,15 @@ function registerFlowTools(flow: FlowMcpServer): void {
   }))
 }
 
+/** Resolver for a server bound to one device; omitted serials fall back to it, others are refused. */
+function lockedSerialResolver(lockedSerial: string): (serial?: string) => Promise<string> {
+  return async (serial) => {
+    if (serial && serial !== lockedSerial)
+      throw new Error(`SERIAL_LOCKED: this session is bound to ${lockedSerial}; ${serial} cannot be used here. Omit serial or pass ${lockedSerial}`)
+    return lockedSerial
+  }
+}
+
 export function createFlowMcpServer(options: FlowMcpOptions): FlowMcpServer {
   const traceDir = options.traceDir ?? process.env[TRACE_DIR_ENV]
   const recorder = options.recorder ?? (traceDir ? new FlowTraceRecorder({ dir: traceDir }) : undefined)
@@ -639,7 +652,8 @@ export function createFlowMcpServer(options: FlowMcpOptions): FlowMcpServer {
     device: options.device,
     lease: options.lease ?? createDeviceLease(),
     recorder,
-    defaultSerial: options.defaultSerial ?? process.env.ANDROID_SERIAL,
+    defaultSerial: options.lockedSerial ?? options.defaultSerial ?? process.env.ANDROID_SERIAL,
+    lockedSerial: options.lockedSerial,
     resolveSerial: options.resolveSerial ?? (async (serial) => {
       if (serial || context.defaultSerial)
         return serial ?? context.defaultSerial!
@@ -655,6 +669,9 @@ export function createFlowMcpServer(options: FlowMcpOptions): FlowMcpServer {
     adbx: options.adbx,
     autoTraceDir: traceDir,
   }
+  // A locked server ignores any custom resolver: the bound serial is the only answer.
+  if (options.lockedSerial)
+    context.resolveSerial = lockedSerialResolver(options.lockedSerial)
   const server = new McpServer({ name: 'flow-mcp', version: '0.0.0' })
   const flow = { server, context }
   registerFlowTools(flow)

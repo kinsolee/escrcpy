@@ -323,6 +323,75 @@ describe('flow MCP lease tools', () => {
   })
 })
 
+describe('flow MCP serial lock', () => {
+  async function connect(flow: ReturnType<typeof createFlowMcpServer>) {
+    const client = new Client({ name: 'flow-mcp-lock-test-client', version: '0.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await Promise.all([flow.server.connect(serverTransport), client.connect(clientTransport)])
+    return client
+  }
+
+  function errorText(result: { content: unknown }): string {
+    return String((result.content as [{ text?: unknown }])[0].text)
+  }
+
+  it('refuses device_select to another serial and keeps the locked one as default', async () => {
+    const flow = createFlowMcpServer({ device: fakeDevice(), lease: fakeLease(), defaultSerial: 'other-2', lockedSerial: 'fake-1' })
+    const client = await connect(flow)
+    expect(flow.context.defaultSerial).toBe('fake-1')
+    const refused = await client.callTool({ name: 'device_select', arguments: { serial: 'other-2' } })
+    expect(refused.isError).toBe(true)
+    expect(errorText(refused)).toContain('SERIAL_LOCKED')
+    expect(errorText(refused)).toContain('fake-1')
+    expect(flow.context.defaultSerial).toBe('fake-1')
+    expect(textOf(await client.callTool({ name: 'device_select', arguments: { serial: 'fake-1' } }))).toEqual({ serial: 'fake-1' })
+    await client.close()
+    await flow.server.close()
+  })
+
+  it('runs actions on the locked serial and never touches a different one', async () => {
+    const device = fakeDevice()
+    const tap = vi.spyOn(device, 'tap')
+    const flow = createFlowMcpServer({ device, lease: fakeLease(), lockedSerial: 'fake-1' })
+    const client = await connect(flow)
+    const refused = await client.callTool({ name: 'tap', arguments: { serial: 'other-2', x: 0.5, y: 0.5 } })
+    expect(refused.isError).toBe(true)
+    expect(errorText(refused)).toContain('SERIAL_LOCKED')
+    expect(tap).not.toHaveBeenCalled()
+    const tapped = await client.callTool({ name: 'tap', arguments: { x: 0.5, y: 0.5 } })
+    expect(tapped.isError).not.toBe(true)
+    expect(tap).toHaveBeenCalledTimes(1)
+    expect(tap.mock.calls[0]?.[0]).toBe('fake-1')
+    await client.close()
+    await flow.server.close()
+  })
+
+  it('refuses to claim a different serial', async () => {
+    const lease = fakeLease()
+    const flow = createFlowMcpServer({ device: fakeDevice(), lease, lockedSerial: 'fake-1' })
+    const client = await connect(flow)
+    const refused = await client.callTool({ name: 'device_claim', arguments: { serial: 'other-2', holder: 'agent' } })
+    expect(refused.isError).toBe(true)
+    expect(lease.held.size).toBe(0)
+    const claimed = await client.callTool({ name: 'device_claim', arguments: { holder: 'agent' } })
+    expect(textOf(claimed)).toMatchObject({ serial: 'fake-1', holder: 'agent' })
+    await client.close()
+    await flow.server.close()
+  })
+
+  it('applies the lock through createInProcessFlowMcp', async () => {
+    const { createInProcessFlowMcp } = await import('../src/index.js')
+    const mcp = await createInProcessFlowMcp({ lockedSerial: 'fake-1' })
+    try {
+      await expect(mcp.callTool('device_select', { serial: 'other-2' })).rejects.toThrow(/SERIAL_LOCKED/)
+      expect(JSON.parse(await mcp.callTool('device_select', { serial: 'fake-1' }))).toEqual({ serial: 'fake-1' })
+    }
+    finally {
+      await mcp.close()
+    }
+  })
+})
+
 describe('createInProcessFlowMcp', () => {
   it('lists the full tool surface and rejects unknown tools without touching a device', async () => {
     const { createInProcessFlowMcp } = await import('../src/index.js')
