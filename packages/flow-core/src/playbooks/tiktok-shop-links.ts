@@ -1,0 +1,626 @@
+import { z } from 'zod'
+import { jevBoxCenter } from '../jev.js'
+import type { JevBoxAnswer, JevNoulAnswer, JevQuestions } from '../jev.js'
+import type { Observation, PlaybookDefinition, PlaybookOutcome, PlaybookRuntime } from './runtime.js'
+
+/**
+ * TikTok Shop: search a keyword and collect product links (Share → Copy link).
+ *
+ * Code owns the flow; every observation is one Jev request that judges the
+ * page type, popups, the share panel, "no results", and locates the controls
+ * the current step may need. Cards are judged one position at a time (product?
+ * LIVE? video? ad?) and code picks the next qualifying one; product IDs come
+ * from the copied link and are compared in code. When Jev is unsure or the
+ * screen is unexpected, only that step goes to the vision agent.
+ */
+
+export const TIKTOK_PACKAGE = 'com.zhiliaoapp.musically'
+
+export const tiktokShopLinksParams = z.object({
+  keyword: z.string().trim().min(1, 'keyword is required'),
+  count: z.coerce.number().int().min(1).max(10).default(3),
+  /** Skip cards labelled "Ad"/"Sponsored". Default false: ads are products too, and are flagged per item. */
+  skipAds: z.boolean().default(false),
+  /** Grid scrolls before giving up on finding more cards. Default 4. */
+  maxScrolls: z.coerce.number().int().min(0).max(20).default(4),
+})
+
+export type TiktokShopLinksParams = z.infer<typeof tiktokShopLinksParams>
+
+export interface TiktokShopLinkItem {
+  link: string
+  productId?: string
+  /** Where the short link redirects, without its query string (e.g. https://www.tiktok.com/view/product/<id>). */
+  finalUrl?: string
+  position: CardPosition
+  ad: boolean
+  /** Jev Noul on the product page: is the product the kind of thing `keyword` names. */
+  relevance?: number
+}
+
+export interface TiktokShopLinksResult {
+  keyword: string
+  links: string[]
+  productIds: string[]
+  noResults: boolean
+  items: TiktokShopLinkItem[]
+  duplicates: string[]
+}
+
+// ---------------------------------------------------------------------------
+// Questions
+
+export const TIKTOK_PAGES = {
+  video_feed: { what: 'TikTok short-video feed: one full-screen video with Like, Comment and Share icons on the right edge and tabs such as Following, Shop and For You at the top' },
+  live_room: { what: 'TikTok LIVE room: a host streaming live, a viewer count, scrolling chat messages and gifts' },
+  shop_home: { what: 'TikTok Shop home page: a search box at the top, banners or category icons, and a feed of products, with no keyboard open' },
+  search_input: { what: 'Search input page: a search text field at the top with a Search button beside it, recent searches or suggestions below, usually with a keyboard' },
+  results_grid: { what: 'Product search results page: the search field shows the query at the top, filter tabs such as Best match below it, and a grid of product cards with prices', not_for: 'A page that says No results found' },
+  no_results: { what: 'Search results page that shows a "No results found" message instead of product cards' },
+  product_detail: { what: 'TikTok Shop product detail page: a large product photo, the price and title, and a Buy now button at the bottom' },
+  other_app: { what: 'A screen of an app that is not TikTok, such as Shopee, MercadoLibre, Chrome or the Android home screen' },
+  other: { what: 'Any other TikTok screen' },
+} as const
+
+type Page = keyof typeof TIKTOK_PAGES
+
+const BASE_QUESTIONS = {
+  page: { type: 'choice', instructions: 'Which kind of page is shown in `screen`? Judge the page itself and ignore any popup, dialog, share panel or keyboard drawn on top of it.', criteria: TIKTOK_PAGES },
+  popup: {
+    type: 'noul',
+    instructions: 'Is a popup or dialog (such as a coupon offer, a promotion, a permission request or a tip) drawn on top of the page in `screen`, covering part of it?',
+    criteria: {
+      true: { what: 'A dialog or popup over the page that has to be closed first', examples: ['a "You\'ve got new offers!" coupon card with Claim all', 'a "Got it" tip dialog', 'an allow-notifications prompt'] },
+      false: { what: 'No popup: the page is uncovered, or only a keyboard, a share panel or a small floating video window is shown', examples: ['an on-screen keyboard', 'a "Send to" share panel with Copy link', 'a small floating video player in a corner of a product page', 'a plain product grid'] },
+    },
+  },
+  share_open: { type: 'noul', instructions: 'Is a share panel titled "Send to", with a Copy link button, open at the bottom of `screen`?' },
+  no_results: { type: 'noul', instructions: 'Does `screen` show a message saying that no results were found for the search?' },
+  popup_close: { type: 'box', instructions: 'the close button (an X) of the popup or dialog in `screen`' },
+} as const satisfies JevQuestions
+
+const NAV_QUESTIONS = {
+  shop_tab_present: { type: 'noul', instructions: 'Is there a "Shop" tab in the top navigation bar of `screen`?' },
+  shop_tab: { type: 'box', instructions: 'the "Shop" tab in the top navigation bar of `screen`' },
+  shop_search_present: { type: 'noul', instructions: 'Is there a search box at the top of the TikTok Shop page in `screen`?' },
+  shop_search: { type: 'box', instructions: 'the search box at the top of the TikTok Shop page in `screen`' },
+} as const satisfies JevQuestions
+
+const SEARCH_QUESTIONS = {
+  field_has_keyword: {
+    type: 'noul',
+    instructions: 'Does the search text field at the top of `screen` contain exactly the text in `keyword`?',
+    criteria: { false: { what: 'The field is empty, shows only grey placeholder or suggestion text, or shows different text' } },
+  },
+  search_button_present: { type: 'noul', instructions: 'Is there a "Search" button next to the search field at the top of `screen`?' },
+  search_button: { type: 'box', instructions: 'the "Search" button next to the search field at the top of `screen`' },
+} as const satisfies JevQuestions
+
+export const CARD_POSITIONS = ['top_left', 'top_right', 'bottom_left', 'bottom_right'] as const
+export type CardPosition = typeof CARD_POSITIONS[number]
+
+const POSITION_WORDS: Record<CardPosition, string> = {
+  top_left: 'top-left',
+  top_right: 'top-right',
+  bottom_left: 'bottom-left',
+  bottom_right: 'bottom-right',
+}
+
+function cardQuestions(): JevQuestions {
+  const questions: JevQuestions = {}
+  for (const position of CARD_POSITIONS) {
+    const where = `the ${POSITION_WORDS[position]} position of the results grid in \`screen\``
+    questions[`${position}_product`] = { type: 'noul', instructions: `Is there a product card (a product photo with a title and a price) in ${where}?` }
+    questions[`${position}_live`] = { type: 'noul', instructions: `Is the card in ${where} marked LIVE?` }
+    questions[`${position}_video`] = { type: 'noul', instructions: `Is the card in ${where} a video (with a play icon or a video duration) rather than a product?` }
+    questions[`${position}_ad`] = { type: 'noul', instructions: `Does the card in ${where} show an "Ad" or "Sponsored" label?` }
+    questions[`${position}_card`] = { type: 'box', instructions: `the card in ${where}` }
+  }
+  return questions
+}
+
+const CARD_QUESTIONS = cardQuestions()
+
+const PRODUCT_QUESTIONS = {
+  share_icon_present: { type: 'noul', instructions: 'Is there a Share icon (a curved arrow) in the top bar of `screen`?' },
+  share_icon: { type: 'box', instructions: 'the Share icon (a curved arrow) in the top bar of `screen`' },
+  copy_link_present: { type: 'noul', instructions: 'Is there a "Copy link" button in a share panel in `screen`?' },
+  copy_link: { type: 'box', instructions: 'the "Copy link" button in the share panel of `screen`' },
+  relevant: { type: 'noul', instructions: 'Is the product shown in `screen` the kind of product that the search text in `keyword` names?' },
+} as const satisfies JevQuestions
+
+/** Where a correctly located control sits (box centre, as 0..1 of the screen) and how big its box is. */
+export interface BoxRegion {
+  x?: [number, number]
+  y?: [number, number]
+  minWidth?: number
+  maxWidth?: number
+  maxHeight?: number
+}
+
+/** Expected regions on a portrait phone; a low-confidence box that fits one is still used (see thresholds.boxGeometry). */
+export const TIKTOK_BOX_REGIONS: Record<string, BoxRegion> = {
+  shop_tab: { y: [0, 0.15], maxWidth: 0.25 },
+  /** A close X is small; used as an extra requirement, never to lower the confidence bar. */
+  popup_close: { maxWidth: 0.15, maxHeight: 0.08 },
+  shop_search: { y: [0, 0.2], minWidth: 0.3 },
+  search_button: { x: [0.6, 1], y: [0, 0.15], maxWidth: 0.3 },
+  share_icon: { x: [0.5, 1], y: [0, 0.15], maxWidth: 0.15 },
+  copy_link: { x: [0, 0.5], y: [0.6, 1], maxWidth: 0.3 },
+  top_left_card: { x: [0, 0.5], y: [0.1, 0.75], minWidth: 0.3, maxWidth: 0.55 },
+  top_right_card: { x: [0.5, 1], y: [0.1, 0.75], minWidth: 0.3, maxWidth: 0.55 },
+  bottom_left_card: { x: [0, 0.5], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55 },
+  bottom_right_card: { x: [0.5, 1], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55 },
+}
+
+export function boxFitsRegion(box: { top: number, bottom: number, left: number, right: number }, region: BoxRegion | undefined): boolean {
+  if (!region)
+    return false
+  const cx = (box.left + box.right) / 2
+  const cy = (box.top + box.bottom) / 2
+  const width = box.right - box.left
+  const inside = (value: number, range?: [number, number]) => !range || (value >= range[0] && value <= range[1])
+  return inside(cx, region.x) && inside(cy, region.y) && (region.minWidth === undefined || width >= region.minWidth) && (region.maxWidth === undefined || width <= region.maxWidth) && (region.maxHeight === undefined || box.bottom - box.top <= region.maxHeight)
+}
+
+type Goal = 'reach_search' | 'type' | 'results' | 'pick' | 'open_share' | 'copy' | 'return'
+
+const GOAL_QUESTIONS: Record<Goal, JevQuestions> = {
+  reach_search: { ...BASE_QUESTIONS, ...NAV_QUESTIONS },
+  type: { ...BASE_QUESTIONS, ...SEARCH_QUESTIONS },
+  results: { ...BASE_QUESTIONS, ...SEARCH_QUESTIONS, ...CARD_QUESTIONS },
+  pick: { ...BASE_QUESTIONS, ...CARD_QUESTIONS },
+  open_share: { ...BASE_QUESTIONS, ...PRODUCT_QUESTIONS },
+  copy: { ...BASE_QUESTIONS, ...PRODUCT_QUESTIONS },
+  return: { ...BASE_QUESTIONS, ...CARD_QUESTIONS },
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+
+const URL_RE = /https?:\/\/\S+/i
+const PRODUCT_ID_RE = /\/product\/(\d{6,})/
+
+function stripQuery(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return `${parsed.origin}${parsed.pathname}`
+  }
+  catch {
+    return url
+  }
+}
+
+export function productIdFromUrl(url: string | undefined): string | undefined {
+  return url?.match(PRODUCT_ID_RE)?.[1]
+}
+
+type Answers = Record<string, any>
+
+interface CardView {
+  position: CardPosition
+  product: number
+  live: number
+  video: number
+  ad: number
+  box: JevBoxAnswer
+}
+
+/** Text of the first EditText in the UI tree, when the tree has one. */
+function searchFieldText(obs: Observation<any>): string | undefined {
+  const field = obs.tree?.nodes.find(node => node.className.endsWith('EditText'))
+  return field ? field.text.trim() : undefined
+}
+
+// ---------------------------------------------------------------------------
+// Playbook
+
+async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<PlaybookOutcome> {
+  const T = rt.thresholds
+  const keyword = params.keyword.trim()
+  rt.allowedInput = [keyword]
+  const items: TiktokShopLinkItem[] = []
+  const duplicates: string[] = []
+  const seen = new Set<string>()
+  const result = (): TiktokShopLinksResult => ({ keyword, links: items.map(item => item.link), productIds: items.flatMap(item => item.productId ? [item.productId] : []), noResults: false, items: [...items], duplicates: [...duplicates] })
+  rt.partial = result()
+
+  const pageOf = (a: Answers): Page | 'uncertain' => a.page.confidence >= T.page ? a.page.choice as Page : 'uncertain'
+  const yes = (answer: JevNoulAnswer) => answer.noul >= T.popup
+  /** A box is used on confidence alone, or at a lower confidence when it fits the target's expected region. */
+  const located = (present: JevNoulAnswer | undefined, box: JevBoxAnswer, name: string) => {
+    if (present && present.noul < T.present)
+      return false
+    const confidence = box.confidence ?? 0
+    if (confidence >= T.box)
+      return true
+    if (confidence >= T.boxGeometry && boxFitsRegion(box.box, TIKTOK_BOX_REGIONS[name])) {
+      rt.decide(`${name} box ${confidence.toFixed(2)} accepted by its expected region`)
+      return true
+    }
+    return false
+  }
+  let gridWaits = 0
+  /** Share-icon taps for the current product, and observations waited since the last one (the panel slides in slowly). */
+  let shareTaps = 0
+  let shareWaits = 0
+
+  let goal = 'reach_search' as Goal
+  let misses = 0
+  let actions = 0
+  let typed = 0
+  let popupCloses = 0
+  let cursor = 0
+  let scrolls = 0
+  let backs = 0
+  let card: { position: CardPosition, ad: boolean, relevance?: number } | undefined
+  let takenLink: string | undefined
+  const setGoal = (next: Goal) => {
+    if (next !== goal) {
+      misses = 0
+      actions = 0
+    }
+    goal = next
+  }
+
+  /** Records a miss; on the second miss of the same goal, hands the step to the vision agent. */
+  const miss = async (why: string, intent: string, expect: Parameters<PlaybookRuntime['takeover']>[1]) => {
+    misses++
+    rt.decide(`miss ${misses}: ${why}`)
+    if (misses >= 2) {
+      misses = 0
+      await rt.takeover(intent, expect, why)
+    }
+  }
+
+  /** Reads the clipboard after a copy; accepts it only when it changed from `before` and holds a URL. */
+  const takeClipboard = async (before: string): Promise<string | undefined> => {
+    const value = await rt.waitClipboardChange(before)
+    const link = value.match(URL_RE)?.[0]
+    if (!link || value === before)
+      return undefined
+    return link
+  }
+
+  /** Stores a freshly copied link; returns true when the target count is reached. */
+  const store = async (link: string): Promise<boolean> => {
+    const resolved = productIdFromUrl(link) ? link : await rt.resolveLink(link)
+    const productId = productIdFromUrl(resolved) ?? productIdFromUrl(link)
+    const finalUrl = resolved ? stripQuery(resolved) : undefined
+    const key = productId ?? finalUrl ?? link
+    if (seen.has(key)) {
+      duplicates.push(productId ?? link)
+      rt.decide(`duplicate product ${productId ?? link}; not counted`)
+    }
+    else {
+      seen.add(key)
+      items.push({ link, ...(productId ? { productId } : {}), ...(finalUrl && finalUrl !== link ? { finalUrl } : {}), position: card?.position ?? 'top_left', ad: card?.ad ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}) })
+      rt.decide(`stored link ${items.length}/${params.count}: ${productId ?? link}`)
+    }
+    rt.partial = result()
+    card = undefined
+    return items.length >= params.count
+  }
+
+  /** Clears the field, types the keyword, and lets the next observation verify it. */
+  const typeKeyword = async () => {
+    typed++
+    await rt.clearText()
+    await rt.inputText(keyword)
+  }
+
+  for (;;) {
+    const obs = await rt.observe(goal, GOAL_QUESTIONS[goal], { keyword })
+    const a = obs.answers as Answers
+    const page = pageOf(a)
+    const shareOpen = yes(a.share_open)
+
+    // Copy link handed to a takeover: its check read the clipboard already.
+    if (takenLink) {
+      const link = takenLink
+      takenLink = undefined
+      if (await store(link))
+        return { success: true, result: result(), reason: `collected ${items.length} links` }
+      setGoal('return')
+    }
+
+    if (yes(a.no_results) || page === 'no_results') {
+      rt.decide('search returned no results')
+      return { success: true, result: { ...result(), noResults: true }, reason: 'no results for the keyword' }
+    }
+
+    // A popup over the page comes first (a share panel the playbook opened is not one).
+    if (yes(a.popup) && !shareOpen) {
+      popupCloses++
+      if (popupCloses > 3) {
+        popupCloses = 0
+        await rt.takeover('A popup or dialog covers the TikTok screen. Close it with its close (X) button or the back key; never tap its action button (Claim, Buy, Follow, etc.).', o => !yes((o.answers as Answers).popup), 'popup did not close')
+        continue
+      }
+      if ((a.popup_close.confidence ?? 0) >= T.box && boxFitsRegion(a.popup_close.box, TIKTOK_BOX_REGIONS.popup_close)) {
+        rt.decide('close popup with its X')
+        if (await rt.tap(obs, jevBoxCenter(a.popup_close.box), 'popup close X'))
+          continue
+      }
+      rt.decide('close popup with BACK')
+      await rt.key('BACK', 'close popup')
+      continue
+    }
+
+    switch (goal) {
+      case 'reach_search': {
+        if (page === 'search_input') {
+          setGoal('type')
+          await typeKeyword()
+          break
+        }
+        if (page === 'results_grid' || page === 'product_detail' || page === 'live_room') {
+          await rt.key('BACK', `leave ${page}`)
+          break
+        }
+        if (++actions > 4) {
+          actions = 0
+          await rt.takeover('Open the TikTok Shop search input page: tap the Shop tab at the top of the video feed, then the search box at the top of the Shop page. Stop when the search text field (usually with a keyboard) is showing.', o => pageOf(o.answers as Answers) === 'search_input', 'search page not reached')
+          break
+        }
+        if (page === 'video_feed' && located(a.shop_tab_present, a.shop_tab, 'shop_tab')) {
+          await rt.tap(obs, jevBoxCenter(a.shop_tab.box), 'Shop tab')
+          break
+        }
+        if (page === 'shop_home' && located(a.shop_search_present, a.shop_search, 'shop_search')) {
+          await rt.tap(obs, jevBoxCenter(a.shop_search.box), 'Shop search box')
+          break
+        }
+        await miss(`page ${page} (${a.page.choice} ${a.page.confidence.toFixed(2)}) has no usable control`, 'Open the TikTok Shop search input page: from the video feed tap the Shop tab at the top, then tap the search box at the top of the Shop page. Stop when the search text field (usually with a keyboard) is showing.', o => pageOf(o.answers as Answers) === 'search_input')
+        break
+      }
+
+      case 'type': {
+        if (page === 'results_grid') {
+          setGoal('results')
+          break
+        }
+        if (page !== 'search_input') {
+          await miss(`expected the search page, saw ${page}`, 'Go back to the TikTok Shop search input page (the search text field with the keyboard). Do not type anything.', o => pageOf(o.answers as Answers) === 'search_input')
+          if (misses === 0)
+            setGoal('reach_search')
+          break
+        }
+        const fieldText = searchFieldText(obs)
+        const verified = fieldText === keyword || (fieldText !== undefined && fieldText.toLowerCase() === keyword.toLowerCase()) || (fieldText === undefined && a.field_has_keyword.noul >= T.popup)
+        const wrong = fieldText !== undefined ? !verified && a.field_has_keyword.noul < 0.5 : a.field_has_keyword.noul <= 1 - T.popup
+        if (verified || (!wrong && typed > 0 && a.field_has_keyword.noul >= 0.5)) {
+          rt.decide(`field holds the keyword (tree: ${fieldText === undefined ? 'n/a' : JSON.stringify(fieldText)}, jev ${a.field_has_keyword.noul.toFixed(2)}); submit`)
+          setGoal('results')
+          await rt.key('ENTER', 'submit search')
+          break
+        }
+        if (typed < 2) {
+          rt.decide(`field text ${fieldText === undefined ? '(no tree)' : JSON.stringify(fieldText)} is not the keyword; (re)type`)
+          await typeKeyword()
+          break
+        }
+        await rt.takeover(`Make the search field at the top of this TikTok Shop search page contain exactly "${keyword}" (clear other text with the field's clear button first), then stop without submitting.`, o => (o.answers as Answers).field_has_keyword?.noul >= 0.5, 'keyword could not be verified in the field')
+        typed = 1
+        break
+      }
+
+      case 'results': {
+        if (page === 'results_grid') {
+          if (a.field_has_keyword.noul <= 1 - T.popup)
+            rt.decide(`warning: results page query may differ from the keyword (jev ${a.field_has_keyword.noul.toFixed(2)})`)
+          setGoal('pick')
+          // Same observation carries the card questions: pick right away.
+          await pick(obs, a)
+          break
+        }
+        if (page === 'search_input') {
+          if (misses === 0 && located(a.search_button_present, a.search_button, 'search_button')) {
+            misses++
+            await rt.tap(obs, jevBoxCenter(a.search_button.box), 'Search button')
+            break
+          }
+          await miss('search did not submit', `Submit the search on this TikTok Shop search page by tapping its Search button. Do not change the text in the field ("${keyword}").`, o => ['results_grid', 'no_results'].includes(pageOf(o.answers as Answers)) || yes((o.answers as Answers).no_results))
+          break
+        }
+        await miss(`expected search results, saw ${page}`, `Show the TikTok Shop product search results for "${keyword}" (the results grid). Do not type a different search.`, o => ['results_grid', 'no_results'].includes(pageOf(o.answers as Answers)))
+        break
+      }
+
+      case 'pick':
+      case 'return': {
+        if (shareOpen) {
+          await rt.key('BACK', 'close share panel')
+          break
+        }
+        if (page === 'results_grid') {
+          backs = 0
+          setGoal('pick')
+          await pick(obs, a)
+          break
+        }
+        if (page === 'product_detail' || page === 'live_room' || page === 'video_feed' || page === 'other') {
+          if (++backs > 4) {
+            backs = 0
+            await rt.takeover(`Go back to the TikTok Shop search results grid for "${keyword}" using the back key.`, o => pageOf(o.answers as Answers) === 'results_grid', 'could not return to the results grid')
+            break
+          }
+          if (page === 'video_feed' && backs > 2) {
+            rt.decide('back at the feed: search again')
+            setGoal('reach_search')
+            cursor = 0
+            scrolls = 0
+            typed = 0
+            break
+          }
+          await rt.key('BACK', `return from ${page}`)
+          break
+        }
+        if (page === 'search_input') {
+          rt.decide('back at the search page: search again (seen products are skipped by ID)')
+          cursor = 0
+          scrolls = 0
+          typed = 0
+          setGoal('type')
+          await typeKeyword()
+          break
+        }
+        if (page === 'shop_home') {
+          setGoal('reach_search')
+          cursor = 0
+          scrolls = 0
+          typed = 0
+          break
+        }
+        await miss(`expected the results grid, saw ${page}`, `Go back to the TikTok Shop search results grid for "${keyword}" using the back key.`, o => pageOf(o.answers as Answers) === 'results_grid')
+        break
+      }
+
+      case 'open_share':
+      case 'copy': {
+        if (page === 'product_detail' && card && card.relevance === undefined)
+          card.relevance = a.relevant.noul
+        if (shareOpen || (goal === 'copy' && a.share_open.noul >= 0.5 && located(a.copy_link_present, a.copy_link, 'copy_link'))) {
+          setGoal('copy')
+          if (located(a.copy_link_present, a.copy_link, 'copy_link')) {
+            // Read, never write, before copying: a write pops Android's clipboard preview over the
+            // bottom-left corner, exactly where Copy link sits.
+            const before = await rt.readClipboard()
+            if (!(await rt.tap(obs, jevBoxCenter(a.copy_link.box), 'Copy link'))) {
+              await miss('Copy link tap refused', 'Tap "Copy link" in the open share panel. Do not tap any friend, contact or other app.', async () => !!(takenLink = await takeClipboard(before)))
+              break
+            }
+            const link = await takeClipboard(before)
+            // Unchanged and already one of ours: the same product copied again (same short link).
+            if (!link && items.some(item => item.link === before.match(URL_RE)?.[0])) {
+              duplicates.push(items.find(item => item.link === before.match(URL_RE)?.[0])!.productId ?? before)
+              rt.decide('Copy link produced a link already collected; duplicate product, not counted')
+              card = undefined
+              rt.partial = result()
+              setGoal('return')
+              await rt.key('BACK', 'back to results')
+              break
+            }
+            if (!link) {
+              await miss('clipboard has no fresh link after Copy link', 'Tap "Copy link" in the open share panel. Do not tap any friend, contact or other app.', async () => !!(takenLink = await takeClipboard(before)))
+              break
+            }
+            if (await store(link))
+              return { success: true, result: result(), reason: `collected ${items.length} links` }
+            setGoal('return')
+            await rt.key('BACK', 'back to results')
+            break
+          }
+          const before = rt.clipboardReads.at(-1) ?? ''
+          await miss(`Copy link not located (box ${(a.copy_link.confidence ?? 0).toFixed(2)})`, 'Tap "Copy link" in the open share panel. Do not tap any friend, contact or other app.', async () => !!(takenLink = await takeClipboard(before)))
+          break
+        }
+        if (page === 'product_detail') {
+          // A second tap while the panel is still sliding in would dismiss it: wait first.
+          if (goal === 'copy' && shareWaits < 2) {
+            shareWaits++
+            rt.decide('share panel not open yet after tapping Share; wait')
+            await rt.sleep(800)
+            break
+          }
+          if (goal === 'copy')
+            setGoal('open_share')
+          if (located(a.share_icon_present, a.share_icon, 'share_icon') && shareTaps < 2) {
+            shareTaps++
+            shareWaits = 0
+            // The share panel loads its targets before sliding in (~2 s on a Pixel 5a).
+            if (await rt.tap(obs, jevBoxCenter(a.share_icon.box), 'Share icon', { settleMs: 2000 }))
+              goal = 'copy'
+            break
+          }
+          await miss(`Share icon not usable (box ${(a.share_icon.confidence ?? 0).toFixed(2)})`, 'Open the share panel ("Send to") of this TikTok Shop product with the Share arrow icon in the top bar. Stop when the panel with Copy link shows.', o => yes((o.answers as Answers).share_open))
+          break
+        }
+        if (page === 'live_room' || page === 'video_feed') {
+          rt.decide(`card opened a ${page}, not a product; skip it`)
+          card = undefined
+          setGoal('return')
+          await rt.key('BACK', `leave ${page}`)
+          break
+        }
+        if (page === 'results_grid') {
+          // The card tap did not open anything: move on to the next card.
+          rt.decide('still on the grid after the card tap; next card')
+          setGoal('pick')
+          await pick(obs, a)
+          break
+        }
+        await miss(`expected a product page, saw ${page}`, `Go back to the TikTok Shop search results grid for "${keyword}" using the back key.`, o => pageOf(o.answers as Answers) === 'results_grid')
+        if (misses === 0)
+          setGoal('return')
+        break
+      }
+    }
+  }
+
+  /** Picks the next qualifying card on the grid, scrolling when the visible ones are used up. */
+  async function pick(obs: Observation<any>, a: Answers): Promise<void> {
+    const cards: CardView[] = CARD_POSITIONS.map(position => ({
+      position,
+      product: a[`${position}_product`].noul,
+      live: a[`${position}_live`].noul,
+      video: a[`${position}_video`].noul,
+      ad: a[`${position}_ad`].noul,
+      box: a[`${position}_card`],
+    }))
+    const qualified = cards.filter(view => view.product >= 0.5 && view.live < 0.5 && view.video < 0.5 && (!params.skipAds || view.ad < 0.5))
+    const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : view.video >= 0.5 ? 'video' : 'ad'})`)
+    rt.decide(`cards: ${qualified.map(view => view.position).join(', ') || 'none'} qualify${skipped.length ? `; skipped ${skipped.join(', ')}` : ''}; cursor ${cursor}`)
+    if (cursor < qualified.length) {
+      const view = qualified[cursor++]
+      card = { position: view.position, ad: view.ad >= 0.5 }
+      shareTaps = 0
+      shareWaits = 0
+      if (located(undefined, view.box, `${view.position}_card`)) {
+        setGoal('open_share')
+        if (!(await rt.tap(obs, jevBoxCenter(view.box.box), `${view.position} card`)))
+          setGoal('pick')
+        return
+      }
+      setGoal('open_share')
+      await rt.takeover(`Open the product card in the ${POSITION_WORDS[view.position]} position of the TikTok Shop results grid by tapping its photo. Stop when its product page shows.`, o => pageOf(o.answers as Answers) === 'product_detail', `card box confidence ${(view.box.confidence ?? 0).toFixed(2)} is below ${T.box}`)
+      return
+    }
+    // Cards not rendered yet (the grid loads after the results header): wait instead of scrolling.
+    if (!cards.some(view => view.product >= 0.5) && gridWaits < 2) {
+      gridWaits++
+      rt.decide('no product cards visible yet; wait for the grid')
+      await rt.sleep(1200)
+      return
+    }
+    gridWaits = 0
+    if (scrolls >= params.maxScrolls)
+      throw new PlaybookEnd(items.length ? `only ${items.length} of ${params.count} links after ${scrolls} scrolls` : `no product cards found after ${scrolls} scrolls`)
+    // Scroll about two rows with a slow drag (no fling), then start from the top-left again.
+    const top = cards[0].product >= 0.5 && cards[2].product >= 0.5 ? cards[2].box.box.top - cards[0].box.box.top : 0.36
+    const distance = Math.min(0.7, Math.max(0.3, top * 2))
+    scrolls++
+    cursor = 0
+    await rt.swipe({ x: 0.5, y: 0.85 }, { x: 0.5, y: 0.85 - distance }, 900, `scroll ${scrolls}`)
+  }
+}
+
+/** Ends the playbook as failed with the partial result. */
+class PlaybookEnd extends Error {}
+
+export const tiktokShopLinks: PlaybookDefinition<TiktokShopLinksParams> = {
+  id: 'tiktok-shop-links',
+  description: 'TikTok Shop: search a keyword and copy the first N product links (Share → Copy link). Result: {keyword, links, productIds, noResults, items, duplicates}.',
+  params: tiktokShopLinksParams,
+  allowedPackages: [TIKTOK_PACKAGE],
+  async run(rt, params) {
+    try {
+      return await run(rt, params)
+    }
+    catch (error) {
+      if (error instanceof PlaybookEnd)
+        return { success: false, result: rt.partial, reason: error.message }
+      throw error
+    }
+  },
+}

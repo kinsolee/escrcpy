@@ -26,14 +26,34 @@ export const llmVendorSchema = z.object({
   models: z.array(llmModelSchema).default([]),
 }).passthrough()
 
+/**
+ * Jev (TypeSafe System One) judgment endpoint. Everything is optional: the
+ * default is the local magpie gateway with the magpie vendor's key.
+ * Requests with images or Box questions go to the fallback endpoint once the
+ * primary answers "Images are not turned on" (a gateway that drops the
+ * `TypeSafe-Danger-Zone-Images` header).
+ */
+export const jevConfigSchema = z.object({
+  baseUrl: z.string().optional(),
+  apiKey: z.string().optional(),
+  apiKeyEnv: z.string().optional(),
+  model: z.string().optional(),
+  fallbackBaseUrl: z.string().optional(),
+  fallbackApiKey: z.string().optional(),
+  fallbackApiKeyEnv: z.string().optional(),
+  timeoutMs: z.number().int().positive().optional(),
+}).passthrough()
+
 export const llmConfigSchema = z.object({
   /** `<vendorId>::<modelId>` picked at execution time; empty means healing stays off. */
   active: z.string().optional(),
   vendors: z.array(llmVendorSchema).default([]),
+  jev: jevConfigSchema.optional(),
 }).passthrough()
 
 export type LlmVendor = z.infer<typeof llmVendorSchema>
 export type LlmConfig = z.infer<typeof llmConfigSchema>
+export type JevConfig = z.infer<typeof jevConfigSchema>
 
 export function llmConfigPath(explicit?: string): string {
   return explicit ?? process.env.FLOW_LLM_CONFIG ?? join(homedir(), '.escrcpy', 'flow', 'llm.json')
@@ -187,4 +207,50 @@ export async function listLlmModels(endpoint: { baseUrl: string, apiKey: string,
   return Array.isArray(data.data)
     ? data.data.map(item => (typeof item.id === 'string' ? item.id : '')).filter(Boolean)
     : []
+}
+
+// ---------------------------------------------------------------------------
+// Jev endpoint
+
+export const DEFAULT_JEV_BASE_URL = 'http://127.0.0.1:3425'
+export const DEFAULT_JEV_MODEL = 'typesafe-ai/jev'
+/** Env var read for the fallback key when the config names none. */
+export const DEFAULT_JEV_FALLBACK_KEY_ENV = 'FLOW_JEV_FALLBACK_API_KEY'
+
+/** Resolved Jev endpoints. Holds keys: never log or persist it. */
+export interface ResolvedJevSettings {
+  /** Undefined when no key is available for the primary endpoint. */
+  primary?: { baseUrl: string, apiKey: string }
+  /** Used for requests with images / Box questions once the primary refuses them. */
+  fallback?: { baseUrl: string, apiKey: string }
+  model: string
+  timeoutMs?: number
+}
+
+const trimUrl = (value: string) => value.trim().replace(/\/+$/, '')
+
+/**
+ * Jev endpoints from llm.json's `jev` section and the environment:
+ * - base URL: `FLOW_JEV_BASE_URL` > `jev.baseUrl` > magpie (`http://127.0.0.1:3425`);
+ * - key: `FLOW_JEV_API_KEY` > env named by `jev.apiKeyEnv` > `jev.apiKey` > the `magpie` vendor's key;
+ * - model: `FLOW_JEV_MODEL` > `jev.model` > `typesafe-ai/jev`;
+ * - fallback: `FLOW_JEV_FALLBACK_BASE_URL` > `jev.fallbackBaseUrl`, key from the env var named by
+ *   `jev.fallbackApiKeyEnv` (default `FLOW_JEV_FALLBACK_API_KEY`) > `jev.fallbackApiKey`.
+ */
+export function resolveJevSettings(config: LlmConfig | undefined, env: NodeJS.ProcessEnv = process.env): ResolvedJevSettings {
+  const jev = config?.jev ?? {}
+  const baseUrl = trimUrl(env.FLOW_JEV_BASE_URL?.trim() || jev.baseUrl?.trim() || DEFAULT_JEV_BASE_URL)
+  const magpie = config?.vendors.find(vendor => vendor.id === 'magpie')
+  const apiKey = env.FLOW_JEV_API_KEY?.trim()
+    || (jev.apiKeyEnv ? env[jev.apiKeyEnv]?.trim() : undefined)
+    || jev.apiKey?.trim()
+    || (magpie ? vendorApiKey(magpie, env) : '')
+  const fallbackBaseUrl = env.FLOW_JEV_FALLBACK_BASE_URL?.trim() || jev.fallbackBaseUrl?.trim()
+  const fallbackApiKey = env[jev.fallbackApiKeyEnv?.trim() || DEFAULT_JEV_FALLBACK_KEY_ENV]?.trim() || jev.fallbackApiKey?.trim()
+  return {
+    ...(apiKey ? { primary: { baseUrl, apiKey } } : {}),
+    ...(fallbackBaseUrl && fallbackApiKey ? { fallback: { baseUrl: trimUrl(fallbackBaseUrl), apiKey: fallbackApiKey } } : {}),
+    model: env.FLOW_JEV_MODEL?.trim() || jev.model?.trim() || DEFAULT_JEV_MODEL,
+    ...(jev.timeoutMs ? { timeoutMs: jev.timeoutMs } : {}),
+  }
 }

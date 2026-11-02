@@ -17,6 +17,9 @@ import {
 } from '@escrcpy/flow-device'
 import type { DeviceLease, EncodedImage, EncodeOptions, ForegroundApp, RatioPoint, ScreenFingerprint, UiNode, UiTree } from '@escrcpy/flow-device'
 import { HealError } from './heal.js'
+import { JevImage, requireJevClient, summarizeJevAnswer } from './jev.js'
+import type { JevClient, JevNoulQuestion, JevQuestions } from './jev.js'
+import { visualRiskCheck } from './jev-vision.js'
 import { createVisionLlmClient, redactSecret } from './vision-llm.js'
 import type { LlmUsage, VisionLlmClient, VisionLlmClientOptions, VisionLlmEndpoint, VisionLlmResponse } from './vision-llm.js'
 
@@ -46,6 +49,10 @@ export interface VisionAgentDevice {
   /** Launch an app by package, optionally force-stopping it first. Used only by the runner's own recovery. */
   startApp: (serial: string, pkg: string, options?: { restart?: boolean }) => Promise<void>
   readClipboard?: (serial: string) => Promise<string>
+  /** Used by playbooks to put a sentinel on the clipboard before "Copy link", so a read proves a fresh copy. */
+  writeClipboard?: (serial: string, text: string) => Promise<void>
+  /** Clears the focused text field (move to end + delete). Used by playbooks before typing a keyword. */
+  clearText?: (serial: string) => Promise<void>
   /** Turns the screen on (KEYCODE_WAKEUP: never toggles it off). A dozing device screencaps solid black. */
   wake?: (serial: string) => Promise<void>
   /** Defaults to flow-device's `encodeScreenshot`. */
@@ -69,7 +76,7 @@ export interface VisionFlowDeviceLike {
 export interface VisionBackendLike {
   shell: (serial: string, command: string) => Promise<string>
   ui?: { dumpLayout: (serial: string) => Promise<string> }
-  clipboard?: { read: (serial: string) => Promise<string> }
+  clipboard?: { read: (serial: string) => Promise<string>, write?: (serial: string, text: string) => Promise<unknown> }
   yadb?: { isAvailable: () => boolean }
 }
 
@@ -93,6 +100,10 @@ export function visionDeviceFromFlowDevice(device: VisionFlowDeviceLike, backend
       await backend.shell(serial, `monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`)
     },
     ...(backend.clipboard && (backend.yadb?.isAvailable() ?? true) ? { readClipboard: (serial: string) => backend.clipboard!.read(serial) } : {}),
+    ...(backend.clipboard?.write && (backend.yadb?.isAvailable() ?? true) ? { writeClipboard: async (serial: string, text: string) => void await backend.clipboard!.write!(serial, text) } : {}),
+    async clearText(serial) {
+      await backend.shell(serial, `input keyevent KEYCODE_MOVE_END ${'KEYCODE_DEL '.repeat(48).trim()}`)
+    },
     async wake(serial) {
       await backend.shell(serial, 'input keyevent KEYCODE_WAKEUP')
     },
@@ -487,6 +498,14 @@ export interface VisionAgentOptions {
   runDir?: string
   /** Extra instructions appended to the system prompt. */
   instructions?: string
+  /**
+   * Jev assist (`true` = client from llm.json / FLOW_JEV_*): a visual check refuses taps on
+   * social / purchase controls the UI tree cannot name, and a successful `done` is verified
+   * (links must come from read_clipboard, the final screen must fit the claim). Jev never plans.
+   */
+  jev?: JevClient | boolean
+  /** Extra yes/no checks on the final screen for a successful `done` (each must be ≥ 0.5); refer to the screenshot as \`screen\`. */
+  jevDoneQuestions?: Record<string, JevNoulQuestion>
   now?: () => number
   sleep?: (ms: number) => Promise<void>
 }
@@ -508,6 +527,10 @@ export interface VisionStepRecord {
   execution?: { ok: boolean, error?: string, durationMs: number, output?: string }
   guard?: { blocked: boolean, reason: string, term?: string, label?: string } | { unverifiedTap?: true, unlabeled?: true }
   screenChanged?: boolean
+  /** Jev visual check of the tap target (jev assist). */
+  visualCheck?: { probability?: number, latencyMs?: number, error?: string }
+  /** Verification of a successful done (jev assist). */
+  doneCheck?: { ok: boolean, reason?: string, links?: { count: number, missing: string[] }, answers?: Record<string, Record<string, unknown>>, latencyMs?: number, error?: string }
   error?: string
 }
 
@@ -526,6 +549,8 @@ export interface VisionAgentResult {
   clipboardReads: string[]
   guardrailBlocks: number
   unverifiedTaps: number
+  /** Present when the Jev assist is on. */
+  jev?: { calls: number, latencyMs: number, visualBlocks: number, doneRejections: number }
   runDir?: string
   reportPath?: string
 }
@@ -659,7 +684,7 @@ const MAX_HISTORY = 12
 const MAX_WAKES = 3
 
 /** A screen whose brightest fingerprint pixel is this dark is off (dozing) rather than a dark UI. */
-function isBlackScreen(fingerprint: ScreenFingerprint | undefined): boolean {
+export function isBlackScreen(fingerprint: ScreenFingerprint | undefined): boolean {
   if (!fingerprint)
     return false
   let max = 0
@@ -702,6 +727,8 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
   const client = options.client ?? (options.endpoint ? createVisionLlmClient(options.endpoint, options.llm) : undefined)
   if (!client)
     throw new HealError('vision agent needs an LLM endpoint or client')
+  const jevClient = options.jev === true ? requireJevClient() : options.jev || undefined
+  const jevStats = { calls: 0, latencyMs: 0, visualBlocks: 0, doneRejections: 0 }
 
   const started = now()
   const deadline = started + timeBudgetMs
@@ -824,6 +851,7 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
       clipboardReads: [...clipboardReads],
       guardrailBlocks,
       unverifiedTaps,
+      ...(jevClient ? { jev: { ...jevStats } } : {}),
       ...(runDir ? { runDir, reportPath } : {}),
     }
     Object.assign(report, result, { finishedAt: new Date(now()).toISOString() })
@@ -1005,8 +1033,21 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
 
       // Terminal actions.
       if (action.type === 'done') {
-        emit({ type: 'step', step })
         const success = action.success ?? true
+        if (success && jevClient) {
+          const verdict = await verifyDone(action.result, image)
+          step.doneCheck = verdict
+          if (!verdict.ok) {
+            jevStats.doneRejections++
+            emit({ type: 'step', step })
+            await persist()
+            if (jevStats.doneRejections > 2)
+              return finish('failed', `done rejected ${jevStats.doneRejections} times by verification: ${verdict.reason}`)
+            notes.push(`The runtime rejected your done: ${verdict.reason}. Fix this, then report done again.`)
+            continue
+          }
+        }
+        emit({ type: 'step', step })
         return finish(success ? 'done' : 'failed', action.reason ?? (success ? 'goal reached' : 'goal not reachable'), { success, result: action.result })
       }
       if (action.type === 'fail') {
@@ -1056,6 +1097,26 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
               step.guard = { blocked: true, reason: `target "${check.label}" matches forbidden text "${check.term}"`, term: check.term, label: check.label }
               notes.push(`The runtime refused to tap "${check.label}" (forbidden). Choose another control.`)
               break
+            }
+            if (jevClient && (check.verdict === 'unverified' || check.unlabeled)) {
+              try {
+                const risk = await visualRiskCheck({ png, ratio: point, jev: jevClient, signal })
+                jevStats.calls++
+                jevStats.latencyMs += risk.jev.latencyMs
+                step.visualCheck = { probability: Math.round(risk.probability * 1000) / 1000, latencyMs: risk.jev.latencyMs }
+                if (risk.risky) {
+                  guardrailBlocks++
+                  jevStats.visualBlocks++
+                  step.guard = { blocked: true, reason: `visual check: the control at the tap point looks like a social / purchase action (p=${risk.probability.toFixed(2)})` }
+                  notes.push('The runtime refused that tap: the control looks like a like / follow / comment / message / cart / buy / claim button. Choose another control.')
+                  break
+                }
+              }
+              catch (error) {
+                if (signal.aborted)
+                  throw signal.reason instanceof BudgetSignal ? signal.reason : new AbortedSignal('aborted by caller')
+                step.visualCheck = { error: redact((error as Error).message) }
+              }
             }
             if (check.verdict === 'unverified') {
               unverifiedTaps++
@@ -1151,6 +1212,48 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
   await persist().catch(() => {})
   emit({ type: 'finish', result })
   return result
+
+  /**
+   * Jev assist for a successful done: every link in the result must appear in a clipboard
+   * read (code), and the final screen must not contradict the claim (Jev Nouls). A Jev
+   * failure does not block the done; it is recorded.
+   */
+  async function verifyDone(result: unknown, image: EncodedImage): Promise<NonNullable<VisionStepRecord['doneCheck']>> {
+    const urls = [...new Set([...JSON.stringify(result ?? null).matchAll(/https?:\/\/[^\s"'\\]+/g)].map(match => match[0]))]
+    const missing = urls.filter(url => !clipboardReads.some(read => read.includes(url)))
+    const links = { count: urls.length, missing }
+    if (missing.length)
+      return { ok: false, reason: `these links were not read from the clipboard (copy each with Copy link, then read_clipboard): ${missing.join(', ')}`, links }
+    const claimsNoResults = !!result && typeof result === 'object' && (result as Record<string, unknown>).noResults === true
+    const questions: JevQuestions = {
+      error_screen: { type: 'noul', instructions: 'Does `screen` show an error message, a login or sign-up prompt, or a page that failed to load?' },
+      ...(claimsNoResults ? { no_results: { type: 'noul', instructions: 'Does `screen` show a message saying that no results were found for the search?' } } : {}),
+      ...options.jevDoneQuestions,
+    }
+    try {
+      const screen = new JevImage(image.data, image.mimeType === 'image/png' ? 'png' : 'jpg', image.width, image.height)
+      const response = await jevClient!.ask({ state: { goal: options.goal, screen }, questions }, { signal })
+      jevStats.calls++
+      jevStats.latencyMs += response.latencyMs
+      const answers = Object.fromEntries(Object.entries(response.answers).map(([name, answer]) => [name, summarizeJevAnswer(answer as never)]))
+      const noul = (name: string) => (response.answers as Record<string, { noul: number }>)[name].noul
+      const base = { links, answers, latencyMs: response.latencyMs }
+      if (noul('error_screen') >= 0.85)
+        return { ok: false, reason: 'the screen shows an error, a login prompt or a failed page', ...base }
+      if (claimsNoResults && noul('no_results') < 0.5)
+        return { ok: false, reason: 'result says noResults but the screen does not show a no-results message', ...base }
+      for (const name of Object.keys(options.jevDoneQuestions ?? {})) {
+        if (noul(name) < 0.5)
+          return { ok: false, reason: `final-screen check "${name}" failed`, ...base }
+      }
+      return { ok: true, ...base }
+    }
+    catch (error) {
+      if (signal.aborted)
+        throw signal.reason instanceof BudgetSignal ? signal.reason : new AbortedSignal('aborted by caller')
+      return { ok: true, links, error: redact((error as Error).message) }
+    }
+  }
 
   /** Relaunches the first allowed app once; false when the recovery budget is spent. */
   async function recoverForeground(step: VisionStepRecord, app: ForegroundApp | undefined): Promise<boolean> {

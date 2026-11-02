@@ -19,7 +19,7 @@ import {
   saveLlmConfig,
   vendorApiKey,
 } from '../src/index.js'
-import type { VisionAgentDevice, VisionLlmClient, VisionLlmRequest } from '../src/index.js'
+import type { JevClient, VisionAgentDevice, VisionLlmClient, VisionLlmRequest } from '../src/index.js'
 
 const TIKTOK = 'com.zhiliaoapp.musically'
 const SERIAL = 'FAKE01'
@@ -264,6 +264,69 @@ describe('runVisionAgent', () => {
       expect(calls.filter(call => call.op === 'tap')).toHaveLength(1)
       expect(requests[0].text).toContain('UI tree unavailable')
     }
+  })
+
+  it('jev assist: refuses an unverifiable tap that looks like a social / purchase control', async () => {
+    const { device, calls } = fakeDevice({ tree: 'fail' })
+    const { client } = fakeClient([
+      act({ type: 'tap', x: 500, y: 500 }),
+      act({ type: 'done', success: true, result: {} }),
+    ])
+    const asked: string[][] = []
+    const jev: JevClient = {
+      describe: () => ({ model: 'fake-jev', imagesViaFallback: false }),
+      async ask(request) {
+        asked.push(Object.keys(request.questions))
+        const answers = Object.fromEntries(Object.keys(request.questions).map(name => [name, { type: 'noul', noul: name === 'risky' ? 0.88 : 0.02 }]))
+        return { answers: answers as never, model: 'fake-jev', latencyMs: 700, attempts: 1, endpoint: 'primary', images: 1 }
+      },
+    }
+    const result = await runVisionAgent({ serial: SERIAL, goal: 'g', allowedPackages: [TIKTOK], device, client, jev, ...fast })
+    expect(result.status).toBe('done')
+    expect(result.guardrailBlocks).toBe(1)
+    expect(result.jev).toMatchObject({ visualBlocks: 1, doneRejections: 0 })
+    expect(calls.some(call => call.op === 'tap')).toBe(false)
+    expect(asked[0]).toEqual(['risky'])
+    expect(asked[1]).toContain('error_screen')
+  })
+
+  it('jev assist: rejects a done whose links were not read from the clipboard, accepts it after read_clipboard', async () => {
+    const link = 'https://vt.tiktok.com/ZSabc123/'
+    const { device } = fakeDevice({ clipboard: ['old', link] })
+    const { client, requests } = fakeClient([
+      act({ type: 'done', success: true, result: { links: [link] } }),
+      act({ type: 'read_clipboard' }),
+      act({ type: 'done', success: true, result: { links: [link] } }),
+    ])
+    const jev: JevClient = {
+      describe: () => ({ model: 'fake-jev', imagesViaFallback: false }),
+      async ask(request) {
+        const answers = Object.fromEntries(Object.keys(request.questions).map(name => [name, { type: 'noul', noul: 0.03 }]))
+        return { answers: answers as never, model: 'fake-jev', latencyMs: 700, attempts: 1, endpoint: 'primary', images: 1 }
+      },
+    }
+    const result = await runVisionAgent({ serial: SERIAL, goal: 'copy a link', allowedPackages: [TIKTOK], device, client, jev, runDir: dir, ...fast })
+    expect(result).toMatchObject({ status: 'done', success: true, steps: 3, clipboardReads: [link] })
+    expect(result.jev).toMatchObject({ doneRejections: 1 })
+    expect(requests[1].text).toContain('rejected your done')
+    const report = JSON.parse(await readFile(path.join(dir, 'report.json'), 'utf8'))
+    expect(report.stepLog[0].doneCheck).toMatchObject({ ok: false, links: { count: 1, missing: [link] } })
+    expect(report.stepLog[2].doneCheck).toMatchObject({ ok: true, answers: { error_screen: { noul: 0.03 } } })
+  })
+
+  it('jev assist: rejects noResults when the final screen shows no such message, and fails after three rejections', async () => {
+    const { device } = fakeDevice()
+    const { client } = fakeClient(Array.from({ length: 3 }, () => act({ type: 'done', success: true, result: { noResults: true } })))
+    const jev: JevClient = {
+      describe: () => ({ model: 'fake-jev', imagesViaFallback: false }),
+      async ask(request) {
+        const answers = Object.fromEntries(Object.keys(request.questions).map(name => [name, { type: 'noul', noul: 0.04 }]))
+        return { answers: answers as never, model: 'fake-jev', latencyMs: 700, attempts: 1, endpoint: 'primary', images: 1 }
+      },
+    }
+    const result = await runVisionAgent({ serial: SERIAL, goal: 'search', allowedPackages: [TIKTOK], device, client, jev, ...fast })
+    expect(result.status).toBe('failed')
+    expect(result.reason).toMatch(/rejected 3 times.*noResults/)
   })
 
   it('re-asks once with the parse error, then continues', async () => {
