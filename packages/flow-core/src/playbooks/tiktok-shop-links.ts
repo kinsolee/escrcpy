@@ -30,9 +30,10 @@ export type TiktokShopLinksParams = z.infer<typeof tiktokShopLinksParams>
 
 export interface TiktokShopLinkItem {
   link: string
-  productId?: string
-  /** Where the short link redirects, without its query string (e.g. https://www.tiktok.com/view/product/<id>). */
-  finalUrl?: string
+  /** Always present: a copied link whose product ID cannot be resolved goes to `unresolved`, not here. */
+  productId: string
+  /** The product URL the link resolves to, without its query string (https://www.tiktok.com/view/product/<id>). */
+  finalUrl: string
   position: CardPosition
   ad: boolean
   /** The grid card showed a sold count (recorded, not required: the bottom row's count is often cut off). */
@@ -45,13 +46,24 @@ export interface TiktokShopLinkItem {
   sheet?: boolean
 }
 
+/** A freshly copied link whose product ID could not be resolved; not counted toward `count`. */
+export interface TiktokShopUnresolvedLink {
+  link: string
+  position: CardPosition
+  searchEpoch: number
+  reason: string
+}
+
 export interface TiktokShopLinksResult {
   keyword: string
+  /** One per item: `links[i]`, `productIds[i]` and `items[i]` describe the same product. */
   links: string[]
   productIds: string[]
   noResults: boolean
   items: TiktokShopLinkItem[]
   duplicates: string[]
+  /** Copied links that did not resolve to a product ID (retried first); they are not in `items`. */
+  unresolved: TiktokShopUnresolvedLink[]
   /** Searches run for this result. Above 1 the items do not all come from one results grid, so positions are per search. */
   searchEpochs: number
   researched: boolean
@@ -249,6 +261,14 @@ function stripQuery(url: string): string {
   }
 }
 
+/** Every counted item carries its product ID and product URL (so `productIds.length === items.length`). */
+export function assertItemsResolved(items: readonly TiktokShopLinkItem[]): void {
+  for (const item of items) {
+    if (!item.productId || !item.finalUrl || productIdFromUrl(item.finalUrl) !== item.productId)
+      throw new Error(`invariant violated: item ${item.link} has no resolved product (productId ${item.productId ?? 'missing'}, finalUrl ${item.finalUrl ?? 'missing'})`)
+  }
+}
+
 export function productIdFromUrl(url: string | undefined): string | undefined {
   return url?.match(PRODUCT_ID_RE)?.[1]
 }
@@ -280,11 +300,15 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   rt.allowedInput = [keyword]
   const items: TiktokShopLinkItem[] = []
   const duplicates: string[] = []
+  const unresolved: TiktokShopUnresolvedLink[] = []
   const seen = new Set<string>()
   /** Searches submitted so far (a re-search after a relaunch starts a new epoch). */
   let searchEpoch = 0
   let epochCounted = true
-  const result = (): TiktokShopLinksResult => ({ keyword, links: items.map(item => item.link), productIds: items.flatMap(item => item.productId ? [item.productId] : []), noResults: false, items: [...items], duplicates: [...duplicates], searchEpochs: searchEpoch, researched: searchEpoch > 1 })
+  const result = (): TiktokShopLinksResult => {
+    assertItemsResolved(items)
+    return { keyword, links: items.map(item => item.link), productIds: items.map(item => item.productId), noResults: false, items: [...items], duplicates: [...duplicates], unresolved: [...unresolved], searchEpochs: searchEpoch, researched: searchEpoch > 1 }
+  }
   rt.partial = result()
 
   const pageOf = (a: Answers): Page | 'uncertain' => a.page.confidence >= T.page ? a.page.choice as Page : 'uncertain'
@@ -417,24 +441,33 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     return link
   }
 
-  /** Stores a freshly copied link; returns true when the target count is reached. */
+  /**
+   * Stores a freshly copied link; returns true when the target count is reached. Only links that
+   * resolve to a product ID count: others go to `unresolved` and the playbook moves on to the next card.
+   */
   const store = async (link: string): Promise<boolean> => {
-    let resolved = productIdFromUrl(link) ? link : await rt.resolveLink(link, PRODUCT_ID_RE)
-    // A short-link lookup occasionally fails transiently; one more try before keying on the link.
-    if (!productIdFromUrl(resolved) && !productIdFromUrl(link))
-      resolved = await rt.resolveLink(link, PRODUCT_ID_RE) ?? resolved
-    const productId = productIdFromUrl(resolved) ?? productIdFromUrl(link)
-    const finalUrl = resolved ? stripQuery(resolved) : undefined
-    // Never key on an unresolved final URL: two different products could both land on /login.
-    const key = productId ?? link
-    if (seen.has(key)) {
-      duplicates.push(productId ?? link)
-      rt.decide(`duplicate product ${productId ?? link}; not counted`)
+    let productUrl: string | undefined = productIdFromUrl(link) ? link : undefined
+    let failure: string | undefined
+    if (!productUrl) {
+      const resolution = await rt.resolveLink(link, PRODUCT_ID_RE)
+      if (resolution.matched && productIdFromUrl(resolution.url))
+        productUrl = resolution.url
+      else
+        failure = resolution.reason ?? 'no product URL'
+    }
+    const productId = productIdFromUrl(productUrl)
+    if (!productUrl || !productId) {
+      unresolved.push({ link, position: card?.position ?? 'top_left', searchEpoch: Math.max(1, searchEpoch), reason: failure ?? 'no product ID in the link' })
+      rt.decide(`link ${link} did not resolve to a product ID (${failure}); not counted, next card`)
+    }
+    else if (seen.has(productId)) {
+      duplicates.push(productId)
+      rt.decide(`duplicate product ${productId}; not counted`)
     }
     else {
-      seen.add(key)
-      items.push({ link, ...(productId ? { productId } : {}), ...(finalUrl && finalUrl !== link ? { finalUrl } : {}), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}), searchEpoch: Math.max(1, searchEpoch), ...(card?.sheet ? { sheet: true } : {}) })
-      rt.decide(`stored link ${items.length}/${params.count}: ${productId ?? link}`)
+      seen.add(productId)
+      items.push({ link, productId, finalUrl: stripQuery(productUrl), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}), searchEpoch: Math.max(1, searchEpoch), ...(card?.sheet ? { sheet: true } : {}) })
+      rt.decide(`stored link ${items.length}/${params.count}: ${productId}`)
     }
     rt.partial = result()
     card = undefined
@@ -893,7 +926,7 @@ class PlaybookEnd extends Error {}
 
 export const tiktokShopLinks: PlaybookDefinition<TiktokShopLinksParams> = {
   id: 'tiktok-shop-links',
-  description: 'TikTok Shop: search a keyword and copy the first N product links (Share → Copy link). Result: {keyword, links, productIds, noResults, items, duplicates}.',
+  description: 'TikTok Shop: search a keyword and copy the first N product links (Share → Copy link). Result: {keyword, links, productIds, noResults, items, duplicates, unresolved, searchEpochs, researched}; only links that resolve to a product ID count.',
   params: tiktokShopLinksParams,
   allowedPackages: [TIKTOK_PACKAGE],
   async run(rt, params) {

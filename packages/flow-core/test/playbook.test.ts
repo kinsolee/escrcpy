@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { decodePng, encodePng } from '@escrcpy/flow-device'
 import type { ForegroundApp, RatioPoint } from '@escrcpy/flow-device'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { productIdFromUrl, resolveRedirects, runPlaybook, TIKTOK_PACKAGE } from '../src/index.js'
-import type { JevAnswer, JevClient, JevImage, JevQuestions, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { assertItemsResolved, HopFetchError, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE } from '../src/index.js'
+import type { HopFetcher, HopResponse, JevAnswer, JevClient, JevImage, JevQuestions, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
 
 // ---------------------------------------------------------------------------
 // A tiny simulated TikTok
@@ -71,6 +71,8 @@ interface WorldOptions {
   couponPopup?: boolean
   /** After a copy, Android's clipboard preview hides the bottom-left card's price (seen on device). */
   clipboardOverlay?: boolean
+  /** Every Copy link yields a new short link, as on real TikTok (default: one fixed link per product). */
+  uniqueLinks?: boolean
   /** Physical half-sheet icons (default SHEET_ICONS). */
   sheetIcons?: { share: Box, cart: Box }
   /** Observations that show a blank, still-loading screen after each (re)launch. */
@@ -122,6 +124,7 @@ function world(options: WorldOptions) {
       forceStop()
   }
   const taps: RatioPoint[] = []
+  let copies = 0
   const typed: string[] = []
   const starts: Array<{ pkg: string, restart?: boolean }> = []
   const visible = () => options.grid.slice(state.scroll * 4, state.scroll * 4 + 4)
@@ -188,7 +191,8 @@ function world(options: WorldOptions) {
         fault('card')
       }
       else if (state.page === 'product_detail' && state.share && inside(point, BOXES.copy_link)) {
-        state.clipboard = `https://vt.tiktok.com/ZS${state.current!.id}x/`
+        copies++
+        state.clipboard = `https://vt.tiktok.com/ZS${state.current!.id}x${options.uniqueLinks ? `-${copies}` : ''}/`
         state.overlay = !!options.clipboardOverlay
         state.share = false
       }
@@ -391,6 +395,25 @@ const products = (...ids: string[]): Card[] => ids.map(id => ({ id }))
 const resolveLink = async (url: string) => {
   const id = url.match(/ZS(\d+)x/)?.[1]
   return id ? `https://www.tiktok.com/view/product/${id}?utm=share` : undefined
+}
+
+/** Scripted hop fetcher: short link `ZS<id>x` → 301 to the product URL, unless a scripted failure for that id comes first. */
+type HopOutcome = 'timeout' | 'reset' | 429 | 503 | 200
+function scriptedHops(script: Record<string, HopOutcome[]> = {}) {
+  const calls: string[] = []
+  const fetchHop: HopFetcher = async (url): Promise<HopResponse> => {
+    calls.push(url)
+    const id = url.match(/ZS(\d+)x/)?.[1]
+    const next = id ? script[id]?.shift() : undefined
+    if (next === 'timeout')
+      throw new HopFetchError('timeout', 'timeout')
+    if (next === 'reset')
+      throw new HopFetchError('network', 'ECONNRESET')
+    if (typeof next === 'number')
+      return { status: next }
+    return id ? { status: 301, location: `https://www.tiktok.com/view/product/${id}?user_id=42&device_id=7` } : { status: 302, location: 'https://www.tiktok.com/login' }
+  }
+  return { fetchHop, calls }
 }
 
 let dir: string
@@ -675,14 +698,112 @@ describe('tiktok-shop-links playbook', () => {
       'https://vt.tiktok.com/ZSabc/': 'https://www.tiktok.com/view/product/1735031026643470004?_d=x',
       'https://www.tiktok.com/view/product/1735031026643470004?_d=x': 'https://www.tiktok.com/login',
     }
-    vi.stubGlobal('fetch', async (url: string) => new Response(null, { status: hops[url] ? 301 : 200, headers: hops[url] ? { location: hops[url] } : {} }))
-    try {
-      expect(await resolveRedirects('https://vt.tiktok.com/ZSabc/', /\/product\/\d{6,}/)).toBe('https://www.tiktok.com/view/product/1735031026643470004?_d=x')
-      expect(await resolveRedirects('https://vt.tiktok.com/ZSabc/')).toBe('https://www.tiktok.com/login')
+    const fetchHop: HopFetcher = async url => hops[url] ? { status: 301, location: hops[url] } : { status: 200 }
+    expect(await resolveRedirects('https://vt.tiktok.com/ZSabc/', /\/product\/\d{6,}/, { fetchHop })).toBe('https://www.tiktok.com/view/product/1735031026643470004?_d=x')
+    expect(await resolveRedirects('https://vt.tiktok.com/ZSabc/', undefined, { fetchHop })).toBe('https://www.tiktok.com/login')
+  })
+
+  it('resolver: retries a timeout, a reset, 429 and 5xx with backoff and returns as soon as the product URL shows', async () => {
+    const PRODUCT = /\/product\/(\d{6,})/
+    const sleeps: number[] = []
+    const sleep = async (ms: number) => void sleeps.push(ms)
+    const t = 0
+    const now = () => t
+    const ok = await resolveLinkDetailed('https://vt.tiktok.com/ZS1730002001x/', { stopAt: PRODUCT, ...scriptedHops({ 1730002001: ['timeout', 429, 'reset'] }), sleep, now })
+    expect(ok).toMatchObject({ matched: true, attempts: 4, url: 'https://www.tiktok.com/view/product/1730002001?user_id=42&device_id=7' })
+    expect(sleeps).toEqual([500, 1000, 2000])
+    expect(ok.hops.map(hop => hop.error ?? hop.status)).toEqual(['timeout', 'status', 'network', 301])
+    expect(ok.hops[2]).toMatchObject({ code: 'ECONNRESET' })
+    // Diagnostics never carry query strings (product URLs hold user / device identifiers).
+    expect(JSON.stringify(ok.hops)).not.toMatch(/user_id|device_id/)
+    expect(ok.hops.at(-1)!.to).toBe('https://www.tiktok.com/view/product/1730002001')
+
+    const failed = await resolveLinkDetailed('https://vt.tiktok.com/ZS1730002002x/', { stopAt: PRODUCT, ...scriptedHops({ 1730002002: [503, 503, 503, 503] }), sleep, now })
+    expect(failed).toMatchObject({ matched: false, attempts: 4 })
+    expect(failed.reason).toMatch(/status 503 .*after 4 attempts/)
+
+    // A 200 / 4xx without a redirect is not retried.
+    const notRetried = await resolveLinkDetailed('https://vt.tiktok.com/ZS1730002003x/', { stopAt: PRODUCT, ...scriptedHops({ 1730002003: [200] }), sleep, now })
+    expect(notRetried).toMatchObject({ matched: false, attempts: 1, reason: expect.stringMatching(/status 200 without a redirect/) })
+  })
+
+  it('resolver: stays within the total time budget', async () => {
+    let t = 0
+    const timeouts: number[] = []
+    // Like the real fetcher, a hop never runs past the timeout it is given (what is left of the budget).
+    const slow: HopFetcher = async (_url, timeoutMs) => {
+      timeouts.push(timeoutMs)
+      t += Math.min(8000, timeoutMs)
+      throw new HopFetchError('timeout', 'timeout')
     }
-    finally {
-      vi.unstubAllGlobals()
-    }
+    const resolution = await resolveLinkDetailed('https://vt.tiktok.com/ZS1x/', { stopAt: /\/product\/\d+/, fetchHop: slow, now: () => t, sleep: async ms => void (t += ms), totalBudgetMs: 20_000 })
+    expect(resolution.matched).toBe(false)
+    expect(resolution.attempts).toBe(3)
+    expect(timeouts).toEqual([8000, 8000, 2500])
+    expect(t).toBeLessThanOrEqual(20_000)
+  })
+
+  it('counts a link whose first resolve times out once the retry resolves it, and records the attempts', async () => {
+    const w = world({ grid: products('1730002101', '1730002102', '1730002103') })
+    const { jev } = fakeJev(w)
+    const hops = scriptedHops({ 1730002101: ['timeout'], 1730002102: [429] })
+    const result = await runTikTok(options(w, jev, { resolveLink: undefined, fetchHop: hops.fetchHop }))
+    expect(result.status).toBe('done')
+    const res = result.result as any
+    expect(res.productIds).toEqual(['1730002101', '1730002102', '1730002103'])
+    expect(res.unresolved).toEqual([])
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const resolves = report.stepLog.flatMap((step: any) => step.actions).filter((action: any) => action.type === 'resolve_link')
+    expect(resolves.map((action: any) => [action.ok, action.attempts])).toEqual([[true, 2], [true, 2], [true, 1]])
+    expect(resolves[0].hops[0]).toMatchObject({ attempt: 1, error: 'timeout' })
+    expect(JSON.stringify(report)).not.toMatch(/user_id=|device_id=/)
+  })
+
+  it('does not count a link that never resolves: it goes to unresolved and the next card is taken', async () => {
+    const w = world({ grid: products('1730002201', '1730002202', '1730002203', '1730002204') })
+    const { jev } = fakeJev(w)
+    const hops = scriptedHops({ 1730002201: ['reset', 'reset', 'reset', 'reset'] })
+    const result = await runTikTok(options(w, jev, { resolveLink: undefined, fetchHop: hops.fetchHop }))
+    expect(result.status).toBe('done')
+    const res = result.result as any
+    expect(res.productIds).toEqual(['1730002202', '1730002203', '1730002204'])
+    expect(res.items.map((item: any) => item.position)).toEqual(['top_right', 'bottom_left', 'bottom_right'])
+    expect(res.items.every((item: any) => item.productId && item.finalUrl === `https://www.tiktok.com/view/product/${item.productId}`)).toBe(true)
+    expect(res.links).toHaveLength(res.productIds.length)
+    expect(res.unresolved).toEqual([{ link: 'https://vt.tiktok.com/ZS1730002201x/', position: 'top_left', searchEpoch: 1, reason: expect.stringMatching(/ECONNRESET.*after 4 attempts/) }])
+  })
+
+  it('does not report success when links keep failing until the cards run out', async () => {
+    const w = world({ grid: products('1730002301', '1730002302') })
+    const { jev } = fakeJev(w)
+    const fail = Array.from({ length: 4 }).fill('reset') as HopOutcome[]
+    const hops = scriptedHops({ 1730002301: [...fail], 1730002302: [...fail] })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2, maxScrolls: 0 }, resolveLink: undefined, fetchHop: hops.fetchHop }))
+    expect(result.success).toBe(false)
+    expect(result.status).toBe('failed')
+    expect(result.reason).toMatch(/no product cards|only 0 of 2/)
+    const res = result.result as any
+    expect(res.items).toEqual([])
+    expect(res.productIds).toEqual([])
+    expect(res.unresolved.map((entry: any) => entry.position)).toEqual(['top_left', 'top_right'])
+  })
+
+  it('deduplicates by product ID when a product that once failed to resolve resolves later', async () => {
+    const w = world({ grid: products('1730002401', '1730002401', '1730002402', '1730002403'), uniqueLinks: true })
+    const { jev } = fakeJev(w)
+    const hops = scriptedHops({ 1730002401: ['reset', 'reset', 'reset', 'reset'] })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2 }, resolveLink: undefined, fetchHop: hops.fetchHop }))
+    expect(result.status).toBe('done')
+    const res = result.result as any
+    // The second copy of 1730002401 resolves and counts once; the failed first copy stays in unresolved only.
+    expect(res.productIds).toEqual(['1730002401', '1730002402'])
+    expect(res.unresolved).toHaveLength(1)
+  })
+
+  it('asserts that every counted item has a product ID and product URL', () => {
+    expect(() => assertItemsResolved([{ link: 'https://vt.tiktok.com/ZSx/', productId: '', finalUrl: '', position: 'top_left', ad: false, searchEpoch: 1 } as any])).toThrow(/invariant violated/)
+    expect(() => assertItemsResolved([{ link: 'l', productId: '1730002501', finalUrl: 'https://www.tiktok.com/view/product/1730002502', position: 'top_left', ad: false, searchEpoch: 1 }])).toThrow(/invariant violated/)
+    expect(() => assertItemsResolved([{ link: 'l', productId: '1730002501', finalUrl: 'https://www.tiktok.com/view/product/1730002501', position: 'top_left', ad: false, searchEpoch: 1 }])).not.toThrow()
   })
 
   it('extracts product ids from canonical links', () => {

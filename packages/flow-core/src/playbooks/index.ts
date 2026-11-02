@@ -3,6 +3,7 @@ import { runPlaybookDefinition } from './runtime.js'
 import type { PlaybookDefinition, PlaybookOptions, PlaybookResult } from './runtime.js'
 import { tiktokShopLinks } from './tiktok-shop-links.js'
 
+export * from './link-resolver.js'
 export * from './runtime.js'
 export * from './tiktok-shop-links.js'
 

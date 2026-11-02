@@ -13,6 +13,8 @@ import { checkTapTarget, DEFAULT_FORBIDDEN_TEXTS, isBlackScreen, runVisionAgent 
 import type { VisionAgentDevice, VisionAgentResult } from '../vision-agent.js'
 import type { VisionLlmClient, VisionLlmClientOptions, VisionLlmEndpoint } from '../vision-llm.js'
 import { redactSecret } from '../vision-llm.js'
+import { redactUrl, resolveLinkDetailed } from './link-resolver.js'
+import type { HopFetcher, LinkResolution } from './link-resolver.js'
 
 /**
  * Playbook runtime: code drives a known task as a state machine, Jev makes
@@ -84,8 +86,13 @@ export interface PlaybookOptions {
   leaseHolder?: string
   signal?: AbortSignal
   onEvent?: (event: PlaybookEvent) => void
-  /** Resolves a copied short link (default: follows redirects with fetch, stopping at the first URL matching `stopAt`). */
+  /**
+   * Custom resolver for copied short links: returns the first URL matching `stopAt` (or the last one
+   * reached). Default: `resolveLinkDetailed` (fresh connection per hop, retries, diagnostics).
+   */
   resolveLink?: (url: string, stopAt?: RegExp) => Promise<string | undefined>
+  /** Hop fetcher for the default resolver (tests inject failures here). */
+  fetchHop?: HopFetcher
   now?: () => number
   sleep?: (ms: number) => Promise<void>
 }
@@ -224,7 +231,6 @@ export class PlaybookRuntime {
   readonly now: () => number
   readonly sleep: (ms: number) => Promise<void>
   readonly settleMs: number
-  readonly resolveLink: (url: string, stopAt?: RegExp) => Promise<string | undefined>
   readonly clipboardReads: string[] = []
   /** Exact strings a takeover may type (e.g. the search keyword). Empty: takeovers may not type. */
   allowedInput: string[] = []
@@ -269,7 +275,6 @@ export class PlaybookRuntime {
     this.now = options.now ?? Date.now
     this.sleep = options.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)))
     this.settleMs = options.settleMs ?? 900
-    this.resolveLink = options.resolveLink ?? resolveRedirects
     this.started = this.now()
     this.deadline = this.started + (options.timeBudgetMs ?? 6 * 60_000)
     this.maxSteps = options.maxSteps ?? 60
@@ -691,6 +696,47 @@ export class PlaybookRuntime {
     await this.sleep(this.settleMs)
   }
 
+  /**
+   * Resolves a copied link with retries (capped at 20 s and the run's time budget) and records the
+   * attempt in the current step: attempts, time, outcome and every hop (origin + path only).
+   */
+  async resolveLink(url: string, stopAt?: RegExp): Promise<LinkResolution> {
+    let resolution: LinkResolution
+    if (this.options.resolveLink) {
+      const started = this.now()
+      let found: string | undefined
+      let reason: string | undefined
+      try {
+        found = await this.options.resolveLink(url, stopAt)
+      }
+      catch (error) {
+        reason = `resolver failed: ${(error as Error).message}`
+      }
+      const matched = !!found && (!stopAt || stopAt.test(found))
+      resolution = { ...(found ? { url: found } : {}), matched, attempts: 1, ms: this.now() - started, hops: [], ...(matched ? {} : { reason: reason ?? (found ? `resolved to ${redactUrl(found)}` : 'resolver returned nothing') }) }
+    }
+    else {
+      resolution = await resolveLinkDetailed(url, {
+        stopAt,
+        totalBudgetMs: Math.max(1000, Math.min(20_000, this.deadline - this.now())),
+        ...(this.options.fetchHop ? { fetchHop: this.options.fetchHop } : {}),
+        sleep: this.sleep,
+        now: this.now,
+      })
+    }
+    this.action({
+      type: 'resolve_link',
+      link: redactUrl(url),
+      ok: resolution.matched,
+      attempts: resolution.attempts,
+      ms: resolution.ms,
+      ...(resolution.url ? { to: redactUrl(resolution.url) } : {}),
+      ...(resolution.reason ? { reason: resolution.reason } : {}),
+      ...(resolution.hops.length ? { hops: resolution.hops } : {}),
+    })
+    return resolution
+  }
+
   async readClipboard(): Promise<string> {
     if (!this.device.readClipboard)
       throw new PlaybookStop('error', 'clipboard is unavailable on this device (needs yadb)')
@@ -817,39 +863,6 @@ export class PlaybookRuntime {
 
   /** Partial result a playbook keeps updated, reported when the run stops early. */
   partial: unknown
-}
-
-/**
- * Follows HTTP redirects (manual, ≤ 5 hops, 8 s each) and returns the first URL matching
- * `stopAt`, else the last one; undefined on failure. Stopping matters: a TikTok product page
- * itself redirects cookie-less clients on to /login.
- */
-export async function resolveRedirects(url: string, stopAt?: RegExp): Promise<string | undefined> {
-  let current = url
-  try {
-    for (let hop = 0; hop < 5; hop++) {
-      if (stopAt?.test(current))
-        return current
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 8000)
-      let response: Response
-      try {
-        response = await fetch(current, { method: 'GET', redirect: 'manual', signal: controller.signal, headers: { 'user-agent': 'Mozilla/5.0 (Linux; Android 14) flow-playbook' } })
-      }
-      finally {
-        clearTimeout(timer)
-      }
-      await response.body?.cancel().catch(() => {})
-      const location = response.headers.get('location')
-      if (response.status < 300 || response.status >= 400 || !location)
-        return current
-      current = new URL(location, current).toString()
-    }
-    return current
-  }
-  catch {
-    return undefined
-  }
 }
 
 /** Runs a playbook definition, holding the device lease when one is given. */
