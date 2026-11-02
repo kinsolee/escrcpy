@@ -21,6 +21,8 @@ import { HealError } from './heal.js'
 import { JevImage, requireJevClient, summarizeJevAnswer } from './jev.js'
 import type { JevClient, JevNoulQuestion, JevQuestions } from './jev.js'
 import { visualRiskCheck } from './jev-vision.js'
+import { CONSENT_NEEDS_HUMAN, CONSENT_QUESTION, CONSENT_THRESHOLD, describeConsent, detectConsentInTree } from './consent.js'
+import type { ConsentDetection } from './consent.js'
 import { createVisionLlmClient, redactSecret } from './vision-llm.js'
 import type { LlmUsage, VisionLlmClient, VisionLlmClientOptions, VisionLlmEndpoint, VisionLlmResponse } from './vision-llm.js'
 
@@ -156,6 +158,19 @@ export const DEFAULT_FORBIDDEN_TEXTS: readonly string[] = [
   'Carrinho',
   'Carrito',
   '购物车',
+  // Accepting terms / policies / agreements is a human's decision (see consent.ts).
+  'Agree',
+  'I agree',
+  'Accept',
+  'Accept all',
+  'Concordo',
+  'Aceito',
+  'Aceitar',
+  'Acepto',
+  'Aceptar',
+  '同意',
+  '接受',
+  '我同意',
 ]
 
 /** Hiragana/Katakana, CJK ideographs, Hangul: scripts written without spaces between words. */
@@ -546,6 +561,8 @@ export interface VisionStepRecord {
   visualCheck?: { probability?: number, latencyMs?: number, error?: string }
   /** Verification of a successful done (jev assist). */
   doneCheck?: { ok: boolean, reason?: string, links?: { count: number, missing: string[] }, answers?: Record<string, Record<string, unknown>>, latencyMs?: number, error?: string }
+  /** Consent notice check before a touch: what was found (or the Jev probability / error when nothing was). */
+  consent?: ConsentDetection & { latencyMs?: number, error?: string }
   error?: string
 }
 
@@ -566,6 +583,8 @@ export interface VisionAgentResult {
   unverifiedTaps: number
   /** Present when the Jev assist is on. */
   jev?: { calls: number, latencyMs: number, visualBlocks: number, doneRejections: number }
+  /** Set when the run stopped at a terms / policy / consent notice (reason starts with consent_dialog_needs_human). */
+  consent?: ConsentDetection & { screenshot?: string }
   runDir?: string
   reportPath?: string
 }
@@ -628,6 +647,7 @@ export function buildVisionSystemPrompt(options: { allowedPackages: string[], co
     `- Stay inside the allowed app${options.allowedPackages.length > 1 ? 's' : ''}: ${options.allowedPackages.length ? options.allowedPackages.join(', ') : '(any)'}. Leaving it is reverted by the runtime and counts against you.`,
     '- Read-only: never like, follow, comment, message, share to a contact, add to cart, buy, check out, claim coupons, subscribe, log in or out, or change settings. The runtime blocks taps on such controls; when blocked, pick a different control.',
     '- Close pop-ups (coupons, promotions, permission prompts) with their close (X) button or the back key, never with their action button.',
+    '- Never accept, agree to or acknowledge terms, policy, privacy or consent notices (not even with Got it / OK, and not by tapping around them). When one is on screen, reply fail; the runtime refuses every touch while it is there.',
     '- After every action, look at the new screenshot to confirm the effect before moving on. If nothing changed, do something different instead of repeating.',
     '- Never invent data. Every value in result must come from the screen or from read_clipboard output. Links must be copied with read_clipboard, not typed from memory.',
     '- When the goal is reached, return done with result in the requested shape.',
@@ -863,11 +883,12 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
     }
   }
 
-  function finish(status: VisionRunStatus, reason: string, extra: { success?: boolean, result?: unknown } = {}): VisionAgentResult {
+  function finish(status: VisionRunStatus, reason: string, extra: { success?: boolean, result?: unknown, consent?: VisionAgentResult['consent'] } = {}): VisionAgentResult {
     const result: VisionAgentResult = {
       status,
       success: extra.success ?? false,
       ...(extra.result !== undefined ? { result: extra.result } : {}),
+      ...(extra.consent ? { consent: extra.consent } : {}),
       reason: redact(reason),
       steps: stepLog.length,
       modelCalls,
@@ -999,6 +1020,16 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
         continue
       }
 
+      // Consent guard, free part: a terms / policy notice named in the UI tree ends the run before
+      // the model is even asked (nothing on such a screen may be touched).
+      const treeConsent = detectConsentInTree(tree)
+      if (treeConsent.present) {
+        step.consent = treeConsent
+        emit({ type: 'step', step })
+        await persist()
+        return stopForConsent(treeConsent, step)
+      }
+
       // Decide.
       const elements = tree ? promptElements(tree, scale) : []
       const text = buildStepText({ index, app, image, elements, treeAvailable: !!tree, observe })
@@ -1092,6 +1123,21 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
             return finish('guardrail', `foreground left the allowed apps again (${current?.package ?? 'unknown'})`)
           }
           continue
+        }
+      }
+
+      // Consent guard before any touch: the UI tree, then (Jev assist) the screenshot. A notice
+      // on screen ends the run; the model gets no second try at it.
+      if (action.type === 'tap' || action.type === 'long_press' || action.type === 'swipe' || action.type === 'scroll' || (action.type === 'key' && action.key === 'enter')) {
+        const consent = await consentBeforeTouch(tree, image)
+        if (consent.present || consent.error || consent.probability !== undefined)
+          step.consent = consent
+        if (consent.present) {
+          guardrailBlocks++
+          step.guard = { blocked: true, reason: `terms / policy / consent notice on screen (${describeConsent(consent)}); ${action.type} not executed` }
+          emit({ type: 'step', step })
+          await persist()
+          return stopForConsent(consent, step)
         }
       }
 
@@ -1279,6 +1325,36 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
         throw signal.reason instanceof BudgetSignal ? signal.reason : new AbortedSignal('aborted by caller')
       return { ok: true, links, error: redact((error as Error).message) }
     }
+  }
+
+  /** Consent notice on the screen about to be touched: UI tree first, then one Jev question (when the assist is on). */
+  async function consentBeforeTouch(observedTree: UiTree | undefined, image: EncodedImage): Promise<NonNullable<VisionStepRecord['consent']>> {
+    let checkTree = observedTree
+    if (!checkTree && device.uiTree)
+      checkTree = (await readTree()).tree
+    const fromTree = detectConsentInTree(checkTree)
+    if (fromTree.present || !jevClient)
+      return fromTree
+    try {
+      const screen = new JevImage(image.data, image.mimeType === 'image/png' ? 'png' : 'jpg', image.width, image.height)
+      const response = await jevClient.ask({ state: { screen }, questions: { consent_dialog: CONSENT_QUESTION } }, { signal })
+      jevStats.calls++
+      jevStats.latencyMs += response.latencyMs
+      const probability = response.answers.consent_dialog.noul
+      return { present: probability > CONSENT_THRESHOLD, ...(probability > CONSENT_THRESHOLD ? { source: 'jev' as const } : {}), probability: Math.round(probability * 1000) / 1000, latencyMs: response.latencyMs }
+    }
+    catch (error) {
+      if (signal.aborted)
+        throw signal.reason instanceof BudgetSignal ? signal.reason : new AbortedSignal('aborted by caller')
+      return { present: false, error: redact((error as Error).message) }
+    }
+  }
+
+  function stopForConsent(consent: ConsentDetection, step: VisionStepRecord): VisionAgentResult {
+    const { present, source, term, text, probability } = consent
+    return finish('failed', `${CONSENT_NEEDS_HUMAN}: a terms / policy / consent notice is on screen (${describeConsent(consent)}); automation must not confirm it`, {
+      consent: { present, ...(source ? { source } : {}), ...(term ? { term } : {}), ...(text ? { text } : {}), ...(probability !== undefined ? { probability } : {}), ...(step.screenshot ? { screenshot: step.screenshot } : {}) },
+    })
   }
 
   /** Relaunches the first allowed app once; false when the recovery budget is spent. */

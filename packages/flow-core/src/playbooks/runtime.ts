@@ -10,6 +10,8 @@ import type { JevAnswers, JevClient, JevNoulQuestion, JevQuestions, JevUsage } f
 import { encodeJevScreen, visualRiskCheck } from '../jev-vision.js'
 import type { JevScreen } from '../jev-vision.js'
 import { checkTapTarget, DEFAULT_FORBIDDEN_TEXTS, isBlackScreen, runVisionAgent } from '../vision-agent.js'
+import { CONSENT_QUESTION, describeConsent, detectConsent } from '../consent.js'
+import type { ConsentDetection } from '../consent.js'
 import type { VisionAgentDevice, VisionAgentResult } from '../vision-agent.js'
 import type { VisionLlmClient, VisionLlmClientOptions, VisionLlmEndpoint } from '../vision-llm.js'
 import { redactSecret } from '../vision-llm.js'
@@ -111,6 +113,8 @@ export interface PlaybookStepRecord {
   decision?: string
   actions: Array<Record<string, unknown>>
   guard?: Record<string, unknown>
+  /** Set when a terms / policy / consent notice was on this screen. */
+  consent?: ConsentDetection
   fallback?: { goal: string, status: string, success: boolean, reason: string, steps: number, modelCalls: number, tokens: { prompt: number, completion: number, total: number }, durationMs: number, reportPath?: string, verified?: boolean }
   error?: string
 }
@@ -133,6 +137,10 @@ export interface PlaybookResult {
   guardrailBlocks: number
   visualGuardBlocks: number
   unverifiedTaps: number
+  /** Touches refused because a terms / policy / consent notice was on screen. */
+  consentBlocks: number
+  /** Set when the run stopped at a consent notice (reason starts with consent_dialog_needs_human): the frame and what was found. */
+  consent?: ConsentDetection & { screenshot?: string }
   durationMs: number
   runDir?: string
   reportPath?: string
@@ -187,6 +195,8 @@ export interface Observation<Q extends JevQuestions> {
   app?: ForegroundApp
   tree?: UiTree
   answers: JevAnswers<Q>
+  /** Terms / policy / consent notice on this screen (UI tree text, or the Jev `consent_dialog` Noul asked with every observation). Nothing may be tapped while present. */
+  consent: ConsentDetection
 }
 
 export interface TapOptions {
@@ -252,6 +262,10 @@ export class PlaybookRuntime {
   private consecutiveFallbackFailures = 0
   private pendingFallback?: { step: PlaybookStepRecord, ok: boolean, expect: TakeoverCheck }
   private guardrailBlocks = 0
+  private consentBlocks = 0
+  private consentStop?: ConsentDetection & { screenshot?: string }
+  /** Consent state of the latest observation (swipe / ENTER have no observation of their own). */
+  private lastConsent?: ConsentDetection
   /** Taps refused by the Jev visual forbidden-control check. */
   visualGuardBlocks = 0
   private unverifiedTaps = 0
@@ -326,6 +340,8 @@ export class PlaybookRuntime {
       guardrailBlocks: this.guardrailBlocks,
       visualGuardBlocks: this.visualGuardBlocks,
       unverifiedTaps: this.unverifiedTaps,
+      consentBlocks: this.consentBlocks,
+      ...(this.consentStop ? { consent: this.consentStop } : {}),
       durationMs: this.now() - this.started,
       ...(this.options.runDir ? { runDir: this.options.runDir, reportPath: this.reportPath } : {}),
     }
@@ -507,10 +523,12 @@ export class PlaybookRuntime {
         step.screenshot = `step-${String(step.index).padStart(3, '0')}.${screen.encoded.mimeType === 'image/png' ? 'png' : 'jpg'}`
         await writeFile(join(this.options.runDir, step.screenshot), screen.encoded.data)
       }
-      this.recordQuestions(questions)
+      // The consent question rides along with every observation (same request, no extra latency).
+      const asked = { ...questions, consent_dialog: CONSENT_QUESTION } as JevQuestions
+      this.recordQuestions(asked)
       const ask = async () => {
         try {
-          return await this.jev.ask({ state: { ...state, screen: screen.image }, questions }, { signal: this.signal })
+          return await this.jev.ask({ state: { ...state, screen: screen.image }, questions: asked }, { signal: this.signal })
         }
         catch (error) {
           if (this.signal?.aborted)
@@ -518,7 +536,7 @@ export class PlaybookRuntime {
           // The client already retried transient failures once; one more try after a pause.
           this.log(`Jev request failed (${(error as Error).message}); retrying once`)
           await this.sleep(1000)
-          return this.jev.ask({ state: { ...state, screen: screen.image }, questions }, { signal: this.signal })
+          return this.jev.ask({ state: { ...state, screen: screen.image }, questions: asked }, { signal: this.signal })
         }
       }
       const [observedApp, treeResult, response] = await Promise.all([this.foreground(), this.readTree(), ask().catch((error: Error) => error)])
@@ -539,7 +557,7 @@ export class PlaybookRuntime {
         attempts: response.attempts,
         endpoint: response.endpoint,
         ...(response.usage ? { usage: response.usage } : {}),
-        questions: Object.keys(questions),
+        questions: Object.keys(asked),
         answers: Object.fromEntries(Object.entries(response.answers).map(([name, answer]) => [name, summarizeJevAnswer(answer as never)])),
       }
       if (!this.isAllowed(app)) {
@@ -556,7 +574,11 @@ export class PlaybookRuntime {
         continue
       }
       this.inAppSeen = true
-      const obs: Observation<Q> = { step, screen, app, tree: treeResult.tree, answers: response.answers as JevAnswers<Q> }
+      const consent = detectConsent(treeResult.tree, (response.answers as Record<string, { noul?: number }>).consent_dialog?.noul)
+      this.lastConsent = consent
+      if (consent.present)
+        step.consent = consent
+      const obs: Observation<Q> = { step, screen, app, tree: treeResult.tree, answers: response.answers as JevAnswers<Q>, consent }
       if (this.pendingFallback) {
         const pending = this.pendingFallback
         this.pendingFallback = undefined
@@ -594,6 +616,13 @@ export class PlaybookRuntime {
   async tap(obs: Observation<any>, ratio: RatioPoint, target: string, options: TapOptions = {}): Promise<boolean> {
     this.checkBudget()
     const entry = this.action({ type: 'tap', target, ratio: { x: Math.round(ratio.x * 1000) / 1000, y: Math.round(ratio.y * 1000) / 1000 } })
+    // Anywhere on a screen with a consent notice: its buttons, and the dimmed area around it.
+    if (obs.consent?.present) {
+      this.consentBlocks++
+      this.guardrailBlocks++
+      entry.blocked = `terms / policy / consent notice on screen (${describeConsent(obs.consent)}); no taps`
+      return false
+    }
     const app = await this.stableForeground()
     if (!this.isAllowed(app)) {
       this.guardrailBlocks++
@@ -661,6 +690,12 @@ export class PlaybookRuntime {
   async key(key: 'BACK' | 'HOME' | 'ENTER', reason?: string, options: { guard?: (app: ForegroundApp) => string | undefined } = {}): Promise<boolean> {
     this.checkBudget()
     const entry = this.action({ type: 'key', key, ...(reason ? { reason } : {}) })
+    if (key === 'ENTER' && this.lastConsent?.present) {
+      this.consentBlocks++
+      this.guardrailBlocks++
+      entry.blocked = 'ENTER not sent: terms / policy / consent notice on screen'
+      return false
+    }
     if (options.guard) {
       const app = await this.stableForeground()
       const refusal = !app || !this.isAllowed(app) ? `foreground ${app?.package ?? 'unknown'} is not allowed` : options.guard(app)
@@ -689,11 +724,37 @@ export class PlaybookRuntime {
     return true
   }
 
-  async swipe(from: RatioPoint, to: RatioPoint, durationMs: number, reason?: string): Promise<void> {
+  async swipe(from: RatioPoint, to: RatioPoint, durationMs: number, reason?: string): Promise<boolean> {
     this.checkBudget()
-    this.action({ type: 'swipe', from, to, durationMs, ...(reason ? { reason } : {}) })
+    const entry = this.action({ type: 'swipe', from, to, durationMs, ...(reason ? { reason } : {}) })
+    if (this.lastConsent?.present) {
+      this.consentBlocks++
+      this.guardrailBlocks++
+      entry.blocked = 'swipe not sent: terms / policy / consent notice on screen'
+      return false
+    }
     await this.device.swipe(this.serial, from, to, durationMs)
     await this.sleep(this.settleMs)
+    return true
+  }
+
+  /**
+   * Force-stops and relaunches the allowed app (code's own way out of a screen it must not touch,
+   * e.g. a LIVE room or a consent notice that BACK did not close). Counts as a relaunch, so
+   * playbooks re-locate on the next observation; it is not a foreground recovery.
+   */
+  async restartApp(reason: string): Promise<void> {
+    this.checkBudget()
+    const pkg = this.allowed[0]
+    this.action({ type: 'restart_app', package: pkg, reason })
+    await this.device.startApp(this.serial, pkg, { restart: true })
+    this.relaunches++
+    await this.sleep(3000)
+  }
+
+  /** Records the consent notice that ends the run (playbooks then stop with consent_dialog_needs_human). */
+  stopForConsent(obs: Observation<any>): void {
+    this.consentStop = { ...obs.consent, ...(obs.step.screenshot ? { screenshot: obs.step.screenshot } : {}) }
   }
 
   /**
@@ -793,6 +854,7 @@ export class PlaybookRuntime {
     const goal = [
       intent,
       'This is one step of a larger scripted task: stop with done as soon as this step is complete, and do not continue beyond it.',
+      'Terms, policy, privacy or consent notices (for example a policy update with only a Got it button) are not yours to handle: do not tap them or anything around them, reply fail.',
       allowedInput.length ? `Never change the search text: you may only type exactly ${allowedInput.map(value => JSON.stringify(value)).join(' or ')}.` : 'Do not type any text.',
     ].join(' ')
     const runDir = this.options.runDir ? join(this.options.runDir, `takeover-${this.fallbacks}`) : undefined

@@ -2,11 +2,11 @@ import type { Buffer } from 'node:buffer'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { decodePng, encodePng } from '@escrcpy/flow-device'
-import type { ForegroundApp, RatioPoint } from '@escrcpy/flow-device'
+import { decodePng, encodePng, parseUiTree } from '@escrcpy/flow-device'
+import type { ForegroundApp, RatioPoint, UiTree } from '@escrcpy/flow-device'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { assertItemsResolved, HopFetchError, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE } from '../src/index.js'
-import type { HopFetcher, HopResponse, JevAnswer, JevClient, JevImage, JevQuestions, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
+import { assertItemsResolved, CONSENT_NEEDS_HUMAN, HopFetchError, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE, tiktokShopLinksParams } from '../src/index.js'
+import type { HopFetcher, HopResponse, JevAnswer, JevClient, JevImage, JevQuestions, PlaybookDefinition, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
 
 // ---------------------------------------------------------------------------
 // A tiny simulated TikTok
@@ -25,6 +25,8 @@ interface Card {
   sheet?: boolean
   /** A video card that still shows a price (so the playbook opens it). */
   priced?: boolean
+  /** A LIVE card whose badge Jev misses (`once`: only until it was opened) and that opens a LIVE room. */
+  liveHidden?: 'once' | 'always'
 }
 
 interface Box { top: number, bottom: number, left: number, right: number }
@@ -65,6 +67,17 @@ const H = 600
 
 const inside = (point: RatioPoint, box: Box) => point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom
 
+/** UI tree of TikTok's policy update dialog (text as on device), or of a screen without one. */
+function consentTree(shown: boolean): UiTree {
+  const node = (text: string, bounds: string, clickable = false) => `<node class="android.widget.TextView" package="${TIKTOK_PACKAGE}" text="${text}" content-desc="" resource-id="" clickable="${clickable}" bounds="${bounds}" />`
+  const dialog = shown
+    ? node('Virtual Items and Rewards Policies update', '[80,700][1000,800]')
+    + node('By continuing to use TikTok after that date, you agree to these policies.', '[80,820][1000,1200]')
+    + node('Got it', '[80,1250][1000,1350]', true)
+    : ''
+  return parseUiTree(`<hierarchy rotation="0"><node class="android.widget.FrameLayout" package="${TIKTOK_PACKAGE}" text="" content-desc="" resource-id="" clickable="false" bounds="[0,0][1080,2400]">${dialog}</node></hierarchy>`)
+}
+
 interface WorldOptions {
   grid: Card[]
   noResults?: boolean
@@ -73,6 +86,10 @@ interface WorldOptions {
   clipboardOverlay?: boolean
   /** Every Copy link yields a new short link, as on real TikTok (default: one fixed link per product). */
   uniqueLinks?: boolean
+  /** BACK does not leave the LIVE room (a dialog without an X in front of it). */
+  liveStuck?: boolean
+  /** A terms / policy notice: named in the UI tree or only visible to Jev; shown on the results grid or at every launch. */
+  consent?: { via: 'tree' | 'jev', when: 'results' | 'launch', clearsOnBack?: boolean }
   /** Physical half-sheet icons (default SHEET_ICONS). */
   sheetIcons?: { share: Box, cart: Box }
   /** Observations that show a blank, still-loading screen after each (re)launch. */
@@ -100,11 +117,15 @@ function world(options: WorldOptions) {
     loading: 0,
     /** The last screenshot was a blank loading screen (Jev answers about it). */
     loadingShown: false,
+    consent: false,
+    consentShown: false,
   }
   const sheetIcons = options.sheetIcons ?? SHEET_ICONS
   /** Page at every BACK, and how often BACK hit the home feed / the sheet's cart was tapped. */
   const backs: string[] = []
-  const counts = { homeBacks: 0, cartTaps: 0, card: 0, share: 0 }
+  /** liveTaps / consentTouches: touches that must never happen (inside a LIVE room, on a consent notice). */
+  const counts = { homeBacks: 0, cartTaps: 0, card: 0, share: 0, liveTaps: 0, consentTouches: 0, restarts: 0 }
+  const liveSeen = new Set<string>()
   const isHomeFeed = () => state.app === TIKTOK_PACKAGE && state.page === 'video_feed' && !state.fromCard && !state.fromProduct
   const activity = () => {
     if (state.app !== TIKTOK_PACKAGE)
@@ -159,6 +180,16 @@ function world(options: WorldOptions) {
       taps.push(point)
       if (state.app !== TIKTOK_PACKAGE)
         return
+      if (state.consent) {
+        // Any touch on the notice (its button or the dimmed area) would confirm it.
+        counts.consentTouches++
+        state.consent = false
+        return
+      }
+      if (state.page === 'live_room') {
+        counts.liveTaps++
+        return
+      }
       if (state.page === 'video_feed' && !state.fromCard && inside(point, BOXES.shop_tab)) {
         state.page = 'shop_home'
       }
@@ -185,7 +216,9 @@ function world(options: WorldOptions) {
           state.app = card.opensApp
           return
         }
-        state.page = card.live ? 'live_room' : card.video ? 'video_feed' : 'product_detail'
+        state.page = card.live || card.liveHidden ? 'live_room' : card.video ? 'video_feed' : 'product_detail'
+        if (card.liveHidden)
+          liveSeen.add(card.id)
         state.fromCard = state.page === 'video_feed'
         state.sheet = !!card.sheet
         fault('card')
@@ -211,6 +244,8 @@ function world(options: WorldOptions) {
     },
     longPress: async () => {},
     swipe: async () => {
+      if (state.consent)
+        counts.consentTouches++
       if (state.page === 'results_grid')
         state.scroll++
     },
@@ -234,6 +269,13 @@ function world(options: WorldOptions) {
         state.app = LAUNCHER
         return
       }
+      if (state.consent) {
+        if (options.consent?.clearsOnBack)
+          state.consent = false
+        return
+      }
+      if (state.page === 'live_room' && options.liveStuck)
+        return
       if (state.share)
         state.share = false
       else if (state.popup)
@@ -251,8 +293,13 @@ function world(options: WorldOptions) {
     },
     startApp: async (_serial, pkg, opts) => {
       starts.push({ pkg, restart: opts?.restart })
+      if (opts?.restart)
+        counts.restarts++
       Object.assign(state, { app: pkg, page: 'video_feed', fromCard: false, fromProduct: false, popup: false, share: false, sheet: false, scroll: 0, loading: options.loadingScreens ?? 0 })
+      // An account-level notice pops up again at every launch.
+      state.consent = options.consent?.when === 'launch'
     },
+    ...(options.consent?.via === 'tree' ? { uiTree: async () => consentTree(state.consent) } : {}),
     readClipboard: async () => state.clipboard,
     writeClipboard: async (_serial, text) => {
       state.clipboard = text
@@ -267,13 +314,17 @@ function world(options: WorldOptions) {
       return
     }
     state.page = 'results_grid'
+    if (options.consent?.when === 'results' && !state.consentShown) {
+      state.consent = true
+      state.consentShown = true
+    }
     if (options.couponPopup && !state.popupShown) {
       state.popup = true
       state.popupShown = true
     }
   }
 
-  return { state, device, taps, typed, starts, visible, backs, counts }
+  return { state, device, taps, typed, starts, visible, backs, counts, liveSeen, consentVia: options.consent?.via }
 }
 
 type World = ReturnType<typeof world>
@@ -352,11 +403,14 @@ function fakeJev(w: World, options: JevOptions = {}) {
             continue
           }
           // A "video" card here is a video post: no price, no sold count.
-          answers[name] = noul(flag === 'price' || flag === 'sold' ? (c && (!c.video || c.priced) ? 0.95 : 0.03) : c?.[flag as 'live' | 'ad'] ? 0.93 : 0.04)
+          const live = !!c?.live || (c?.liveHidden === 'once' && w.liveSeen.has(c.id))
+          answers[name] = noul(flag === 'price' || flag === 'sold' ? (c && (!c.video || c.priced) ? 0.95 : 0.03) : flag === 'live' ? (live ? 0.93 : 0.04) : c?.ad ? 0.93 : 0.04)
           continue
         }
         const table: Record<string, number> = {
-          popup: s.popup ? 0.97 : 0.03,
+          // A consent notice also looks like a popup with a close button: the playbook must still not touch it.
+          popup: s.popup || s.consent ? 0.97 : 0.03,
+          consent_dialog: s.consent && w.consentVia === 'jev' ? 0.97 : 0.02,
           share_open: s.share ? 0.99 : 0.01,
           no_results: s.page === 'no_results' ? 0.98 : 0.02,
           field_has_keyword: s.field === state.keyword ? 0.95 : 0.03,
@@ -441,6 +495,7 @@ function options(w: World, jev: JevClient, extra: Partial<PlaybookOptions> = {})
 }
 
 const runTikTok = (opts: PlaybookOptions) => runPlaybook('tiktok-shop-links', opts)
+const tiktokParams = tiktokShopLinksParams
 
 // ---------------------------------------------------------------------------
 
@@ -804,6 +859,105 @@ describe('tiktok-shop-links playbook', () => {
     expect(() => assertItemsResolved([{ link: 'https://vt.tiktok.com/ZSx/', productId: '', finalUrl: '', position: 'top_left', ad: false, searchEpoch: 1 } as any])).toThrow(/invariant violated/)
     expect(() => assertItemsResolved([{ link: 'l', productId: '1730002501', finalUrl: 'https://www.tiktok.com/view/product/1730002502', position: 'top_left', ad: false, searchEpoch: 1 }])).toThrow(/invariant violated/)
     expect(() => assertItemsResolved([{ link: 'l', productId: '1730002501', finalUrl: 'https://www.tiktok.com/view/product/1730002501', position: 'top_left', ad: false, searchEpoch: 1 }])).not.toThrow()
+  })
+
+  it('leaves a LIVE room opened by a card with one BACK, touches nothing in it, and takes the next card', async () => {
+    const w = world({ grid: [{ id: '1730003001', liveHidden: 'always' }, { id: '1730003002' }] })
+    const { jev } = fakeJev(w)
+    const model = fakeModel([])
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 }, fallback: { client: model.client } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    expect(w.counts.liveTaps).toBe(0)
+    expect(w.backs.filter(page => page === 'live_room')).toHaveLength(1)
+    const res = result.result as any
+    expect(res).toMatchObject({ liveRoomEntries: 1, researched: false, productIds: ['1730003002'] })
+    expect(res.items[0].position).toBe('top_right')
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    expect(report.stepLog.some((step: any) => /top_left card opened a LIVE room: marked LIVE/.test(step.decision ?? ''))).toBe(true)
+    expect(report.stepLog.some((step: any) => /top_left\(opened a LIVE room\)/.test(step.decision ?? ''))).toBe(true)
+  })
+
+  it('force-stops and relaunches when BACK does not leave the LIVE room, then searches again', async () => {
+    const w = world({ grid: [{ id: '1730003101', liveHidden: 'once' }, { id: '1730003102' }], liveStuck: true })
+    const { jev } = fakeJev(w)
+    const model = fakeModel([])
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 }, fallback: { client: model.client } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    expect(w.counts.liveTaps).toBe(0)
+    // The initial restart plus one for the LIVE room; no takeover was asked to close its dialog.
+    expect(w.counts.restarts).toBe(2)
+    expect(w.counts.homeBacks).toBe(0)
+    expect(result.result).toMatchObject({ liveRoomEntries: 1, researched: true, searchEpochs: 2, productIds: ['1730003102'] })
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    expect(report.stepLog.flatMap((step: any) => step.actions).filter((action: any) => action.type === 'restart_app')).toHaveLength(1)
+  })
+
+  it('stops as failed on the third LIVE room of a run instead of looping', async () => {
+    const w = world({ grid: [{ id: '1730003201', liveHidden: 'always' }, { id: '1730003202' }], liveStuck: true })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('failed')
+    expect(result.success).toBe(false)
+    expect(result.reason).toMatch(/LIVE room 3 times/)
+    expect(w.counts.liveTaps).toBe(0)
+    expect(result.result).toMatchObject({ liveRoomEntries: 3, items: [] })
+  })
+
+  it('does not touch a consent notice found in the UI tree (not even the popup X): BACK closes it and the run goes on', async () => {
+    const w = world({ grid: products('1730003301', '1730003302'), consent: { via: 'tree', when: 'results', clearsOnBack: true } })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2 } }))
+    expect(result.status).toBe('done')
+    expect(w.counts.consentTouches).toBe(0)
+    expect(result.result).toMatchObject({ productIds: ['1730003301', '1730003302'] })
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const flagged = report.stepLog.find((step: any) => step.consent)
+    expect(flagged.consent).toMatchObject({ present: true, source: 'tree', term: 'agree' })
+    expect(flagged.actions).toEqual([expect.objectContaining({ type: 'key', key: 'BACK' })])
+  })
+
+  it('stops with consent_dialog_needs_human when a notice seen only by Jev is back after BACK and a relaunch', async () => {
+    const w = world({ grid: products('1730003401'), consent: { via: 'jev', when: 'launch' } })
+    const { jev } = fakeJev(w)
+    const model = fakeModel([])
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 }, fallback: { client: model.client } }))
+    expect(result.status).toBe('failed')
+    expect(result.success).toBe(false)
+    expect(result.reason.startsWith(CONSENT_NEEDS_HUMAN)).toBe(true)
+    expect(result.consent).toMatchObject({ present: true, source: 'jev', screenshot: expect.stringMatching(/^step-\d{3}\.(jpg|png)$/) })
+    expect(w.counts.consentTouches).toBe(0)
+    expect(w.counts.restarts).toBe(2)
+    expect(model.calls).toHaveLength(0)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    expect(report.consent.screenshot).toBe(result.consent!.screenshot)
+    expect(report.status).toBe('failed')
+  })
+
+  it('runtime: refuses every tap and swipe while a consent notice is on screen, whatever the playbook asks', async () => {
+    const w = world({ grid: [], consent: { via: 'jev', when: 'launch' } })
+    const { jev } = fakeJev(w)
+    const attempts: boolean[] = []
+    const greedy: PlaybookDefinition = {
+      id: 'greedy',
+      description: 'taps the notice on purpose',
+      params: tiktokParams,
+      allowedPackages: [TIKTOK_PACKAGE],
+      async run(rt) {
+        const obs = await rt.observe('poke', {})
+        attempts.push(await rt.tap(obs, { x: 0.5, y: 0.55 }, 'Got it'))
+        attempts.push(await rt.tap(obs, { x: 0.5, y: 0.1 }, 'dimmed area'))
+        attempts.push(await rt.swipe({ x: 0.5, y: 0.8 }, { x: 0.5, y: 0.3 }, 300))
+        attempts.push(await rt.key('ENTER'))
+        return { success: true, reason: 'tried' }
+      },
+    }
+    const result = await runPlaybook(greedy, options(w, jev))
+    expect(attempts).toEqual([false, false, false, false])
+    expect(w.taps).toEqual([])
+    expect(w.counts.consentTouches).toBe(0)
+    expect(result.consentBlocks).toBe(4)
   })
 
   it('extracts product ids from canonical links', () => {

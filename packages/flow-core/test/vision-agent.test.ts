@@ -10,8 +10,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   buildVisionRequestBody,
   checkTapTarget,
+  CONSENT_NEEDS_HUMAN,
   createVisionLlmClient,
   DEFAULT_FORBIDDEN_TEXTS,
+  detectConsentInTree,
   isMeaningfulLabel,
   loadLlmConfig,
   matchForbiddenText,
@@ -55,6 +57,11 @@ const SCREENS = {
   product: { png: solid(120), tree: parseUiTree(xmlOf([{ text: 'Share', bounds: [900, 100, 1050, 200], clickable: true }])) },
   shopee: { png: solid(200), tree: parseUiTree(xmlOf([])) },
   off: { png: solid(0), tree: parseUiTree(xmlOf([])) },
+  consent: { png: solid(70), tree: parseUiTree(xmlOf([
+    { text: 'Virtual Items and Rewards Policies update', bounds: [80, 700, 1000, 800] },
+    { text: 'By continuing to use TikTok after that date, you agree to these policies.', bounds: [80, 820, 1000, 1200] },
+    { text: 'Got it', bounds: [80, 1250, 1000, 1350], clickable: true },
+  ])) },
 }
 
 type ScreenName = keyof typeof SCREENS
@@ -321,8 +328,10 @@ describe('runVisionAgent', () => {
     expect(result.guardrailBlocks).toBe(1)
     expect(result.jev).toMatchObject({ visualBlocks: 1, doneRejections: 0 })
     expect(calls.some(call => call.op === 'tap')).toBe(false)
-    expect(asked[0]).toEqual(['risky'])
-    expect(asked[1]).toContain('error_screen')
+    // Consent check on the whole screen first, then the crop risk check, then the done check.
+    expect(asked[0]).toEqual(['consent_dialog'])
+    expect(asked[1]).toEqual(['risky'])
+    expect(asked[2]).toContain('error_screen')
   })
 
   it('jev assist: rejects a done whose links were not read from the clipboard, accepts it after read_clipboard', async () => {
@@ -362,6 +371,45 @@ describe('runVisionAgent', () => {
     const result = await runVisionAgent({ serial: SERIAL, goal: 'search', allowedPackages: [TIKTOK], device, client, jev, ...fast })
     expect(result.status).toBe('failed')
     expect(result.reason).toMatch(/rejected 3 times.*noResults/)
+  })
+
+  it('consent guard: a policy notice in the UI tree ends the run before the model is asked; nothing is tapped', async () => {
+    const { device, state, calls } = fakeDevice()
+    state.screen = 'consent'
+    const { client, requests } = fakeClient([act({ type: 'tap', element: 2 }, 'only an acknowledgement, tap Got it')])
+    const result = await runVisionAgent({ serial: SERIAL, goal: 'close the popup', allowedPackages: [TIKTOK], device, client, runDir: dir, ...fast })
+    expect(result.status).toBe('failed')
+    expect(result.reason.startsWith(CONSENT_NEEDS_HUMAN)).toBe(true)
+    expect(result.consent).toMatchObject({ present: true, source: 'tree', term: 'agree', screenshot: 'step-001.jpg' })
+    expect(requests).toHaveLength(0)
+    expect(calls.filter(call => call.op === 'tap' || call.op === 'swipe')).toEqual([])
+  })
+
+  it('consent guard: a notice seen only by Jev refuses the touch (here the dimmed area) and ends the run', async () => {
+    const { device, calls } = fakeDevice({ tree: 'fail' })
+    const { client } = fakeClient([act({ type: 'tap', x: 500, y: 150 }, 'tap outside the dialog to dismiss it'), act({ type: 'key', key: 'back' })])
+    const jev: JevClient = {
+      describe: () => ({ model: 'fake-jev', imagesViaFallback: false }),
+      async ask(request) {
+        const answers = Object.fromEntries(Object.keys(request.questions).map(name => [name, { type: 'noul', noul: name === 'consent_dialog' ? 0.97 : 0.02 }]))
+        return { answers: answers as never, model: 'fake-jev', latencyMs: 600, attempts: 1, endpoint: 'primary', images: 1 }
+      },
+    }
+    const result = await runVisionAgent({ serial: SERIAL, goal: 'close the popup', allowedPackages: [TIKTOK], device, client, jev, ...fast })
+    expect(result.status).toBe('failed')
+    expect(result.reason).toMatch(/^consent_dialog_needs_human: .*Jev 0\.97/)
+    expect(result.consent).toMatchObject({ source: 'jev', probability: 0.97 })
+    expect(result.guardrailBlocks).toBe(1)
+    expect(calls.filter(call => call.op === 'tap')).toEqual([])
+    // The model gets no second try at the notice.
+    expect(result.modelCalls).toBe(1)
+  })
+
+  it('consent guard: the system prompt tells the model to fail on terms / policy notices', async () => {
+    const { device } = fakeDevice()
+    const { client, requests } = fakeClient([act({ type: 'fail', reason: 'x' })])
+    await runVisionAgent({ serial: SERIAL, goal: 'g', allowedPackages: [TIKTOK], device, client, ...fast })
+    expect(requests[0].system).toMatch(/Never accept, agree to or acknowledge terms, policy, privacy or consent notices/)
   })
 
   it('re-asks once with the parse error, then continues', async () => {
@@ -501,6 +549,27 @@ describe('forbidden texts', () => {
     expect(isMeaningfulLabel('123')).toBe(false)
     expect(isMeaningfulLabel('Copy link')).toBe(true)
     expect(isMeaningfulLabel('复制链接')).toBe(true)
+  })
+
+  it('blocks explicit consent words on any page, and tells consent notices from ordinary pages', () => {
+    const tree = parseUiTree(xmlOf([
+      { text: 'I agree', bounds: [100, 100, 400, 200], clickable: true },
+      { text: 'Aceitar', bounds: [100, 300, 400, 400], clickable: true },
+      { text: '同意', bounds: [100, 500, 400, 600], clickable: true },
+      { text: 'Accept all', bounds: [100, 700, 400, 800], clickable: true },
+    ]))
+    for (const [y, term] of [[150, 'Agree'], [350, 'Aceitar'], [550, '同意'], [750, 'Accept']] as const)
+      expect(checkTapTarget(tree, { x: 250, y }, DEFAULT_FORBIDDEN_TEXTS)).toMatchObject({ verdict: 'blocked', term })
+    // Ordinary pages: a return policy line on a product page, a coupon offer: no consent notice.
+    const pdp = parseUiTree(xmlOf([{ text: 'Return policy: 30 days', bounds: [0, 1500, 1080, 1600] }, { text: 'Buy now', bounds: [600, 2200, 1000, 2300], clickable: true }, { text: 'Política de privacidade', bounds: [0, 1700, 1080, 1800] }]))
+    expect(detectConsentInTree(pdp).present).toBe(false)
+    const coupon = parseUiTree(xmlOf([{ text: 'You\'ve got 4 new offers!', bounds: [80, 600, 1000, 700] }, { text: 'Claim all', bounds: [200, 1300, 880, 1400], clickable: true }]))
+    expect(detectConsentInTree(coupon).present).toBe(false)
+    // A weak term counts once an acknowledge button is there too; a strong phrase counts alone.
+    const update = parseUiTree(xmlOf([{ text: 'Atualizamos nossos Termos de Serviço', bounds: [80, 600, 1000, 700] }, { text: 'OK', bounds: [200, 1300, 880, 1400], clickable: true }]))
+    expect(detectConsentInTree(update)).toMatchObject({ present: true, term: 'termos' })
+    expect(detectConsentInTree(SCREENS.consent.tree)).toMatchObject({ present: true, term: 'agree' })
+    expect(detectConsentInTree(parseUiTree(xmlOf([{ text: '继续使用即表示您同意', bounds: [0, 0, 500, 100] }]))).present).toBe(true)
   })
 
   it('does not look inside large clickable containers', () => {

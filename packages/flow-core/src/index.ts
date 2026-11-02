@@ -1,6 +1,7 @@
 export * from './agent.js'
 export * from './automation.js'
 export * from './compiler.js'
+export * from './consent.js'
 export * from './extract.js'
 export * from './goal.js'
 export * from './heal.js'

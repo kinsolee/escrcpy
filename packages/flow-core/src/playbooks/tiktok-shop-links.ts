@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { CONSENT_NEEDS_HUMAN, describeConsent } from '../consent.js'
 import { jevBoxCenter } from '../jev.js'
 import type { JevBoxAnswer, JevNoulAnswer, JevNoulQuestion, JevQuestions } from '../jev.js'
 import type { Observation, PlaybookDefinition, PlaybookOutcome, PlaybookRuntime } from './runtime.js'
@@ -62,6 +63,8 @@ export interface TiktokShopLinksResult {
   noResults: boolean
   items: TiktokShopLinkItem[]
   duplicates: string[]
+  /** Times the run ended up in a LIVE room (left at once with BACK, or force-stop + relaunch; nothing tapped there). */
+  liveRoomEntries: number
   /** Copied links that did not resolve to a product ID (retried first); they are not in `items`. */
   unresolved: TiktokShopUnresolvedLink[]
   /** Searches run for this result. Above 1 the items do not all come from one results grid, so positions are per search. */
@@ -249,6 +252,11 @@ const URL_RE = /https?:\/\/\S+/i
 const HOME_ACTIVITY_RE = /\.(?:splash\.SplashActivity|main\.MainActivity)$/
 /** Videos opened from a card or a product, and (on 46.5) the video + product half sheet. */
 const DETAIL_ACTIVITY_RE = /\.detail\.ui\.DetailActivity$/
+/** LIVE rooms (com.ss.android.ugc.aweme.live.LivePlayActivity on 46.5 / 47.5). */
+const LIVE_ACTIVITY_RE = /\.live\.[A-Za-z]*Activity$/
+/** LIVE rooms entered by mistake that a run tolerates; the next one ends it as failed. */
+export const MAX_LIVE_ROOM_ENTRIES = 2
+const CONSENT_SENTENCE = 'Terms, policy, privacy or consent notices are not yours to handle: do not tap them or anything around them, reply fail.'
 const PRODUCT_ID_RE = /\/product\/(\d{6,})/
 
 function stripQuery(url: string): string {
@@ -301,13 +309,21 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   const items: TiktokShopLinkItem[] = []
   const duplicates: string[] = []
   const unresolved: TiktokShopUnresolvedLink[] = []
+  // LIVE rooms: nothing in them is touched. Entering one is left with one BACK, then force-stop + relaunch.
+  let liveRoomEntries = 0
+  let inLiveRoom = false
+  let liveBackTried = false
+  let liveRestarted = false
+  // Consent notices: BACK once, then force-stop + relaunch once per run; seen again after that, a human decides.
+  let consentBackTried = false
+  let consentRestarts = 0
   const seen = new Set<string>()
   /** Searches submitted so far (a re-search after a relaunch starts a new epoch). */
   let searchEpoch = 0
   let epochCounted = true
   const result = (): TiktokShopLinksResult => {
     assertItemsResolved(items)
-    return { keyword, links: items.map(item => item.link), productIds: items.map(item => item.productId), noResults: false, items: [...items], duplicates: [...duplicates], unresolved: [...unresolved], searchEpochs: searchEpoch, researched: searchEpoch > 1 }
+    return { keyword, links: items.map(item => item.link), productIds: items.map(item => item.productId), noResults: false, items: [...items], duplicates: [...duplicates], unresolved: [...unresolved], searchEpochs: searchEpoch, researched: searchEpoch > 1, liveRoomEntries }
   }
   rt.partial = result()
 
@@ -399,10 +415,13 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
    * clipboard preview sits over the bottom-left card and hides its price on the next look.
    */
   const pageQualified = new Set<CardPosition>()
+  /** Positions that opened a LIVE room on this page (their LIVE badge was missed). */
+  const liveMarked = new Set<CardPosition>()
   const opened = new Set<CardPosition>()
   const newPage = () => {
     pageQualified.clear()
     opened.clear()
+    liveMarked.clear()
   }
   let scrolls = 0
   let backs = 0
@@ -511,12 +530,67 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       return { success: true, result: { ...result(), noResults: true }, reason: 'no results for the keyword' }
     }
 
+    // LIVE room (a card whose LIVE badge was missed, or any other way in): bookkeeping first.
+    const inLive = page === 'live_room' || LIVE_ACTIVITY_RE.test(obs.app?.activity ?? '')
+    if (inLive && !inLiveRoom) {
+      inLiveRoom = true
+      liveBackTried = false
+      liveRestarted = false
+      liveRoomEntries++
+      if (tappedCard && card) {
+        liveMarked.add(card.position)
+        rt.decide(`the ${card.position} card opened a LIVE room: marked LIVE for this search`)
+      }
+      card = undefined
+      rt.decide(`in a LIVE room (${liveRoomEntries} of ${MAX_LIVE_ROOM_ENTRIES} tolerated); nothing here is touched`)
+      rt.partial = result()
+      if (liveRoomEntries > MAX_LIVE_ROOM_ENTRIES)
+        throw new PlaybookEnd(`entered a LIVE room ${liveRoomEntries} times (cards whose LIVE badge was not recognised); stopped instead of retrying`)
+    }
+    if (!inLive)
+      inLiveRoom = false
+
+    // Terms / policy / consent notice: nothing on the screen may be touched (the runtime refuses
+    // taps anyway). BACK, then force-stop + relaunch; still there after that → a human decides.
+    if (obs.consent.present) {
+      rt.decide(`terms / policy / consent notice on screen (${describeConsent(obs.consent)}): not touched`)
+      if (consentRestarts >= 1) {
+        rt.stopForConsent(obs)
+        throw new PlaybookEnd(`${CONSENT_NEEDS_HUMAN}: a terms / policy / consent notice is still on screen after BACK and a relaunch (${describeConsent(obs.consent)}); a person has to handle it${obs.step.screenshot ? ` (frame ${obs.step.screenshot})` : ''}`)
+      }
+      if (!consentBackTried) {
+        consentBackTried = true
+        if (await back(obs, 'leave the consent notice without confirming it'))
+          continue
+      }
+      consentRestarts++
+      consentBackTried = false
+      await rt.restartApp('consent notice still on screen after BACK')
+      continue
+    }
+    consentBackTried = false
+
+    // In a LIVE room: leave without touching anything (no popups closed, no takeover).
+    if (inLive) {
+      if (!liveBackTried) {
+        liveBackTried = true
+        if (await back(obs, 'leave the LIVE room'))
+          continue
+      }
+      if (liveRestarted)
+        throw new PlaybookEnd('still in a LIVE room after BACK and a relaunch')
+      liveRestarted = true
+      liveBackTried = false
+      await rt.restartApp('still in the LIVE room after BACK')
+      continue
+    }
+
     // A popup over the page comes first (a share panel the playbook opened is not one).
     if (yes(a.popup) && !shareOpen) {
       popupCloses++
       if (popupCloses > 3) {
         popupCloses = 0
-        await rt.takeover('A popup or dialog covers the TikTok screen. Close it with its close (X) button or the back key; never tap its action button (Claim, Buy, Follow, etc.).', o => !yes((o.answers as Answers).popup), 'popup did not close')
+        await rt.takeover(`A popup or dialog covers the TikTok screen. Close it with its close (X) button or the back key; never tap its action button (Claim, Buy, Follow, etc.). ${CONSENT_SENTENCE}`, o => !yes((o.answers as Answers).popup), 'popup did not close')
         continue
       }
       if ((a.popup_close.confidence ?? 0) >= T.box && boxFitsRegion(a.popup_close.box, TIKTOK_BOX_REGIONS.popup_close)) {
@@ -526,7 +600,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       }
       rt.decide('close popup with BACK')
       if (!(await back(obs, 'close popup')))
-        await rt.takeover('A popup or dialog covers the TikTok home screen. Close it with its close (X) button; never tap its action button (Claim, Buy, Follow, etc.) and do not press back.', o => !yes((o.answers as Answers).popup), 'popup on the home feed has no usable close button')
+        await rt.takeover(`A popup or dialog covers the TikTok home screen. Close it with its close (X) button; never tap its action button (Claim, Buy, Follow, etc.) and do not press back. ${CONSENT_SENTENCE}`, o => !yes((o.answers as Answers).popup), 'popup on the home feed has no usable close button')
       continue
     }
 
@@ -566,7 +640,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           await typeKeyword()
           break
         }
-        if (page === 'results_grid' || page === 'product_detail' || page === 'live_room') {
+        if (page === 'results_grid' || page === 'product_detail') {
           await back(obs, `leave ${page}`)
           break
         }
@@ -658,7 +732,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           await pick(obs, a)
           break
         }
-        if (page === 'product_detail' || page === 'live_room' || page === 'video_feed' || page === 'other') {
+        if (page === 'product_detail' || page === 'video_feed' || page === 'other') {
           if (++backs > 4) {
             backs = 0
             await rt.takeover(`Go back to the TikTok Shop search results grid for "${keyword}" using the back key.`, o => pageOf(o.answers as Answers) === 'results_grid', 'could not return to the results grid')
@@ -794,9 +868,9 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           await miss(`Share icon not usable (box ${(a.share_icon.confidence ?? 0).toFixed(2)})`, 'Open the share panel ("Send to") of this TikTok Shop product with the Share arrow icon in the top bar. Stop when the panel with Copy link shows.', o => yes((o.answers as Answers).share_open))
           break
         }
-        if (page === 'live_room' || page === 'video_feed') {
-          // Skipping a card that opened a video / LIVE takes exactly one BACK, and only right after the
-          // card tap (the home feed never gets here: it was re-located above).
+        if (page === 'video_feed') {
+          // Skipping a card that opened a video takes exactly one BACK, and only right after the card
+          // tap (the home feed never gets here: it was re-located above; LIVE rooms are left above).
           setGoal('return')
           if (tappedCard) {
             rt.decide(`card opened a ${page}, not a product; one BACK to skip it`)
@@ -881,8 +955,8 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       if (view.product >= 0.5 && view.live < 0.5 && (!params.skipAds || view.ad < 0.5))
         pageQualified.add(view.position)
     }
-    const qualified = cards.filter(view => pageQualified.has(view.position) && view.live < 0.5)
-    const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : 'ad'})`)
+    const qualified = cards.filter(view => pageQualified.has(view.position) && view.live < 0.5 && !liveMarked.has(view.position))
+    const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : liveMarked.has(view.position) ? 'opened a LIVE room' : 'ad'})`)
     rt.decide(`cards: ${qualified.map(view => view.position).join(', ') || 'none'} qualify${skipped.length ? `; skipped ${skipped.join(', ')}` : ''}; opened ${[...opened].join(', ') || 'none'}`)
     const view = qualified.find(candidate => !opened.has(candidate.position))
     if (view) {
