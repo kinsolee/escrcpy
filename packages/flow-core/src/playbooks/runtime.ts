@@ -83,8 +83,8 @@ export interface PlaybookOptions {
   leaseHolder?: string
   signal?: AbortSignal
   onEvent?: (event: PlaybookEvent) => void
-  /** Resolves a copied short link to its final URL (default: follows redirects with fetch). */
-  resolveLink?: (url: string) => Promise<string | undefined>
+  /** Resolves a copied short link (default: follows redirects with fetch, stopping at the first URL matching `stopAt`). */
+  resolveLink?: (url: string, stopAt?: RegExp) => Promise<string | undefined>
   now?: () => number
   sleep?: (ms: number) => Promise<void>
 }
@@ -210,7 +210,7 @@ export class PlaybookRuntime {
   readonly now: () => number
   readonly sleep: (ms: number) => Promise<void>
   readonly settleMs: number
-  readonly resolveLink: (url: string) => Promise<string | undefined>
+  readonly resolveLink: (url: string, stopAt?: RegExp) => Promise<string | undefined>
   readonly clipboardReads: string[] = []
   /** Exact strings a takeover may type (e.g. the search keyword). Empty: takeovers may not type. */
   allowedInput: string[] = []
@@ -760,11 +760,17 @@ export class PlaybookRuntime {
   partial: unknown
 }
 
-/** Follows HTTP redirects (manual, ≤ 5 hops, 8 s) and returns the last URL; undefined on failure. */
-export async function resolveRedirects(url: string): Promise<string | undefined> {
+/**
+ * Follows HTTP redirects (manual, ≤ 5 hops, 8 s each) and returns the first URL matching
+ * `stopAt`, else the last one; undefined on failure. Stopping matters: a TikTok product page
+ * itself redirects cookie-less clients on to /login.
+ */
+export async function resolveRedirects(url: string, stopAt?: RegExp): Promise<string | undefined> {
   let current = url
   try {
     for (let hop = 0; hop < 5; hop++) {
+      if (stopAt?.test(current))
+        return current
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), 8000)
       let response: Response

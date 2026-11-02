@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { decodePng, encodePng } from '@escrcpy/flow-device'
 import type { ForegroundApp, RatioPoint } from '@escrcpy/flow-device'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { productIdFromUrl, runPlaybook, TIKTOK_PACKAGE } from '../src/index.js'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { productIdFromUrl, resolveRedirects, runPlaybook, TIKTOK_PACKAGE } from '../src/index.js'
 import type { JevAnswer, JevClient, JevImage, JevQuestions, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
 
 // ---------------------------------------------------------------------------
@@ -182,6 +182,8 @@ type World = ReturnType<typeof world>
 interface JevOptions {
   /** Box confidence overrides by question name. */
   boxConfidence?: Record<string, number>
+  /** Box edge overrides by question name. */
+  boxes?: Record<string, Box>
   /** Visual risk probability by the grey level under the tap (see CARD_SHADES / PAGE_SHADES). */
   riskByShade?: Record<number, number>
 }
@@ -230,7 +232,7 @@ function fakeJev(w: World, options: JevOptions = {}) {
           continue
         }
         if (question.type === 'box') {
-          answers[name] = { type: 'box', box: BOXES[name] ?? { top: 0.4, bottom: 0.6, left: 0.4, right: 0.6 }, confidence: options.boxConfidence?.[name] ?? 0.9 }
+          answers[name] = { type: 'box', box: options.boxes?.[name] ?? BOXES[name] ?? { top: 0.4, bottom: 0.6, left: 0.4, right: 0.6 }, confidence: options.boxConfidence?.[name] ?? 0.9 }
           continue
         }
         const card = (position: string) => w.visible()[POSITIONS.indexOf(position as typeof POSITIONS[number])]
@@ -359,6 +361,17 @@ describe('tiktok-shop-links playbook', () => {
     expect(w.taps.some(point => inside(point, BOXES.top_left_card) || inside(point, BOXES.top_right_card))).toBe(false)
   })
 
+  it('mirrors the left card of the row when a right-column box comes back wrong', async () => {
+    const w = world({ grid: [{ id: '1730000801', live: true }, { id: '1730000802' }] })
+    const { jev } = fakeJev(w, { boxes: { top_right_card: { top: 0.2, bottom: 0.47, left: 0.01, right: 0.98 } }, boxConfidence: { top_right_card: 0.2 } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.success).toBe(true)
+    expect(result.fallbacks).toBe(0)
+    expect((result.result as any).items[0]).toMatchObject({ position: 'top_right', productId: '1730000802' })
+    const cardTap = w.taps.find(point => inside(point, BOXES.top_right_card))!
+    expect(cardTap.x).toBeCloseTo(0.75, 2)
+  })
+
   it('does not count a product it already copied', async () => {
     const w = world({ grid: products('1730000301', '1730000301', '1730000302', '1730000303') })
     const { jev } = fakeJev(w)
@@ -424,6 +437,21 @@ describe('tiktok-shop-links playbook', () => {
     const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
     const blocked = report.stepLog.flatMap((step: any) => step.actions).find((action: any) => action.blocked)
     expect(blocked).toMatchObject({ target: 'top_left card', visualCheck: { probability: 0.92 } })
+  })
+
+  it('stops following redirects at the product URL (the product page itself redirects to /login)', async () => {
+    const hops: Record<string, string> = {
+      'https://vt.tiktok.com/ZSabc/': 'https://www.tiktok.com/view/product/1735031026643470004?_d=x',
+      'https://www.tiktok.com/view/product/1735031026643470004?_d=x': 'https://www.tiktok.com/login',
+    }
+    vi.stubGlobal('fetch', async (url: string) => new Response(null, { status: hops[url] ? 301 : 200, headers: hops[url] ? { location: hops[url] } : {} }))
+    try {
+      expect(await resolveRedirects('https://vt.tiktok.com/ZSabc/', /\/product\/\d{6,}/)).toBe('https://www.tiktok.com/view/product/1735031026643470004?_d=x')
+      expect(await resolveRedirects('https://vt.tiktok.com/ZSabc/')).toBe('https://www.tiktok.com/login')
+    }
+    finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it('extracts product ids from canonical links', () => {

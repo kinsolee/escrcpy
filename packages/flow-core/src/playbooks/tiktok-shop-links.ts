@@ -135,6 +135,7 @@ export interface BoxRegion {
   y?: [number, number]
   minWidth?: number
   maxWidth?: number
+  minHeight?: number
   maxHeight?: number
 }
 
@@ -147,10 +148,11 @@ export const TIKTOK_BOX_REGIONS: Record<string, BoxRegion> = {
   search_button: { x: [0.6, 1], y: [0, 0.15], maxWidth: 0.3 },
   share_icon: { x: [0.5, 1], y: [0, 0.15], maxWidth: 0.15 },
   copy_link: { x: [0, 0.5], y: [0.6, 1], maxWidth: 0.3 },
-  top_left_card: { x: [0, 0.5], y: [0.1, 0.75], minWidth: 0.3, maxWidth: 0.55 },
-  top_right_card: { x: [0.5, 1], y: [0.1, 0.75], minWidth: 0.3, maxWidth: 0.55 },
-  bottom_left_card: { x: [0, 0.5], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55 },
-  bottom_right_card: { x: [0.5, 1], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55 },
+  // A card cut off by the header after a scroll is too short to tap safely.
+  top_left_card: { x: [0, 0.5], y: [0.2, 0.75], minWidth: 0.3, maxWidth: 0.55, minHeight: 0.15 },
+  top_right_card: { x: [0.5, 1], y: [0.2, 0.75], minWidth: 0.3, maxWidth: 0.55, minHeight: 0.15 },
+  bottom_left_card: { x: [0, 0.5], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55, minHeight: 0.15 },
+  bottom_right_card: { x: [0.5, 1], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55, minHeight: 0.15 },
 }
 
 export function boxFitsRegion(box: { top: number, bottom: number, left: number, right: number }, region: BoxRegion | undefined): boolean {
@@ -160,7 +162,7 @@ export function boxFitsRegion(box: { top: number, bottom: number, left: number, 
   const cy = (box.top + box.bottom) / 2
   const width = box.right - box.left
   const inside = (value: number, range?: [number, number]) => !range || (value >= range[0] && value <= range[1])
-  return inside(cx, region.x) && inside(cy, region.y) && (region.minWidth === undefined || width >= region.minWidth) && (region.maxWidth === undefined || width <= region.maxWidth) && (region.maxHeight === undefined || box.bottom - box.top <= region.maxHeight)
+  return inside(cx, region.x) && inside(cy, region.y) && (region.minWidth === undefined || width >= region.minWidth) && (region.maxWidth === undefined || width <= region.maxWidth) && (region.maxHeight === undefined || box.bottom - box.top <= region.maxHeight) && (region.minHeight === undefined || box.bottom - box.top >= region.minHeight)
 }
 
 type Goal = 'reach_search' | 'type' | 'results' | 'pick' | 'open_share' | 'copy' | 'return'
@@ -228,14 +230,15 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   const pageOf = (a: Answers): Page | 'uncertain' => a.page.confidence >= T.page ? a.page.choice as Page : 'uncertain'
   const yes = (answer: JevNoulAnswer) => answer.noul >= T.popup
   /** A box is used on confidence alone, or at a lower confidence when it fits the target's expected region. */
-  const located = (present: JevNoulAnswer | undefined, box: JevBoxAnswer, name: string) => {
+  const located = (present: JevNoulAnswer | undefined, box: JevBoxAnswer, name: string, quiet = false) => {
     if (present && present.noul < T.present)
       return false
     const confidence = box.confidence ?? 0
     if (confidence >= T.box)
       return true
     if (confidence >= T.boxGeometry && boxFitsRegion(box.box, TIKTOK_BOX_REGIONS[name])) {
-      rt.decide(`${name} box ${confidence.toFixed(2)} accepted by its expected region`)
+      if (!quiet)
+        rt.decide(`${name} box ${confidence.toFixed(2)} accepted by its expected region`)
       return true
     }
     return false
@@ -284,10 +287,11 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
 
   /** Stores a freshly copied link; returns true when the target count is reached. */
   const store = async (link: string): Promise<boolean> => {
-    const resolved = productIdFromUrl(link) ? link : await rt.resolveLink(link)
+    const resolved = productIdFromUrl(link) ? link : await rt.resolveLink(link, PRODUCT_ID_RE)
     const productId = productIdFromUrl(resolved) ?? productIdFromUrl(link)
     const finalUrl = resolved ? stripQuery(resolved) : undefined
-    const key = productId ?? finalUrl ?? link
+    // Never key on an unresolved final URL: two different products could both land on /login.
+    const key = productId ?? link
     if (seen.has(key)) {
       duplicates.push(productId ?? link)
       rt.decide(`duplicate product ${productId ?? link}; not counted`)
@@ -568,6 +572,17 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       ad: a[`${position}_ad`].noul,
       box: a[`${position}_card`],
     }))
+    // Right-column boxes often come back wrong on the real grid (spanning both columns, or a copy
+    // of the left card). The grid is two symmetric columns, so mirror the left card of the row.
+    for (const [right, left] of [[1, 0], [3, 2]] as const) {
+      const view = cards[right]
+      const partner = cards[left]
+      if (view.product < 0.5 || located(undefined, view.box, `${view.position}_card`, true) || !located(undefined, partner.box, `${partner.position}_card`, true))
+        continue
+      const { top, bottom, left: l, right: r } = partner.box.box
+      view.box = { type: 'box', box: { top, bottom, left: 1 - r, right: 1 - l }, confidence: partner.box.confidence }
+      rt.decide(`${view.position} box mirrored from ${partner.position}`)
+    }
     const qualified = cards.filter(view => view.product >= 0.5 && view.live < 0.5 && view.video < 0.5 && (!params.skipAds || view.ad < 0.5))
     const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : view.video >= 0.5 ? 'video' : 'ad'})`)
     rt.decide(`cards: ${qualified.map(view => view.position).join(', ') || 'none'} qualify${skipped.length ? `; skipped ${skipped.join(', ')}` : ''}; cursor ${cursor}`)
@@ -596,9 +611,9 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     gridWaits = 0
     if (scrolls >= params.maxScrolls)
       throw new PlaybookEnd(items.length ? `only ${items.length} of ${params.count} links after ${scrolls} scrolls` : `no product cards found after ${scrolls} scrolls`)
-    // Scroll about two rows with a slow drag (no fling), then start from the top-left again.
-    const top = cards[0].product >= 0.5 && cards[2].product >= 0.5 ? cards[2].box.box.top - cards[0].box.box.top : 0.36
-    const distance = Math.min(0.7, Math.max(0.3, top * 2))
+    // Slow drag (no fling) that brings the bottom row up under the header, then start from the top-left again.
+    const bottomTop = cards[2].product >= 0.5 && located(undefined, cards[2].box, 'bottom_left_card', true) ? cards[2].box.box.top : undefined
+    const distance = bottomTop === undefined ? 0.45 : Math.min(0.7, Math.max(0.25, bottomTop - 0.22))
     scrolls++
     cursor = 0
     await rt.swipe({ x: 0.5, y: 0.85 }, { x: 0.5, y: 0.85 - distance }, 900, `scroll ${scrolls}`)
