@@ -222,3 +222,43 @@ export function createDeviceLease(options: DeviceLeaseOptions = {}): DeviceLease
 
   return { acquire, release, refresh, info, list }
 }
+
+export interface HeldLeaseOptions extends AcquireOptions {
+  /** How often the lock is touched while `run` is in flight. Default 30 s (well under the 120 s stale window). */
+  refreshMs?: number
+}
+
+export interface HeldLease {
+  /** True when this process already held the lease before the call, so it is left in place afterwards. */
+  reused: boolean
+  lease: LeaseInfo
+}
+
+/**
+ * Runs `run` while holding the device lease, restoring the lease state that
+ * existed before the call: a lease this process already held (for example an
+ * agent's explicit `device_claim`) is reused and kept, never released; a lease
+ * acquired here is released afterwards. Leases of other live processes reject
+ * with `LeaseBusyError`. The lock is refreshed periodically so long runs are
+ * not mistaken for stale ones.
+ */
+export async function withLease<T>(lease: DeviceLease, serial: string, options: HeldLeaseOptions, run: (held: HeldLease) => Promise<T>): Promise<T> {
+  const existing = await lease.info(serial)
+  const reused = !!existing && existing.pid === process.pid
+  const info = reused ? existing! : await lease.acquire(serial, options)
+  const refreshMs = options.refreshMs ?? 30_000
+  const timer = setInterval(() => {
+    lease.refresh(serial).catch(() => {})
+  }, refreshMs)
+  timer.unref?.()
+  try {
+    if (reused)
+      await lease.refresh(serial).catch(() => {})
+    return await run({ reused, lease: info })
+  }
+  finally {
+    clearInterval(timer)
+    if (!reused)
+      await lease.release(serial).catch(() => false)
+  }
+}
