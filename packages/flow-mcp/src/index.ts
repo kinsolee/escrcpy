@@ -15,8 +15,8 @@ import {
   withLease,
 } from '@escrcpy/flow-device'
 import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
-import { AUTO_RECORDING_TASK, compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, requireLlmEndpoint, resolveLlm, runVisionAgent, saveLlmConfig, visionDeviceFromFlowDevice, writeFlow } from '@escrcpy/flow-core'
-import type { AgentToolOutput, VisionAgentResult } from '@escrcpy/flow-core'
+import { AUTO_RECORDING_TASK, compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, requireJevClient, requireLlmEndpoint, resolveLlm, runVisionAgent, saveLlmConfig, visionDeviceFromFlowDevice, visualCheck, visualLocate, writeFlow } from '@escrcpy/flow-core'
+import type { AgentToolOutput, JevClient, JevQuestions, VisionAgentResult } from '@escrcpy/flow-core'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -57,6 +57,8 @@ export interface FlowMcpOptions {
   resolveSerial?: (serial?: string) => Promise<string>
   describeDevice?: (serial: string) => Promise<TraceDevice>
   logger?: (message: string, error?: unknown) => void
+  /** Jev client for the visual tools (tests inject a fake); default from llm.json. */
+  jev?: JevClient
 }
 
 export interface RealFlowMcpOptions {
@@ -621,6 +623,7 @@ function registerFlowTools(flow: FlowMcpServer): void {
   })
 
   registerVisionAgentTool(flow)
+  registerVisualTools(flow)
 
   flow.server.registerPrompt('flow/explore', {
     title: 'Explore and record an Android flow',
@@ -667,6 +670,7 @@ function registerVisionAgentTool(flow: FlowMcpServer): void {
       model: z.string().optional().describe('vendor::model from the shared llm.json; default its active model'),
       run_dir: z.string().optional().describe('Directory for report.json and step screenshots; default ~/.escrcpy/flow/vision-runs/<serial>/<time>'),
       instructions: z.string().optional().describe('Extra guidance appended to the system prompt'),
+      jev: z.boolean().optional().describe('Jev assist: visually refuse taps on unlabeled social/purchase controls and verify a successful done (links from the clipboard, final screen)'),
     },
   }, async (args, extra): Promise<ToolResponse> => {
     try {
@@ -689,6 +693,7 @@ function registerVisionAgentTool(flow: FlowMcpServer): void {
         observe: args.observe,
         launch: args.launch,
         instructions: args.instructions,
+        ...(args.jev ? { jev: requireJevClient() } : {}),
         endpoint,
         device: visionDeviceFromFlowDevice(context.device, context.adbx),
         lease: context.lease ?? createDeviceLease(),
@@ -708,6 +713,38 @@ function registerVisionAgentTool(flow: FlowMcpServer): void {
       loggerFor(flow)('vision_agent_run failed', error)
       return formatError(error)
     }
+  })
+}
+
+const jevQuestionSchema = z.object({
+  type: z.enum(['noul', 'choice', 'score', 'box']),
+  instructions: z.unknown().optional(),
+  criteria: z.unknown().optional(),
+}).passthrough()
+
+/**
+ * visual_locate / visual_check: one Jev request on the current screenshot.
+ * Read-only; they do not take the device lease. The Jev client is built per
+ * call from llm.json's `jev` section (default magpie) unless injected.
+ */
+function registerVisualTools(flow: FlowMcpServer): void {
+  const { context } = flow
+  const jev = (): JevClient => context.jev ?? requireJevClient()
+  registerTool(flow, 'visual_locate', 'Locate a control on the current screen with Jev (one request: a Box plus a Noul asking whether it is there at all). Returns {present, presentProbability, box (0..1 edges), confidence, ratio (0..1 centre, usable with tap), point (device px), jev latency}. Box is a prototype-grade capability: check present and confidence before tapping.', {
+    serial: z.string().describe('Android device serial (required)'),
+    description: z.string().min(1).describe('What to find, e.g. "the Copy link button in the share panel"'),
+  }, async (args) => {
+    const serial = await serialFor(context, args.serial)
+    return ok(await visualLocate({ serial, description: args.description, device: context.device, jev: jev() }))
+  })
+  registerTool(flow, 'visual_check', 'Ask Jev typed questions about the current screen in one request (fan-out). questions: {name: {type: "noul"|"choice"|"score"|"box", instructions, criteria?}}; the screenshot is in the state as `screen` (write it in backticks in instructions). Returns rounded answers with probabilities/confidence and the latency. Use for snap judgments (which page, is a popup open, is X visible); code decides what to do.', {
+    serial: z.string().describe('Android device serial (required)'),
+    questions: z.record(z.string(), jevQuestionSchema).describe('Named questions; at least one'),
+    state: z.record(z.string(), z.unknown()).optional().describe('Extra state fields next to `screen`, e.g. {"keyword": "..."}'),
+  }, async (args) => {
+    const serial = await serialFor(context, args.serial)
+    const result = await visualCheck({ serial, questions: args.questions as JevQuestions, state: args.state, device: context.device, jev: jev() })
+    return ok({ answers: result.summary, screen: result.screen, jev: result.jev })
   })
 }
 
@@ -743,6 +780,7 @@ export function createFlowMcpServer(options: FlowMcpOptions): FlowMcpServer {
     logger: options.logger,
     adbx: options.adbx,
     autoTraceDir: traceDir,
+    jev: options.jev,
   }
   // A locked server ignores any custom resolver: the bound serial is the only answer.
   if (options.lockedSerial)

@@ -213,6 +213,34 @@ describe('in-process client', () => {
   })
 })
 
+describe('visual tools', () => {
+  it('visual_locate and visual_check answer about the current screen with one Jev request each', async () => {
+    const asked: Array<{ questions: string[], state: string[] }> = []
+    const jev = {
+      describe: () => ({ model: 'fake-jev', imagesViaFallback: false }),
+      async ask(request: { state: Record<string, unknown>, questions: Record<string, { type: string }> }) {
+        asked.push({ questions: Object.keys(request.questions), state: Object.keys(request.state) })
+        const answers = Object.fromEntries(Object.entries(request.questions).map(([name, question]) => [name, question.type === 'box'
+          ? { type: 'box', box: { top: 0.84, bottom: 0.92, left: 0.04, right: 0.18 }, confidence: 0.91 }
+          : question.type === 'choice'
+            ? { type: 'choice', choice: 'share_sheet', confidence: 0.9, probabilities: { share_sheet: 0.95, other: 0.05 } }
+            : { type: 'noul', noul: 0.97 }]))
+        return { answers, model: 'fake-jev', usage: { inputTokens: 2300, outputTokens: 30 }, latencyMs: 950, attempts: 1, endpoint: 'primary', images: 1 }
+      },
+    }
+    const flow = createFlowMcpServer({ device: fakeDevice().device, lease: fakeLease(), defaultSerial: SERIAL, jev: jev as never })
+    const mcp = await connectInProcess(flow)
+    expect(mcp.tools.map(tool => tool.name)).toEqual(expect.arrayContaining(['visual_locate', 'visual_check']))
+    const located = JSON.parse(await mcp.callTool('visual_locate', { serial: SERIAL, description: 'the Copy link button' }) as string)
+    expect(located).toMatchObject({ present: true, confidence: 0.91, ratio: { x: 0.11, y: 0.88 }, jev: { latencyMs: 950 } })
+    expect(asked[0]).toEqual({ questions: ['present', 'target'], state: ['screen'] })
+    const checked = JSON.parse(await mcp.callTool('visual_check', { serial: SERIAL, questions: { page: { type: 'choice', instructions: 'Which page is `screen`?', criteria: { share_sheet: 'Send to panel', other: 'else' } }, popup: { type: 'noul', instructions: 'Popup?' } }, state: { keyword: 'k' } }) as string)
+    expect(checked.answers).toEqual({ page: { choice: 'share_sheet', confidence: 0.9, probabilities: { share_sheet: 0.95, other: 0.05 } }, popup: { noul: 0.97 } })
+    expect(asked[1].state).toEqual(['keyword', 'screen'])
+    await mcp.close()
+  })
+})
+
 describe('isEntryModule', () => {
   it('recognises the entry file when launched through a symlink', async () => {
     const real = join(dir, 'agent.mjs')

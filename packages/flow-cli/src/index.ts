@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs'
 import { readdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, dirname } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 import process from 'node:process'
 import { parseArgs } from 'node:util'
 import adbkit from '@devicefarmer/adbkit'
 import { createAdbx } from '@escrcpy/adbx'
-import { applyPatch, compileTraceFile, createEnvLlmClient, loadLlmConfig, readFlow, readTrace, replayFlow, requireLlmEndpoint, resolveLlm, runVisionAgent, toAutomationScript, visionDeviceFromFlowDevice, writeFlow } from '@escrcpy/flow-core'
-import type { FlowScript, FlowStep, HealLlmClient, RunReport, Target, VisionAgentEvent, VisionObserveMode } from '@escrcpy/flow-core'
+import { applyPatch, compileTraceFile, createEnvLlmClient, listPlaybooks, loadLlmConfig, PLAYBOOKS, readFlow, readTrace, replayFlow, requireJevClient, requireLlmEndpoint, resolveLlm, runPlaybook, runVisionAgent, toAutomationScript, visionDeviceFromFlowDevice, visualCheck, visualLocate, writeFlow } from '@escrcpy/flow-core'
+import type { FlowScript, FlowStep, HealLlmClient, JevQuestions, PlaybookEvent, PlaybookThresholds, RunReport, Target, VisionAgentEvent, VisionObserveMode } from '@escrcpy/flow-core'
 import { defaultVisionRunDir, isEntryModule, startFlowMcpServer } from '@escrcpy/flow-mcp'
 import type { Selector, UiElement } from '@escrcpy/flow-device'
 import { createDeviceLease, createFlowDevice, FlowDeviceError, LeaseBusyError, resolveYadbPath, withLease } from '@escrcpy/flow-device'
@@ -36,6 +37,11 @@ Commands:
   heal <report.json> [--apply]  Re-run a failed flow with LLM self-heal and emit a patch
   agent --serial <s> --goal <text>
                                 Let a vision LLM operate the device toward a goal (no script)
+  see --serial <s> --locate <desc> | --ask <json>
+                                Ask Jev about the current screen (Box + presence, or typed questions)
+  playbook <id> --serial <s> [params]
+                                Run a code-driven playbook (Jev judges each screen, the vision
+                                agent takes over single uncertain steps); playbook list shows ids
 
 Compile options:
   --var <name=value>            Override or declare a trace variable (repeatable)
@@ -72,7 +78,25 @@ Agent options (flow agent):
   --model <vendor::model>       Model from llm.json (default: its active model)
   --run-dir <dir>               report.json + step screenshots (default ~/.escrcpy/flow/vision-runs/<serial>/<time>)
   --instructions <text>         Extra guidance for the model
+  --jev                         Jev assist: visually refuse unlabeled social/purchase taps and
+                                verify a successful done (clipboard links, final screen)
   --json                        Print only the final result JSON on stdout (progress goes to stderr)
+
+See options (flow see):
+  --locate <desc>               Box + presence for one control, e.g. "the Copy link button"
+  --ask <json|file>             Questions {name: {type, instructions, criteria?}} about the screen ("screen");
+                                or {"questions": {...}, "state": {...}} for extra state fields
+
+Playbook options (flow playbook tiktok-shop-links):
+  --keyword <text>              Search keyword (required)
+  --count <n>                   Links to collect (default 3)
+  --skip-ads                    Skip cards labelled Ad / Sponsored (default: keep and flag them)
+  --model <vendor::model>       Takeover model from llm.json (default: its active model)
+  --no-fallback                 No vision-agent takeovers: an uncertain step fails the run
+  --box-threshold <0..1>        Box confidence needed to tap (default 0.6)
+  --launch <mode>               restart (default) | if-needed | never
+  --max-steps / --time-budget / --run-dir   as for flow agent (defaults 60 / 360000 /
+                                ~/.escrcpy/flow/playbook-runs/<id>/<serial>/<time>)
 
 Fleet options:
   --dry-run                     Print the expanded plan (device -> task queue) without touching devices
@@ -97,6 +121,11 @@ Environment:
   FLOW_LLM_API_TYPE  messages (default), responses or chat_completions, matching the LLM endpoint style
   FLOW_VISION_RUNS_DIR  Root for flow agent run directories (default ~/.escrcpy/flow/vision-runs)
   llm.json vendors may set "apiKeyEnv": "<ENV_NAME>" to read the key from the environment
+  FLOW_JEV_BASE_URL / FLOW_JEV_API_KEY / FLOW_JEV_MODEL   Jev endpoint (default: llm.json "jev"
+                   section, else magpie http://127.0.0.1:3425 with the magpie vendor key)
+  FLOW_JEV_FALLBACK_BASE_URL / FLOW_JEV_FALLBACK_API_KEY   Optional endpoint for image/Box requests
+                   when the primary answers "Images are not turned on" (off unless set)
+  FLOW_PLAYBOOK_RUNS_DIR  Root for flow playbook run directories
 `
 
 interface CliValues {
@@ -146,6 +175,14 @@ interface CliValues {
   'model'?: string
   'run-dir'?: string
   'instructions'?: string
+  'jev'?: boolean
+  'locate'?: string
+  'ask'?: string
+  'keyword'?: string
+  'count'?: string
+  'skip-ads'?: boolean
+  'no-fallback'?: boolean
+  'box-threshold'?: string
 }
 
 export interface ParsedCliArgs {
@@ -200,6 +237,14 @@ const CLI_OPTIONS = {
   'model': { type: 'string' },
   'run-dir': { type: 'string' },
   'instructions': { type: 'string' },
+  'jev': { type: 'boolean' },
+  'locate': { type: 'string' },
+  'ask': { type: 'string' },
+  'keyword': { type: 'string' },
+  'count': { type: 'string' },
+  'skip-ads': { type: 'boolean' },
+  'no-fallback': { type: 'boolean' },
+  'box-threshold': { type: 'string' },
 } as const
 
 export function parseCliArgs(argv: string[] = process.argv.slice(2)): ParsedCliArgs {
@@ -582,6 +627,7 @@ async function agentCommand(values: CliValues): Promise<void> {
     observe: values.observe as VisionObserveMode | undefined,
     launch: values.launch as 'if-needed' | 'restart' | 'never' | undefined,
     instructions: values.instructions,
+    ...(values.jev ? { jev: requireJevClient() } : {}),
     endpoint,
     device: visionDeviceFromFlowDevice(device, adbx),
     runDir,
@@ -610,6 +656,127 @@ async function agentCommand(values: CliValues): Promise<void> {
     process.stdout.write(`${JSON.stringify(result)}\n`)
   else
     console.log(JSON.stringify(result, null, 2))
+  if (!result.success)
+    process.exitCode = 1
+}
+
+/** `flow see`: one Jev request about the current screen. Read-only, no lease. */
+async function seeCommand(values: CliValues): Promise<void> {
+  const serial = values.serial
+  if (!serial)
+    throw new Error('flow see requires an explicit --serial')
+  if (!values.locate === !values.ask)
+    throw new Error('flow see needs exactly one of --locate <description> or --ask <json>')
+  const adbx = adbBackend(values)
+  const device = createFlowDevice({ adbx })
+  const jev = requireJevClient()
+  let output: unknown
+  if (values.locate) {
+    output = await visualLocate({ serial, description: values.locate, device, jev })
+  }
+  else {
+    const parsed = await readResultSchema(values.ask) as Record<string, unknown>
+    if (!parsed || typeof parsed !== 'object')
+      throw new Error('--ask expects a JSON object of questions')
+    const wrapped = parsed.questions && typeof parsed.questions === 'object' && !('type' in (parsed.questions as object))
+    const questions = (wrapped ? parsed.questions : parsed) as JevQuestions
+    const state = wrapped ? parsed.state as Record<string, unknown> | undefined : undefined
+    const result = await visualCheck({ serial, questions, state, device, jev })
+    output = { answers: result.summary, screen: result.screen, jev: result.jev }
+  }
+  process.stdout.write(values.json ? `${JSON.stringify(output)}\n` : `${JSON.stringify(output, null, 2)}\n`)
+}
+
+function describePlaybookEvent(event: PlaybookEvent): string | undefined {
+  if (event.type === 'log')
+    return `playbook: ${event.message}`
+  if (event.type !== 'step')
+    return undefined
+  const { step } = event
+  const page = step.jev?.answers.page as { choice?: string, confidence?: number } | undefined
+  const jev = step.jev ? ` [jev ${step.jev.latencyMs} ms${page?.choice ? `, ${page.choice} ${page.confidence}` : ''}]` : ''
+  const actions = step.actions.map(action => `${action.type}${action.target ? `(${action.target})` : action.key ? `(${action.key})` : ''}${action.blocked ? ' BLOCKED' : ''}`).join(' ')
+  const fallback = step.fallback ? ` TAKEOVER ${step.fallback.status} ${step.fallback.steps} steps ${step.fallback.tokens.total} tok` : ''
+  return `step ${step.index} ${step.goal}${jev}: ${step.decision ?? ''}${actions ? ` -> ${actions}` : ''}${fallback}${step.error ? ` (${step.error})` : ''}`
+}
+
+function parseRatio(value: string | undefined, name: string): number | undefined {
+  if (value === undefined)
+    return undefined
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1)
+    throw new Error(`${name} expects a number between 0 and 1, got ${value}`)
+  return parsed
+}
+
+/**
+ * `flow playbook <id>`: a code-driven task where Jev judges each screen and the
+ * vision agent takes over single uncertain steps. Prints the result JSON and
+ * exits 0 only on success.
+ */
+async function playbookCommand(id: string | undefined, values: CliValues): Promise<void> {
+  if (!id || id === 'list') {
+    process.stdout.write(`${JSON.stringify(listPlaybooks(), null, 2)}\n`)
+    return
+  }
+  if (!PLAYBOOKS[id])
+    throw new Error(`unknown playbook "${id}"; available: ${Object.keys(PLAYBOOKS).join(', ')}`)
+  const serial = values.serial
+  if (!serial)
+    throw new Error('flow playbook requires an explicit --serial')
+  if (values.launch && !['if-needed', 'restart', 'never'].includes(values.launch))
+    throw new Error(`--launch expects restart, if-needed or never, got ${values.launch}`)
+  const params: Record<string, unknown> = {}
+  if (values.keyword !== undefined)
+    params.keyword = values.keyword
+  if (values.count !== undefined)
+    params.count = optionalPositiveInt(values.count, '--count')
+  if (values['skip-ads'])
+    params.skipAds = true
+  const boxThreshold = parseRatio(values['box-threshold'], '--box-threshold')
+  const thresholds: Partial<PlaybookThresholds> = boxThreshold === undefined ? {} : { box: boxThreshold }
+  const jev = requireJevClient()
+  const fallback = values['no-fallback'] ? false as const : { endpoint: requireLlmEndpoint(values.model) }
+  const adbx = adbBackend(values)
+  const device = createFlowDevice({ adbx })
+  const runDir = values['run-dir'] ?? join(process.env.FLOW_PLAYBOOK_RUNS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'playbook-runs'), id, serial, new Date().toISOString().replace(/[:.]/g, '-'))
+  const controller = new AbortController()
+  const onSignal = () => controller.abort()
+  process.once('SIGINT', onSignal)
+  process.once('SIGTERM', onSignal)
+  let result
+  try {
+    result = await runPlaybook(id, {
+      serial,
+      params,
+      device: visionDeviceFromFlowDevice(device, adbx),
+      jev,
+      fallback,
+      forbiddenTexts: values['forbid-text'],
+      thresholds,
+      maxSteps: optionalPositiveInt(values['max-steps'], '--max-steps'),
+      timeBudgetMs: optionalPositiveInt(values['time-budget'], '--time-budget'),
+      launch: values.launch as 'restart' | 'if-needed' | 'never' | undefined,
+      runDir,
+      ...(values['no-lease'] ? {} : { lease: createDeviceLease(), leaseHolder: process.env.FLOW_AGENT_NAME ?? `flow-playbook:${id}` }),
+      signal: controller.signal,
+      onEvent: (event) => {
+        const line = describePlaybookEvent(event)
+        if (line)
+          console.error(line)
+      },
+    })
+  }
+  catch (error) {
+    if (error instanceof LeaseBusyError)
+      throw new Error(`device busy: ${serial} is leased by ${error.lease.holder} (pid ${error.lease.pid}); retry after release`)
+    throw error
+  }
+  finally {
+    process.off('SIGINT', onSignal)
+    process.off('SIGTERM', onSignal)
+  }
+  process.stdout.write(values.json ? `${JSON.stringify(result)}\n` : `${JSON.stringify(result, null, 2)}\n`)
   if (!result.success)
     process.exitCode = 1
 }
@@ -754,6 +921,14 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
   }
   if (command === 'agent') {
     await agentCommand(values)
+    return
+  }
+  if (command === 'see') {
+    await seeCommand(values)
+    return
+  }
+  if (command === 'playbook') {
+    await playbookCommand(positionals[1], values)
     return
   }
   if (command === 'fleet') {

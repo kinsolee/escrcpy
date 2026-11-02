@@ -177,6 +177,20 @@ steps:
     return { dir, flowPath, reportPath }
   }
 
+  it('documents and parses the Jev commands: see, playbook, agent --jev', async () => {
+    expect(HELP).toContain('see --serial <s> --locate <desc> | --ask <json>')
+    expect(HELP).toContain('playbook <id> --serial <s>')
+    expect(HELP).toContain('FLOW_JEV_FALLBACK_BASE_URL')
+    const parsed = parseCliArgs(['playbook', 'tiktok-shop-links', '--serial', 'S1', '--keyword', 'removedor de fiapos', '--count', '3', '--skip-ads', '--no-fallback', '--box-threshold', '0.5', '--json'])
+    expect(parsed.positionals).toEqual(['playbook', 'tiktok-shop-links'])
+    expect(parsed.values).toMatchObject({ 'serial': 'S1', 'keyword': 'removedor de fiapos', 'count': '3', 'skip-ads': true, 'no-fallback': true, 'box-threshold': '0.5', 'json': true })
+    expect(parseCliArgs(['agent', '--jev']).values.jev).toBe(true)
+    await expect(runCli(['see', '--locate', 'x'])).rejects.toThrow(/--serial/)
+    await expect(runCli(['see', '--serial', 'S1'])).rejects.toThrow(/exactly one of --locate/)
+    await expect(runCli(['playbook', 'nope', '--serial', 'S1'])).rejects.toThrow(/unknown playbook "nope"; available: tiktok-shop-links/)
+    await expect(runCli(['playbook', 'tiktok-shop-links'])).rejects.toThrow(/--serial/)
+  })
+
   it('exposes the heal command and options in help', () => {
     expect(HELP).toContain('heal <report.json> [--apply]')
     expect(HELP).toContain('--heal')
