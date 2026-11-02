@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import adbkit from '@devicefarmer/adbkit'
 import { createAdbx } from '@escrcpy/adbx'
 import type { Adbx } from '@escrcpy/adbx'
@@ -12,9 +12,11 @@ import {
   createDeviceLease,
   createFlowDevice,
   resolveYadbPath,
+  withLease,
 } from '@escrcpy/flow-device'
 import type { DeviceLease, FlowDevice, RatioPoint, Selector, Snapshot } from '@escrcpy/flow-device'
-import { AUTO_RECORDING_TASK, compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, resolveLlm, saveLlmConfig, writeFlow } from '@escrcpy/flow-core'
+import { AUTO_RECORDING_TASK, compileTraceFile, llmConfigPath, loadLlmConfig, parseFlow, readFlow, replayFlow, requireLlmEndpoint, resolveLlm, runVisionAgent, saveLlmConfig, visionDeviceFromFlowDevice, writeFlow } from '@escrcpy/flow-core'
+import type { AgentToolOutput, VisionAgentResult } from '@escrcpy/flow-core'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
@@ -240,10 +242,10 @@ async function runFlowReplay(context: FlowMcpServer['context'], args: FlowRunArg
     },
   }
   const lease = context.lease ?? createDeviceLease()
-  await lease.acquire(serial, { holder: 'flow-mcp' })
-  const reportDir = join(process.env.FLOW_REPORTS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'reports'), script.name, serial, new Date().toISOString().replace(/[:.]/g, '-'))
-  mkdirSync(reportDir, { recursive: true })
-  try {
+  // A lease this process already holds (an agent's device_claim) is reused and kept after the run.
+  return withLease(lease, serial, { holder: 'flow-mcp' }, async () => {
+    const reportDir = join(process.env.FLOW_REPORTS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'reports'), script.name, serial, new Date().toISOString().replace(/[:.]/g, '-'))
+    mkdirSync(reportDir, { recursive: true })
     const wantsHeal = args.heal || args.healGoal
     const resolved = wantsHeal ? resolveLlm(loadLlmConfig()) : undefined
     if (wantsHeal && !resolved)
@@ -259,10 +261,7 @@ async function runFlowReplay(context: FlowMcpServer['context'], args: FlowRunArg
       ...(resolved ? { heal: { client: resolved.client, writePatch: true, ...(args.healGoal ? { goal } : {}) } } : {}),
     })
     return { report, reportDir }
-  }
-  finally {
-    await lease.release(serial)
-  }
+  })
 }
 
 function registerFlowTools(flow: FlowMcpServer): void {
@@ -621,6 +620,8 @@ function registerFlowTools(flow: FlowMcpServer): void {
     return ok(await context.recorder.stop(outcome))
   })
 
+  registerVisionAgentTool(flow)
+
   flow.server.registerPrompt('flow/explore', {
     title: 'Explore and record an Android flow',
     description: 'Guide an agent to explore an Android UI and produce a useful record/replay trace.',
@@ -634,6 +635,80 @@ function registerFlowTools(flow: FlowMcpServer): void {
       },
     }],
   }))
+}
+
+/** Where vision agent runs keep report.json + screenshots unless the caller picks a directory. */
+export function defaultVisionRunDir(serial: string, now = new Date()): string {
+  const root = process.env.FLOW_VISION_RUNS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'vision-runs')
+  return join(root, serial, now.toISOString().replace(/[:.]/g, '-'))
+}
+
+/**
+ * vision_agent_run: a vision model drives the device toward `goal` with the
+ * runner's hard guardrails (foreground allow-list, forbidden-label taps,
+ * budgets). Long-running: progress notifications are sent per step when the
+ * client passes a progressToken, and a client cancel aborts the run.
+ */
+function registerVisionAgentTool(flow: FlowMcpServer): void {
+  const { context } = flow
+  flow.server.registerTool('vision_agent_run', {
+    description: 'Let a vision LLM operate the device toward a natural-language goal (no recorded script). It sees a screenshot each step and returns one action (tap/long_press/swipe/scroll/input_text/key back|home|enter/wait/read_clipboard/done/fail). The runtime enforces: foreground must stay in allowed_packages (one automatic relaunch, then fail), taps on controls labelled with forbidden texts (Like/Follow/Add to cart/Buy now/… in en/zh/pt/es) are refused, and step/time/model-call budgets. Holds the device lease while running. Returns {status, success, result, reason, steps, modelCalls, tokens, clipboardReads, reportPath}. Runs take minutes: use a long client timeout or progress notifications.',
+    inputSchema: {
+      serial: z.string().describe('Android device serial (required, never inferred)'),
+      goal: z.string().min(1).describe('What to achieve, in natural language'),
+      result_schema: z.unknown().optional().describe('Shape expected in result, e.g. {"links":"string[]","noResults":"boolean"}'),
+      allowed_packages: z.array(z.string()).optional().describe('Foreground packages the agent may act in; the first one is (re)launched when needed'),
+      forbidden_texts: z.array(z.string()).optional().describe('Extra labels that must never be tapped (added to the defaults)'),
+      max_steps: z.number().int().min(1).max(200).optional().describe('Default 30'),
+      max_model_calls: z.number().int().min(1).max(400).optional(),
+      time_budget_ms: z.number().int().min(10_000).max(3_600_000).optional().describe('Default 600000'),
+      observe: z.enum(['screenshot', 'screenshot+tree']).optional().describe('Default screenshot+tree (tree only when it dumps within 2 s)'),
+      launch: z.enum(['if-needed', 'restart', 'never']).optional().describe('Start behaviour for allowed_packages[0]; default if-needed'),
+      model: z.string().optional().describe('vendor::model from the shared llm.json; default its active model'),
+      run_dir: z.string().optional().describe('Directory for report.json and step screenshots; default ~/.escrcpy/flow/vision-runs/<serial>/<time>'),
+      instructions: z.string().optional().describe('Extra guidance appended to the system prompt'),
+    },
+  }, async (args, extra): Promise<ToolResponse> => {
+    try {
+      const serial = await serialFor(context, args.serial)
+      if (!context.adbx)
+        throw new Error('vision_agent_run requires an ADB backend')
+      const endpoint = requireLlmEndpoint(args.model)
+      const runDir = args.run_dir ?? defaultVisionRunDir(serial)
+      const progressToken = extra?._meta?.progressToken
+      const maxSteps = args.max_steps ?? 30
+      const result: VisionAgentResult = await runVisionAgent({
+        serial,
+        goal: args.goal,
+        resultSchema: args.result_schema,
+        allowedPackages: args.allowed_packages,
+        forbiddenTexts: args.forbidden_texts,
+        maxSteps,
+        maxModelCalls: args.max_model_calls,
+        timeBudgetMs: args.time_budget_ms,
+        observe: args.observe,
+        launch: args.launch,
+        instructions: args.instructions,
+        endpoint,
+        device: visionDeviceFromFlowDevice(context.device, context.adbx),
+        lease: context.lease ?? createDeviceLease(),
+        leaseHolder: 'vision-agent',
+        runDir,
+        signal: extra?.signal,
+        onEvent: (event) => {
+          if (event.type !== 'step' || progressToken === undefined)
+            return
+          const action = event.step.action ? event.step.action.type : 'observe'
+          extra.sendNotification({ method: 'notifications/progress', params: { progressToken, progress: event.step.index, total: maxSteps, message: `step ${event.step.index}: ${action}` } }).catch(() => {})
+        },
+      })
+      return ok(result)
+    }
+    catch (error) {
+      loggerFor(flow)('vision_agent_run failed', error)
+      return formatError(error)
+    }
+  })
 }
 
 /** Resolver for a server bound to one device; omitted serials fall back to it, others are refused. */
@@ -694,8 +769,12 @@ export interface InProcessTool {
 
 export interface InProcessFlowMcp {
   tools: InProcessTool[]
-  /** Runs one tool; resolves with its text content, rejects on isError. */
-  callTool: (name: string, args: Record<string, unknown>) => Promise<string>
+  /**
+   * Runs one tool and rejects on isError. Text-only results resolve with the text;
+   * results with image blocks (screenshot) resolve with `{ text, images }` so the
+   * Copilot agent loop can show the model the picture.
+   */
+  callTool: (name: string, args: Record<string, unknown>) => Promise<string | AgentToolOutput>
   close: () => Promise<void>
 }
 
@@ -704,7 +783,11 @@ export interface InProcessFlowMcp {
  * so the desktop copilot can drive it without spawning a subprocess.
  */
 export async function createInProcessFlowMcp(options: RealFlowMcpOptions = {}): Promise<InProcessFlowMcp> {
-  const flow = createRealFlowMcpServer(options)
+  return connectInProcess(createRealFlowMcpServer(options))
+}
+
+/** Wires any flow MCP server (real or test fake) to an in-memory client. */
+export async function connectInProcess(flow: FlowMcpServer): Promise<InProcessFlowMcp> {
   const client = new Client({ name: 'escrcpy-copilot', version: '0.0.0' })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   await Promise.all([
@@ -720,10 +803,15 @@ export async function createInProcessFlowMcp(options: RealFlowMcpOptions = {}): 
     })),
     callTool: async (name, args) => {
       const result = await client.callTool({ name, arguments: args })
-      const content = (result.content ?? []) as Array<{ type?: string, text?: string }>
+      const content = (result.content ?? []) as Array<{ type?: string, text?: string, data?: string, mimeType?: string }>
       const text = content.map(item => item.text ?? '').join('\n').trim()
       if (result.isError)
         throw new Error(text || `tool ${name} failed`)
+      const images = content
+        .filter(item => item.type === 'image' && typeof item.data === 'string' && typeof item.mimeType === 'string')
+        .map(item => ({ data: item.data!, mimeType: item.mimeType! }))
+      if (images.length)
+        return { text, images }
       return text || JSON.stringify(result.structuredContent ?? '') || 'ok'
     },
     close: async () => {
@@ -739,8 +827,26 @@ export async function startFlowMcpServer(options: RealFlowMcpOptions = {}): Prom
   console.error('[flow-mcp] stdio server started')
 }
 
-const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
-if (isMainModule) {
+/**
+ * True when this file is the node entry point. Compares real paths: launched
+ * through a symlink (macOS /tmp → /private/tmp, a linked bin, a symlinked app
+ * Resources dir) argv[1] and import.meta.url differ, and a plain string compare
+ * made `node agent.mjs` exit silently without starting the server.
+ */
+export function isEntryModule(metaUrl: string, argv1: string | undefined = process.argv[1]): boolean {
+  if (!argv1)
+    return false
+  if (metaUrl === pathToFileURL(argv1).href)
+    return true
+  try {
+    return pathToFileURL(realpathSync(argv1)).href === pathToFileURL(realpathSync(fileURLToPath(metaUrl))).href
+  }
+  catch {
+    return false
+  }
+}
+
+if (isEntryModule(import.meta.url)) {
   startFlowMcpServer().catch((error) => {
     console.error('[flow-mcp] fatal', error)
     process.exitCode = 1
