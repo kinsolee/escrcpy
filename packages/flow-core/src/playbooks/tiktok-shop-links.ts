@@ -1,7 +1,8 @@
 import { z } from 'zod'
 import { jevBoxCenter } from '../jev.js'
-import type { JevBoxAnswer, JevNoulAnswer, JevQuestions } from '../jev.js'
+import type { JevBoxAnswer, JevNoulAnswer, JevNoulQuestion, JevQuestions } from '../jev.js'
 import type { Observation, PlaybookDefinition, PlaybookOutcome, PlaybookRuntime } from './runtime.js'
+import type { RatioPoint } from '@escrcpy/flow-device'
 
 /**
  * TikTok Shop: search a keyword and collect product links (Share → Copy link).
@@ -38,6 +39,10 @@ export interface TiktokShopLinkItem {
   sold?: boolean
   /** Jev Noul on the product page: is the product the kind of thing `keyword` names. */
   relevance?: number
+  /** Which search produced the card: 1 for the first, higher after a re-search (e.g. TikTok was force-stopped). */
+  searchEpoch: number
+  /** The product was opened in TikTok's video + product half sheet (DetailActivity) rather than a full product page. */
+  sheet?: boolean
 }
 
 export interface TiktokShopLinksResult {
@@ -47,6 +52,9 @@ export interface TiktokShopLinksResult {
   noResults: boolean
   items: TiktokShopLinkItem[]
   duplicates: string[]
+  /** Searches run for this result. Above 1 the items do not all come from one results grid, so positions are per search. */
+  searchEpochs: number
+  researched: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +87,12 @@ const BASE_QUESTIONS = {
   share_open: { type: 'noul', instructions: 'Is a share panel titled "Send to", with a Copy link button, open at the bottom of `screen`?' },
   no_results: { type: 'noul', instructions: 'Does `screen` show a message saying that no results were found for the search?' },
   popup_close: { type: 'box', instructions: 'the close button (an X) of the popup or dialog in `screen`' },
+  // Pressing BACK here can leave TikTok, so code must know it: the Activity is the main signal, this the backup.
+  home_feed: {
+    type: 'noul',
+    instructions: 'Is `screen` the TikTok home feed, with the Following and For You tabs at the top and the Home, Friends, +, Inbox and Profile bar at the bottom?',
+    criteria: { false: { what: 'Not the home feed', examples: ['a single video opened from a product or a search, with a back arrow at the top-left and no Home / Inbox / Profile bar', 'the TikTok Shop page', 'a product page'] } },
+  },
 } as const satisfies JevQuestions
 
 const NAV_QUESTIONS = {
@@ -136,7 +150,26 @@ const PRODUCT_QUESTIONS = {
   copy_link_present: { type: 'noul', instructions: 'Is there a "Copy link" button in a share panel in `screen`?' },
   copy_link: { type: 'box', instructions: 'the "Copy link" button in the share panel of `screen`' },
   relevant: { type: 'noul', instructions: 'Is the product shown in `screen` the kind of product that the search text in `keyword` names?' },
+  // TikTok 46.5 opens video-thumbnail cards as a video with the product in a half sheet below it
+  // (DetailActivity); its Share icon sits at the sheet's top-right, right next to the cart icon.
+  product_sheet: {
+    type: 'noul',
+    instructions: 'Is the product in `screen` shown in a sheet that covers only the lower part of the screen, with a video still visible above the sheet?',
+    criteria: { false: { what: 'A full-screen product page whose top bar (back or close button, search box, share and cart icons) sits at the very top of the screen, or any page that is not a product page' } },
+  },
+  sheet_share_icon: { type: 'box', instructions: 'the Share icon (a curved arrow) at the top-right of the product sheet in `screen`' },
+  sheet_cart_icon: { type: 'box', instructions: 'the shopping cart icon at the top-right of the product sheet in `screen`' },
 } as const satisfies JevQuestions
+
+/** Asked on the crop around a candidate sheet Share point, with the forbidden-control question (same request). */
+export const SHEET_SHARE_CONFIRM: JevNoulQuestion = {
+  type: 'noul',
+  instructions: 'Is the control inside the red circle in `crop` a Share icon (a curved arrow pointing right)?',
+  criteria: { false: { what: 'Any other control or empty space', examples: ['a shopping cart icon', 'a three-dots menu icon', 'empty space between two icons'] } },
+}
+
+/** Horizontal distance between the sheet's round icons (share → cart → more) as a share of the screen width; measured on a Pixel 5a. */
+export const SHEET_ICON_SPACING = 0.11
 
 /** Where a correctly located control sits (box centre, as 0..1 of the screen) and how big its box is. */
 export interface BoxRegion {
@@ -156,6 +189,10 @@ export const TIKTOK_BOX_REGIONS: Record<string, BoxRegion> = {
   shop_search: { y: [0, 0.2], minWidth: 0.3 },
   search_button: { x: [0.6, 1], y: [0, 0.15], maxWidth: 0.3 },
   share_icon: { x: [0.5, 1], y: [0, 0.15], maxWidth: 0.15 },
+  // Half sheet (DetailActivity on TikTok 46.5): icons on the sheet's top edge, which sits around 0.3 of the height.
+  // Share is the left one (≈0.71), the cart next to it (≈0.83). Used only when the page is a sheet.
+  sheet_share_icon: { x: [0.6, 0.79], y: [0.15, 0.7], maxWidth: 0.12, maxHeight: 0.08 },
+  sheet_cart_icon: { x: [0.74, 0.9], y: [0.15, 0.7], maxWidth: 0.12, maxHeight: 0.08 },
   copy_link: { x: [0, 0.5], y: [0.6, 1], maxWidth: 0.3 },
   // A card cut off by the header after a scroll is too short to tap safely.
   top_left_card: { x: [0, 0.5], y: [0.2, 0.75], minWidth: 0.3, maxWidth: 0.55, minHeight: 0.15 },
@@ -190,6 +227,10 @@ const GOAL_QUESTIONS: Record<Goal, JevQuestions> = {
 // Helpers
 
 const URL_RE = /https?:\/\/\S+/i
+/** The home feed and the Shop tab live in the launcher Activity; BACK there can leave TikTok. */
+const HOME_ACTIVITY_RE = /\.(?:splash\.SplashActivity|main\.MainActivity)$/
+/** Videos opened from a card or a product, and (on 46.5) the video + product half sheet. */
+const DETAIL_ACTIVITY_RE = /\.detail\.ui\.DetailActivity$/
 const PRODUCT_ID_RE = /\/product\/(\d{6,})/
 
 function stripQuery(url: string): string {
@@ -234,7 +275,10 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   const items: TiktokShopLinkItem[] = []
   const duplicates: string[] = []
   const seen = new Set<string>()
-  const result = (): TiktokShopLinksResult => ({ keyword, links: items.map(item => item.link), productIds: items.flatMap(item => item.productId ? [item.productId] : []), noResults: false, items: [...items], duplicates: [...duplicates] })
+  /** Searches submitted so far (a re-search after a relaunch starts a new epoch). */
+  let searchEpoch = 0
+  let epochCounted = true
+  const result = (): TiktokShopLinksResult => ({ keyword, links: items.map(item => item.link), productIds: items.flatMap(item => item.productId ? [item.productId] : []), noResults: false, items: [...items], duplicates: [...duplicates], searchEpochs: searchEpoch, researched: searchEpoch > 1 })
   rt.partial = result()
 
   const pageOf = (a: Answers): Page | 'uncertain' => a.page.confidence >= T.page ? a.page.choice as Page : 'uncertain'
@@ -254,6 +298,62 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     return false
   }
   let gridWaits = 0
+
+  /** The TikTok home feed (For You). Never press BACK here: it is one step from leaving the app. */
+  const isHome = (obs: Observation<any>, a: Answers, page: Page | 'uncertain') => {
+    if (page === 'shop_home')
+      return false
+    const activity = obs.app?.activity ?? ''
+    if (DETAIL_ACTIVITY_RE.test(activity) || activity.includes('.ecommerce.'))
+      return false
+    if (HOME_ACTIVITY_RE.test(activity))
+      return page === 'video_feed' || (page === 'uncertain' && a.home_feed.noul >= 0.5)
+    return (page === 'video_feed' || page === 'uncertain') && a.home_feed.noul >= T.popup
+  }
+
+  /** The video + product half sheet: Jev says so clearly, or the Activity is DetailActivity and Jev / the sheet icons agree. */
+  const isSheet = (obs: Observation<any>, a: Answers, page: Page | 'uncertain') => {
+    if (page !== 'product_detail' || !a.product_sheet)
+      return false
+    if (a.product_sheet.noul >= T.popup)
+      return true
+    if (!DETAIL_ACTIVITY_RE.test(obs.app?.activity ?? ''))
+      return false
+    const iconsOnSheet = (a.sheet_share_icon.confidence ?? 0) >= 0.6 && boxFitsRegion(a.sheet_share_icon.box, TIKTOK_BOX_REGIONS.sheet_share_icon)
+    return a.product_sheet.noul >= 0.25 || iconsOnSheet
+  }
+
+  /** BACK, unless this is the home feed; the runtime re-checks the live foreground (TikTok, and not freshly on the home Activity). */
+  const back = async (obs: Observation<any>, reason: string): Promise<boolean> => {
+    const a = obs.answers as Answers
+    if (isHome(obs, a, pageOf(a))) {
+      rt.decide(`BACK refused on the home feed (${reason})`)
+      return false
+    }
+    const observedHome = HOME_ACTIVITY_RE.test(obs.app?.activity ?? '')
+    return rt.key('BACK', reason, { guard: app => !observedHome && HOME_ACTIVITY_RE.test(app.activity) ? `the screen changed to ${app.activity.split('.').at(-1)} (home)` : undefined })
+  }
+
+  /**
+   * Sheet Share candidates, leftmost first: the Box centre when it sits in the sheet's icon row and
+   * not on the cart, then one icon left of the cart. Each tap first passes the visual check, which
+   * also confirms the ringed control is a Share arrow, so a point on the cart is refused.
+   */
+  const sheetShareCandidates = (a: Answers): RatioPoint[] => {
+    const usable = (box: JevBoxAnswer, name: string) => (box.confidence ?? 0) >= T.boxGeometry && boxFitsRegion(box.box, TIKTOK_BOX_REGIONS[name])
+    const cart = usable(a.sheet_cart_icon, 'sheet_cart_icon') ? jevBoxCenter(a.sheet_cart_icon.box) : undefined
+    const points: RatioPoint[] = []
+    if (usable(a.sheet_share_icon, 'sheet_share_icon')) {
+      const share = jevBoxCenter(a.sheet_share_icon.box)
+      if (!cart || cart.x - share.x >= SHEET_ICON_SPACING / 2)
+        points.push(share)
+    }
+    if (cart)
+      points.push({ x: cart.x - SHEET_ICON_SPACING, y: cart.y })
+    return points
+      .filter((point, i) => points.findIndex(other => Math.abs(other.x - point.x) < 0.015 && Math.abs(other.y - point.y) < 0.015) === i)
+      .sort((p, q) => p.x - q.x)
+  }
   /** Share-icon taps for the current product, and observations waited since the last one (the panel slides in slowly). */
   let shareTaps = 0
   let shareWaits = 0
@@ -276,7 +376,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   }
   let scrolls = 0
   let backs = 0
-  let card: { position: CardPosition, ad: boolean, sold: boolean, relevance?: number } | undefined
+  let card: { position: CardPosition, ad: boolean, sold: boolean, relevance?: number, sheet?: boolean } | undefined
+  /** Set when the last action was a card tap; read (and cleared) by the next observation. */
+  let cardJustTapped = false
+  let lastRelaunches = rt.relaunches
+  let relocateWaits = 0
+  let videoBacks = 0
   let takenLink: string | undefined
   const setGoal = (next: Goal) => {
     if (next !== goal) {
@@ -321,7 +426,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     }
     else {
       seen.add(key)
-      items.push({ link, ...(productId ? { productId } : {}), ...(finalUrl && finalUrl !== link ? { finalUrl } : {}), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}) })
+      items.push({ link, ...(productId ? { productId } : {}), ...(finalUrl && finalUrl !== link ? { finalUrl } : {}), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}), searchEpoch: Math.max(1, searchEpoch), ...(card?.sheet ? { sheet: true } : {}) })
       rt.decide(`stored link ${items.length}/${params.count}: ${productId ?? link}`)
     }
     rt.partial = result()
@@ -332,6 +437,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   /** Clears the field, types the keyword, and lets the next observation verify it. */
   const typeKeyword = async () => {
     typed++
+    epochCounted = false
     await rt.clearText()
     await rt.inputText(keyword)
   }
@@ -341,6 +447,11 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     const a = obs.answers as Answers
     const page = pageOf(a)
     const shareOpen = yes(a.share_open)
+    const tappedCard = cardJustTapped
+    cardJustTapped = false
+    const relaunched = rt.relaunches !== lastRelaunches
+    lastRelaunches = rt.relaunches
+    const home = isHome(obs, a, page)
 
     // Copy link handed to a takeover: its check read the clipboard already.
     if (takenLink) {
@@ -352,6 +463,10 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     }
 
     if (yes(a.no_results) || page === 'no_results') {
+      if (!epochCounted) {
+        searchEpoch++
+        epochCounted = true
+      }
       rt.decide('search returned no results')
       return { success: true, result: { ...result(), noResults: true }, reason: 'no results for the keyword' }
     }
@@ -370,8 +485,29 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           continue
       }
       rt.decide('close popup with BACK')
-      await rt.key('BACK', 'close popup')
+      if (!(await back(obs, 'close popup')))
+        await rt.takeover('A popup or dialog covers the TikTok home screen. Close it with its close (X) button; never tap its action button (Claim, Buy, Follow, etc.) and do not press back.', o => !yes((o.answers as Answers).popup), 'popup on the home feed has no usable close button')
       continue
+    }
+
+    // After a relaunch (TikTok restarted, e.g. force-stopped) the old step goal no longer applies,
+    // and the home feed is never a place to press BACK: re-locate by what the screen shows.
+    if (relaunched || (home && goal !== 'reach_search')) {
+      const next = relocate(page, home, shareOpen)
+      if (next === 'wait' && relocateWaits < 2) {
+        relocateWaits++
+        rt.decide(`after a relaunch the screen is ${page}; wait for it to settle`)
+        await rt.sleep(1500)
+        continue
+      }
+      relocateWaits = 0
+      if (next && next !== 'wait') {
+        rt.decide(`${relaunched ? 'TikTok was relaunched' : 'on the home feed'}: re-locate to ${next} (page ${page})`)
+        if (next !== goal) {
+          setGoal(next)
+          continue
+        }
+      }
     }
 
     switch (goal) {
@@ -382,7 +518,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           break
         }
         if (page === 'results_grid' || page === 'product_detail' || page === 'live_room') {
-          await rt.key('BACK', `leave ${page}`)
+          await back(obs, `leave ${page}`)
           break
         }
         if (++actions > 4) {
@@ -434,6 +570,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
 
       case 'results': {
         if (page === 'results_grid') {
+          if (!epochCounted) {
+            searchEpoch++
+            epochCounted = true
+            if (searchEpoch > 1)
+              rt.decide(`search ${searchEpoch}: a new results grid, positions restart`)
+          }
           if (a.field_has_keyword.noul <= 1 - T.popup)
             rt.decide(`warning: results page query may differ from the keyword (jev ${a.field_has_keyword.noul.toFixed(2)})`)
           setGoal('pick')
@@ -457,11 +599,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       case 'pick':
       case 'return': {
         if (shareOpen) {
-          await rt.key('BACK', 'close share panel')
+          await back(obs, 'close share panel')
           break
         }
         if (page === 'results_grid') {
           backs = 0
+          videoBacks = 0
           setGoal('pick')
           await pick(obs, a)
           break
@@ -472,15 +615,23 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
             await rt.takeover(`Go back to the TikTok Shop search results grid for "${keyword}" using the back key.`, o => pageOf(o.answers as Answers) === 'results_grid', 'could not return to the results grid')
             break
           }
-          if (page === 'video_feed' && backs > 2) {
-            rt.decide('back at the feed: search again')
+          // A video opened from the product (not the home feed: that was re-located above) is one or
+          // two BACKs from the grid; past that, search again instead of pressing on.
+          if (page === 'video_feed' && ++videoBacks > 2) {
+            rt.decide('still on a video after two BACKs: search again')
+            videoBacks = 0
             setGoal('reach_search')
             newPage()
             scrolls = 0
             typed = 0
             break
           }
-          await rt.key('BACK', `return from ${page}`)
+          if (!(await back(obs, `return from ${page}`))) {
+            setGoal('reach_search')
+            newPage()
+            scrolls = 0
+            typed = 0
+          }
           break
         }
         if (page === 'search_input') {
@@ -507,6 +658,9 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       case 'copy': {
         if (page === 'product_detail' && card && card.relevance === undefined)
           card.relevance = a.relevant.noul
+        const sheet = isSheet(obs, a, page)
+        if (sheet && card)
+          card.sheet = true
         if (shareOpen || (goal === 'copy' && a.share_open.noul >= 0.5 && located(a.copy_link_present, a.copy_link, 'copy_link'))) {
           setGoal('copy')
           if (located(a.copy_link_present, a.copy_link, 'copy_link')) {
@@ -525,7 +679,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
               card = undefined
               rt.partial = result()
               setGoal('return')
-              await rt.key('BACK', 'back to results')
+              await back(obs, 'back to results')
               break
             }
             if (!link) {
@@ -535,7 +689,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
             if (await store(link))
               return { success: true, result: result(), reason: `collected ${items.length} links` }
             setGoal('return')
-            await rt.key('BACK', 'back to results')
+            await back(obs, 'back to results')
             break
           }
           const before = rt.clipboardReads.at(-1) ?? ''
@@ -552,6 +706,34 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           }
           if (goal === 'copy')
             setGoal('open_share')
+          if (sheet) {
+            // Half sheet: its own icon row and rules; the cart is right next to Share, so every
+            // candidate passes the visual check (forbidden control + "is this the Share arrow").
+            rt.decide(`product half sheet over a video (${obs.app?.activity.split('.').at(-1) ?? 'activity unknown'}, sheet ${a.product_sheet.noul.toFixed(2)})`)
+            if (shareTaps < 2) {
+              const candidates = sheetShareCandidates(a)
+              for (let i = 0; i < candidates.length && i < 3; i++) {
+                const point = candidates[i]
+                const blocksBefore = rt.visualGuardBlocks
+                if (await rt.tap(obs, point, 'sheet Share icon', { settleMs: 2000, confirm: SHEET_SHARE_CONFIRM })) {
+                  shareTaps++
+                  shareWaits = 0
+                  goal = 'copy'
+                  break
+                }
+                // Refused as a forbidden control: that point was on the cart, so Share is one icon to its left.
+                const left = { x: point.x - SHEET_ICON_SPACING, y: point.y }
+                if (rt.visualGuardBlocks > blocksBefore && left.x > 0.5 && !candidates.some(other => Math.abs(other.x - left.x) < 0.015)) {
+                  rt.decide(`sheet Share candidate (${point.x.toFixed(2)}, ${point.y.toFixed(2)}) was refused as a forbidden control; try one icon to its left`)
+                  candidates.push(left)
+                }
+              }
+              if (goal === 'copy')
+                break
+            }
+            await miss(`sheet Share icon not usable (box ${(a.sheet_share_icon.confidence ?? 0).toFixed(2)})`, 'Open the share panel ("Send to") of this product with the curved-arrow Share icon at the top-right of the product sheet, the icon left of the shopping cart. Never tap the shopping cart. Stop when the panel with Copy link shows.', o => yes((o.answers as Answers).share_open))
+            break
+          }
           if (located(a.share_icon_present, a.share_icon, 'share_icon') && shareTaps < 2) {
             shareTaps++
             shareWaits = 0
@@ -564,10 +746,17 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           break
         }
         if (page === 'live_room' || page === 'video_feed') {
-          rt.decide(`card opened a ${page}, not a product; skip it`)
-          card = undefined
+          // Skipping a card that opened a video / LIVE takes exactly one BACK, and only right after the
+          // card tap (the home feed never gets here: it was re-located above).
           setGoal('return')
-          await rt.key('BACK', `leave ${page}`)
+          if (tappedCard) {
+            rt.decide(`card opened a ${page}, not a product; one BACK to skip it`)
+            card = undefined
+            await back(obs, `leave ${page} opened by the card`)
+          }
+          else {
+            rt.decide(`on a ${page} without a fresh card tap; return to the grid`)
+          }
           break
         }
         if (page === 'results_grid') {
@@ -583,6 +772,38 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         break
       }
     }
+  }
+
+  /**
+   * Where to continue after a relaunch or on the home feed: home / Shop → search again (seen
+   * products stay deduplicated by ID), search page → type, grid → pick, product → copy.
+   * `wait` when the screen is not recognisable yet (splash).
+   */
+  function relocate(page: Page | 'uncertain', home: boolean, shareOpen: boolean): Goal | 'wait' | undefined {
+    const searching = goal === 'reach_search' || goal === 'type' || goal === 'results'
+    if (home || page === 'shop_home') {
+      newPage()
+      scrolls = 0
+      typed = 0
+      card = undefined
+      videoBacks = 0
+      return 'reach_search'
+    }
+    if (page === 'search_input') {
+      typed = 0
+      return 'type'
+    }
+    // Before the search was submitted, other screens are handled by the current step.
+    if (searching)
+      return page === 'uncertain' || page === 'other' ? 'wait' : undefined
+    // A video opened from a product or card (not the home feed): back out to the grid.
+    if (page === 'video_feed' || page === 'live_room')
+      return 'return'
+    if (page === 'results_grid')
+      return goal === 'return' ? 'return' : 'pick'
+    if (page === 'product_detail' || shareOpen)
+      return goal === 'copy' ? 'copy' : 'open_share'
+    return page === 'uncertain' || page === 'other' ? 'wait' : undefined
   }
 
   /** Picks the next qualifying card on the grid, scrolling when the visible ones are used up. */
@@ -622,7 +843,9 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       shareWaits = 0
       if (located(undefined, view.box, `${view.position}_card`)) {
         setGoal('open_share')
-        if (!(await rt.tap(obs, jevBoxCenter(view.box.box), `${view.position} card`)))
+        if (await rt.tap(obs, jevBoxCenter(view.box.box), `${view.position} card`))
+          cardJustTapped = true
+        else
           setGoal('pick')
         return
       }

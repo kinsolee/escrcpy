@@ -217,20 +217,32 @@ export interface VisualRiskResult {
   /** True when the probability exceeds the threshold: refuse the tap. */
   risky: boolean
   probability: number
+  /** Answer to the optional `confirm` question (asked on the same crop, same request). */
+  confirmed?: number
   rect: TapCrop['rect']
   jev: VisualCallInfo
 }
 
 /**
  * Asks Jev whether the control under `ratio` (marked with a red ring on a crop
- * of the raw screencap) is a social / purchase action. Throws when the crop or
- * the request fails; callers decide how to treat an unverifiable tap.
+ * of the raw screencap) is a social / purchase action. With `confirm`, the
+ * same request also asks whether the ringed control is the intended one (the
+ * question must refer to the crop as \`crop\`). Throws when the crop or the
+ * request fails; callers decide how to treat an unverifiable tap.
  */
-export async function visualRiskCheck(options: { png: Buffer, ratio: RatioPoint, jev: JevClient, threshold?: number, signal?: AbortSignal }): Promise<VisualRiskResult> {
+export async function visualRiskCheck(options: { png: Buffer, ratio: RatioPoint, jev: JevClient, threshold?: number, confirm?: JevNoulQuestion, signal?: AbortSignal }): Promise<VisualRiskResult> {
   const crop = cropAroundPoint(options.png, options.ratio)
   if (!crop)
     throw new JevError('JEV_IMAGE_INVALID', 'screencap could not be decoded for the visual tap check')
-  const response = await options.jev.ask({ state: { crop: crop.image }, questions: { risky: VISUAL_RISK_QUESTION } }, { signal: options.signal })
-  const probability = response.answers.risky.noul
-  return { risky: probability > (options.threshold ?? VISUAL_RISK_THRESHOLD), probability, rect: crop.rect, jev: callInfo(response) }
+  const questions: Record<string, JevNoulQuestion> = { risky: VISUAL_RISK_QUESTION, ...(options.confirm ? { confirm: options.confirm } : {}) }
+  const response = await options.jev.ask({ state: { crop: crop.image }, questions }, { signal: options.signal })
+  const answers = response.answers as Record<string, { noul: number }>
+  const probability = answers.risky.noul
+  return {
+    risky: probability > (options.threshold ?? VISUAL_RISK_THRESHOLD),
+    probability,
+    ...(options.confirm ? { confirmed: answers.confirm.noul } : {}),
+    rect: crop.rect,
+    jev: callInfo(response),
+  }
 }

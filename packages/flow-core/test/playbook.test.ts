@@ -13,7 +13,19 @@ import type { JevAnswer, JevClient, JevImage, JevQuestions, PlaybookOptions, Vis
 
 type Page = 'video_feed' | 'shop_home' | 'search_input' | 'results_grid' | 'no_results' | 'product_detail' | 'live_room'
 
-interface Card { id: string, live?: boolean, video?: boolean, ad?: boolean, opensApp?: string, /** The tap does nothing (grid still loading). */ dead?: boolean }
+interface Card {
+  id: string
+  live?: boolean
+  video?: boolean
+  ad?: boolean
+  opensApp?: string
+  /** The tap does nothing (grid still loading). */
+  dead?: boolean
+  /** Opens as a video with the product in a half sheet (TikTok 46.5 DetailActivity). */
+  sheet?: boolean
+  /** A video card that still shows a price (so the playbook opens it). */
+  priced?: boolean
+}
 
 interface Box { top: number, bottom: number, left: number, right: number }
 
@@ -29,6 +41,21 @@ const BOXES: Record<string, Box> = {
   bottom_left_card: { top: 0.5, bottom: 0.8, left: 0.02, right: 0.48 },
   bottom_right_card: { top: 0.5, bottom: 0.8, left: 0.52, right: 0.98 },
 }
+/** Where the half sheet's icons really are (Pixel 5a, TikTok 46.5.3): Share ≈0.71, cart ≈0.825. */
+const SHEET_ICONS = {
+  share: { top: 0.285, bottom: 0.315, left: 0.69, right: 0.735 },
+  cart: { top: 0.285, bottom: 0.315, left: 0.8, right: 0.85 },
+}
+const SHARE_SHADE = 230
+const CART_SHADE = 250
+const ACTIVITY = {
+  home: 'com.ss.android.ugc.aweme.splash.SplashActivity',
+  detail: 'com.ss.android.ugc.aweme.detail.ui.DetailActivity',
+  search: 'com.ss.android.ugc.aweme.ecommerce.search.page.EcSearchActivity',
+  pdp: 'com.ss.android.ugc.aweme.ecommerce.base.pdp.sea.ui.SeaPdpActivity',
+  live: 'com.ss.android.ugc.aweme.live.LivePlayActivity',
+}
+const LAUNCHER = 'com.google.android.apps.nexuslauncher'
 const POSITIONS = ['top_left', 'top_right', 'bottom_left', 'bottom_right'] as const
 /** Grey level painted under each grid card, so a crop's ring centre tells which card a tap targets. */
 const CARD_SHADES = [60, 80, 100, 120]
@@ -44,6 +71,10 @@ interface WorldOptions {
   couponPopup?: boolean
   /** After a copy, Android's clipboard preview hides the bottom-left card's price (seen on device). */
   clipboardOverlay?: boolean
+  /** Physical half-sheet icons (default SHEET_ICONS). */
+  sheetIcons?: { share: Box, cart: Box }
+  /** `am force-stop` right after the nth tap of this kind. */
+  forceStopAfter?: { tap: 'card' | 'share', nth: number }
 }
 
 function world(options: WorldOptions) {
@@ -59,6 +90,31 @@ function world(options: WorldOptions) {
     current: undefined as Card | undefined,
     popupShown: false,
     overlay: false,
+    sheet: false,
+    /** On a video reached by BACK from a product (DetailActivity), not the home feed. */
+    fromProduct: false,
+  }
+  const sheetIcons = options.sheetIcons ?? SHEET_ICONS
+  /** Page at every BACK, and how often BACK hit the home feed / the sheet's cart was tapped. */
+  const backs: string[] = []
+  const counts = { homeBacks: 0, cartTaps: 0, card: 0, share: 0 }
+  const isHomeFeed = () => state.app === TIKTOK_PACKAGE && state.page === 'video_feed' && !state.fromCard && !state.fromProduct
+  const activity = () => {
+    if (state.app !== TIKTOK_PACKAGE)
+      return `${state.app}.Main`
+    switch (state.page) {
+      case 'video_feed': return isHomeFeed() ? ACTIVITY.home : ACTIVITY.detail
+      case 'shop_home': return ACTIVITY.home
+      case 'product_detail': return state.sheet ? ACTIVITY.detail : ACTIVITY.pdp
+      case 'live_room': return ACTIVITY.live
+      default: return ACTIVITY.search
+    }
+  }
+  const forceStop = () => Object.assign(state, { app: LAUNCHER, page: 'video_feed', fromCard: false, fromProduct: false, popup: false, share: false, sheet: false, scroll: 0 })
+  const fault = (kind: 'card' | 'share') => {
+    counts[kind]++
+    if (options.forceStopAfter?.tap === kind && options.forceStopAfter.nth === counts[kind])
+      forceStop()
   }
   const taps: RatioPoint[] = []
   const typed: string[] = []
@@ -74,12 +130,18 @@ function world(options: WorldOptions) {
           data.fill(CARD_SHADES[index], (y * W + Math.round(box.left * W)) * 3, (y * W + Math.round(box.right * W)) * 3)
       })
     }
+    if (state.page === 'product_detail' && state.sheet) {
+      for (const [box, shade] of [[sheetIcons.share, SHARE_SHADE], [sheetIcons.cart, CART_SHADE]] as const) {
+        for (let y = Math.round(box.top * H); y < Math.round(box.bottom * H); y++)
+          data.fill(shade, (y * W + Math.round(box.left * W)) * 3, (y * W + Math.round(box.right * W)) * 3)
+      }
+    }
     return encodePng({ width: W, height: H, data })
   }
 
   const device: VisionAgentDevice = {
     screencap: async () => screen(),
-    foregroundApp: async (): Promise<ForegroundApp> => ({ package: state.app, activity: `${state.app}.Main` }),
+    foregroundApp: async (): Promise<ForegroundApp> => ({ package: state.app, activity: activity() }),
     tap: async (_serial, point) => {
       taps.push(point)
       if (state.app !== TIKTOK_PACKAGE)
@@ -112,14 +174,25 @@ function world(options: WorldOptions) {
         }
         state.page = card.live ? 'live_room' : card.video ? 'video_feed' : 'product_detail'
         state.fromCard = state.page === 'video_feed'
+        state.sheet = !!card.sheet
+        fault('card')
       }
       else if (state.page === 'product_detail' && state.share && inside(point, BOXES.copy_link)) {
         state.clipboard = `https://vt.tiktok.com/ZS${state.current!.id}x/`
         state.overlay = !!options.clipboardOverlay
         state.share = false
       }
+      else if (state.page === 'product_detail' && state.sheet && !state.share) {
+        if (inside(point, sheetIcons.cart))
+          counts.cartTaps++
+        if (inside(point, sheetIcons.share)) {
+          state.share = true
+          fault('share')
+        }
+      }
       else if (state.page === 'product_detail' && !state.share && inside(point, BOXES.share_icon)) {
         state.share = true
+        fault('share')
       }
     },
     longPress: async () => {},
@@ -140,12 +213,21 @@ function world(options: WorldOptions) {
         return submit()
       if (key !== 'BACK')
         return
+      backs.push(state.app === TIKTOK_PACKAGE ? state.page : state.app)
+      if (isHomeFeed()) {
+        // One BACK from the home feed leaves TikTok.
+        counts.homeBacks++
+        state.app = LAUNCHER
+        return
+      }
       if (state.share)
         state.share = false
       else if (state.popup)
         state.popup = false
-      else if (state.page === 'product_detail' || state.page === 'live_room' || (state.page === 'video_feed' && state.fromCard))
-        Object.assign(state, { page: 'results_grid', fromCard: false })
+      else if (state.page === 'product_detail' && state.sheet)
+        Object.assign(state, { page: 'video_feed', sheet: false, fromProduct: true })
+      else if (state.page === 'product_detail' || state.page === 'live_room' || (state.page === 'video_feed' && (state.fromCard || state.fromProduct)))
+        Object.assign(state, { page: 'results_grid', fromCard: false, fromProduct: false })
       else if (state.page === 'results_grid' || state.page === 'no_results')
         state.page = 'search_input'
       else if (state.page === 'search_input')
@@ -155,7 +237,7 @@ function world(options: WorldOptions) {
     },
     startApp: async (_serial, pkg, opts) => {
       starts.push({ pkg, restart: opts?.restart })
-      Object.assign(state, { app: pkg, page: 'video_feed', fromCard: false, popup: false, share: false, scroll: 0 })
+      Object.assign(state, { app: pkg, page: 'video_feed', fromCard: false, fromProduct: false, popup: false, share: false, sheet: false, scroll: 0 })
     },
     readClipboard: async () => state.clipboard,
     writeClipboard: async (_serial, text) => {
@@ -177,7 +259,7 @@ function world(options: WorldOptions) {
     }
   }
 
-  return { state, device, taps, typed, starts, visible }
+  return { state, device, taps, typed, starts, visible, backs, counts }
 }
 
 type World = ReturnType<typeof world>
@@ -228,7 +310,11 @@ function fakeJev(w: World, options: JevOptions = {}) {
       const noul = (value: number): JevAnswer => ({ type: 'noul', noul: value })
       for (const [name, question] of Object.entries(questions)) {
         if (name === 'risky') {
-          answers[name] = noul(options.riskByShade?.[ringCentreShade(state.crop)] ?? 0.05)
+          answers[name] = noul({ [CART_SHADE]: 0.97, ...options.riskByShade }[ringCentreShade(state.crop)] ?? 0.05)
+          continue
+        }
+        if (name === 'confirm') {
+          answers[name] = noul(ringCentreShade(state.crop) === SHARE_SHADE ? 0.95 : 0.05)
           continue
         }
         if (question.type === 'choice') {
@@ -238,7 +324,8 @@ function fakeJev(w: World, options: JevOptions = {}) {
           continue
         }
         if (question.type === 'box') {
-          answers[name] = { type: 'box', box: options.boxes?.[name] ?? BOXES[name] ?? { top: 0.4, bottom: 0.6, left: 0.4, right: 0.6 }, confidence: options.boxConfidence?.[name] ?? 0.9 }
+          const sheetBox = name === 'sheet_share_icon' ? SHEET_ICONS.share : name === 'sheet_cart_icon' ? SHEET_ICONS.cart : undefined
+          answers[name] = { type: 'box', box: options.boxes?.[name] ?? sheetBox ?? BOXES[name] ?? { top: 0.4, bottom: 0.6, left: 0.4, right: 0.6 }, confidence: options.boxConfidence?.[name] ?? 0.9 }
           continue
         }
         const card = (position: string) => w.visible()[POSITIONS.indexOf(position as typeof POSITIONS[number])]
@@ -251,7 +338,7 @@ function fakeJev(w: World, options: JevOptions = {}) {
             continue
           }
           // A "video" card here is a video post: no price, no sold count.
-          answers[name] = noul(flag === 'price' || flag === 'sold' ? (c && !c.video ? 0.95 : 0.03) : c?.[flag as 'live' | 'ad'] ? 0.93 : 0.04)
+          answers[name] = noul(flag === 'price' || flag === 'sold' ? (c && (!c.video || c.priced) ? 0.95 : 0.03) : c?.[flag as 'live' | 'ad'] ? 0.93 : 0.04)
           continue
         }
         const table: Record<string, number> = {
@@ -261,6 +348,8 @@ function fakeJev(w: World, options: JevOptions = {}) {
           field_has_keyword: s.field === state.keyword ? 0.95 : 0.03,
           relevant: 0.9,
           error_screen: 0.02,
+          home_feed: s.app === TIKTOK_PACKAGE && s.page === 'video_feed' && !s.fromCard && !s.fromProduct ? 0.97 : 0.02,
+          product_sheet: s.page === 'product_detail' && s.sheet ? 0.9 : 0.03,
         }
         answers[name] = noul(table[name] ?? (name.endsWith('_present') ? 0.95 : 0.1))
       }
@@ -397,6 +486,84 @@ describe('tiktok-shop-links playbook', () => {
     const result = await runTikTok(options(w, jev))
     expect(result.success).toBe(true)
     expect((result.result as any).items.map((item: any) => item.position)).toEqual(['top_left', 'top_right', 'bottom_left'])
+  })
+
+  it('taps the Share icon of the video + product half sheet (DetailActivity) without a takeover', async () => {
+    const w = world({ grid: [{ id: '1737660200969930116', sheet: true }, { id: '1730001002' }] })
+    const { jev } = fakeJev(w)
+    const model = fakeModel([])
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'massageador tens', count: 2 }, fallback: { client: model.client } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    expect(model.calls).toHaveLength(0)
+    expect((result.result as any).items.map((item: any) => [item.productId, item.sheet ?? false])).toEqual([['1737660200969930116', true], ['1730001002', false]])
+    expect(w.counts.cartTaps).toBe(0)
+    expect(w.counts.homeBacks).toBe(0)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const sheetTap = report.stepLog.flatMap((step: any) => step.actions).find((action: any) => action.target === 'sheet Share icon')
+    // The visual check runs on the sheet even though nothing is unlabeled, and confirms the Share arrow.
+    expect(sheetTap).toMatchObject({ visualCheck: { confirmed: 0.95, reason: 'required for this target' } })
+    expect(sheetTap.blocked).toBeUndefined()
+    expect(report.stepLog.some((step: any) => /half sheet/.test(step.decision ?? ''))).toBe(true)
+    // The PDP top-bar Share rule was not used on the sheet.
+    expect(report.stepLog.flatMap((step: any) => step.actions).filter((action: any) => action.target === 'Share icon')).toHaveLength(1)
+  })
+
+  it('refuses a sheet Share box that lands on the cart and taps the icon to its left', async () => {
+    // Jev's Share box sits on the cart and its cart box is unusable: the cart tap is refused by the
+    // visual check (p=0.97) and the playbook moves one icon left, onto Share.
+    const w = world({ grid: [{ id: '1730001101', sheet: true }], sheetIcons: { share: { top: 0.285, bottom: 0.315, left: 0.62, right: 0.7 }, cart: { top: 0.285, bottom: 0.315, left: 0.74, right: 0.86 } } })
+    const { jev } = fakeJev(w, { boxes: { sheet_share_icon: { top: 0.285, bottom: 0.315, left: 0.77, right: 0.79 } }, boxConfidence: { sheet_cart_icon: 0.05 } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    expect(result.visualGuardBlocks).toBe(1)
+    expect(w.counts.cartTaps).toBe(0)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const sheetTaps = report.stepLog.flatMap((step: any) => step.actions).filter((action: any) => action.target === 'sheet Share icon')
+    expect(sheetTaps[0]).toMatchObject({ ratio: { x: 0.78 }, blocked: expect.stringMatching(/social \/ purchase/) })
+    expect(sheetTaps[1].ratio.x).toBeCloseTo(0.67, 2)
+    expect(sheetTaps[1].blocked).toBeUndefined()
+  })
+
+  it('after a force-stop on the product page, searches again from the home feed without BACK or a takeover', async () => {
+    const w = world({ grid: products('1730001201', '1730001202', '1730001203', '1730001204'), forceStopAfter: { tap: 'share', nth: 2 } })
+    const { jev } = fakeJev(w)
+    const model = fakeModel([])
+    const result = await runTikTok(options(w, jev, { fallback: { client: model.client } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    expect(w.counts.homeBacks).toBe(0)
+    // No BACK at all on any video page: the home feed is re-located, not backed out of.
+    expect(w.backs.filter(page => page === 'video_feed')).toEqual([])
+    const res = result.result as any
+    expect(res.productIds).toEqual(['1730001201', '1730001202', '1730001203'])
+    expect(res).toMatchObject({ researched: true, searchEpochs: 2 })
+    expect(res.items.map((item: any) => item.searchEpoch)).toEqual([1, 2, 2])
+    expect(res.duplicates).toEqual(['1730001201'])
+    expect(w.starts).toEqual([{ pkg: TIKTOK_PACKAGE, restart: true }, { pkg: TIKTOK_PACKAGE, restart: undefined }])
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    expect(report.stepLog.some((step: any) => /TikTok was relaunched: re-locate to reach_search/.test(step.decision ?? ''))).toBe(true)
+  })
+
+  it('after a force-stop right after a card tap, also searches again without BACK', async () => {
+    const w = world({ grid: products('1730001301', '1730001302', '1730001303'), forceStopAfter: { tap: 'card', nth: 2 } })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2 } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    expect(w.counts.homeBacks).toBe(0)
+    expect(result.result).toMatchObject({ productIds: ['1730001301', '1730001302'], researched: true, searchEpochs: 2 })
+  })
+
+  it('skips a card that opened a video with exactly one BACK', async () => {
+    const w = world({ grid: [{ id: '1730001401', video: true, priced: true }, { id: '1730001402' }] })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(w.backs.filter(page => page === 'video_feed')).toHaveLength(1)
+    expect(w.counts.homeBacks).toBe(0)
+    expect(result.result).toMatchObject({ researched: false, searchEpochs: 1 })
   })
 
   it('does not count a product it already copied', async () => {

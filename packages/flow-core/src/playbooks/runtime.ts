@@ -6,7 +6,7 @@ import type { DeviceLease, ForegroundApp, RatioPoint, UiTree } from '@escrcpy/fl
 import type { z } from 'zod'
 import { HealError } from '../heal.js'
 import { summarizeJevAnswer } from '../jev.js'
-import type { JevAnswers, JevClient, JevQuestions, JevUsage } from '../jev.js'
+import type { JevAnswers, JevClient, JevNoulQuestion, JevQuestions, JevUsage } from '../jev.js'
 import { encodeJevScreen, visualRiskCheck } from '../jev-vision.js'
 import type { JevScreen } from '../jev-vision.js'
 import { checkTapTarget, DEFAULT_FORBIDDEN_TEXTS, isBlackScreen, runVisionAgent } from '../vision-agent.js'
@@ -182,6 +182,14 @@ export interface Observation<Q extends JevQuestions> {
   answers: JevAnswers<Q>
 }
 
+export interface TapOptions {
+  settleMs?: number
+  /** `always`: run the Jev visual forbidden-control check even when the UI tree names the target. */
+  visualCheck?: 'auto' | 'always'
+  /** Also ask, on the same crop, whether the ringed control is the intended one (refer to it as \`crop\`); refuse below 0.5. Implies `visualCheck: 'always'`. */
+  confirm?: JevNoulQuestion
+}
+
 /** Judges a takeover on the next observation (may read the device, e.g. the clipboard). */
 export type TakeoverCheck = (obs: Observation<any>) => boolean | Promise<boolean>
 
@@ -238,10 +246,13 @@ export class PlaybookRuntime {
   private consecutiveFallbackFailures = 0
   private pendingFallback?: { step: PlaybookStepRecord, ok: boolean, expect: TakeoverCheck }
   private guardrailBlocks = 0
-  private visualGuardBlocks = 0
+  /** Taps refused by the Jev visual forbidden-control check. */
+  visualGuardBlocks = 0
   private unverifiedTaps = 0
   private recoveries = 0
   private coldRecoveries = 0
+  /** Every relaunch of the allowed app (cold-start bounces and recoveries). Playbooks compare it between observations to re-locate after one. */
+  relaunches = 0
   private inAppSeen = false
   private wakes = 0
   private current?: PlaybookStepRecord
@@ -443,6 +454,7 @@ export class PlaybookRuntime {
         throw new PlaybookStop('guardrail', `foreground left the allowed apps again (${app?.package ?? 'unknown'})`)
     }
     const pkg = this.allowed[0]
+    this.relaunches++
     step.actions.push({ type: 'recover', from: app?.package ?? 'unknown', package: pkg })
     await this.device.startApp(this.serial, pkg)
     await this.sleep(Math.max(this.settleMs, 2000))
@@ -574,7 +586,7 @@ export class PlaybookRuntime {
    * the target has no label — a Jev visual check of a crop around the point.
    * Returns false when the tap was refused.
    */
-  async tap(obs: Observation<any>, ratio: RatioPoint, target: string, options: { settleMs?: number } = {}): Promise<boolean> {
+  async tap(obs: Observation<any>, ratio: RatioPoint, target: string, options: TapOptions = {}): Promise<boolean> {
     this.checkBudget()
     const entry = this.action({ type: 'tap', target, ratio: { x: Math.round(ratio.x * 1000) / 1000, y: Math.round(ratio.y * 1000) / 1000 } })
     const app = await this.stableForeground()
@@ -593,25 +605,40 @@ export class PlaybookRuntime {
     }
     if (check.labels.length)
       entry.labels = check.labels.slice(0, 6)
-    if (check.verdict === 'unverified' || check.unlabeled) {
+    const always = options.visualCheck === 'always' || !!options.confirm
+    if (always || check.verdict === 'unverified' || check.unlabeled) {
       try {
-        const risk = await visualRiskCheck({ png: obs.screen.png, ratio, jev: this.jev, threshold: this.thresholds.visualRisk, signal: this.signal })
+        const risk = await visualRiskCheck({ png: obs.screen.png, ratio, jev: this.jev, threshold: this.thresholds.visualRisk, confirm: options.confirm, signal: this.signal })
         this.jevLatencies.push(risk.jev.latencyMs)
         if (risk.jev.usage) {
           this.jevTokens.input += risk.jev.usage.inputTokens
           this.jevTokens.output += risk.jev.usage.outputTokens
         }
-        entry.visualCheck = { probability: Math.round(risk.probability * 1000) / 1000, latencyMs: risk.jev.latencyMs, reason: check.verdict === 'unverified' ? 'no UI tree' : 'unlabeled target' }
+        entry.visualCheck = {
+          probability: Math.round(risk.probability * 1000) / 1000,
+          ...(risk.confirmed !== undefined ? { confirmed: Math.round(risk.confirmed * 1000) / 1000 } : {}),
+          latencyMs: risk.jev.latencyMs,
+          reason: always ? 'required for this target' : check.verdict === 'unverified' ? 'no UI tree' : 'unlabeled target',
+        }
         if (risk.risky) {
           this.visualGuardBlocks++
           this.guardrailBlocks++
           entry.blocked = `visual check: the control looks like a social / purchase action (p=${risk.probability.toFixed(2)})`
           return false
         }
+        if (risk.confirmed !== undefined && risk.confirmed < 0.5) {
+          entry.blocked = `visual check: the ringed control is not the intended ${target} (p=${risk.confirmed.toFixed(2)})`
+          return false
+        }
       }
       catch (error) {
         this.unverifiedTaps++
         entry.visualCheck = { error: (error as Error).message }
+        // A required check that cannot run fails closed.
+        if (always) {
+          entry.blocked = 'required visual check could not run; tap not executed'
+          return false
+        }
       }
     }
     const started = this.now()
@@ -621,11 +648,25 @@ export class PlaybookRuntime {
     return true
   }
 
-  async key(key: 'BACK' | 'HOME' | 'ENTER', reason?: string): Promise<void> {
+  /**
+   * Sends a key. With `guard`, the live foreground is checked first (it must be an allowed app,
+   * and the guard may refuse it, e.g. a launcher-level activity where BACK would leave the app);
+   * returns false when the key was not sent.
+   */
+  async key(key: 'BACK' | 'HOME' | 'ENTER', reason?: string, options: { guard?: (app: ForegroundApp) => string | undefined } = {}): Promise<boolean> {
     this.checkBudget()
-    this.action({ type: 'key', key, ...(reason ? { reason } : {}) })
+    const entry = this.action({ type: 'key', key, ...(reason ? { reason } : {}) })
+    if (options.guard) {
+      const app = await this.stableForeground()
+      const refusal = !app || !this.isAllowed(app) ? `foreground ${app?.package ?? 'unknown'} is not allowed` : options.guard(app)
+      if (refusal) {
+        entry.blocked = `${key} not sent: ${refusal}`
+        return false
+      }
+    }
     await this.device.key(this.serial, key)
     await this.sleep(this.settleMs)
+    return true
   }
 
   async inputText(text: string): Promise<void> {
