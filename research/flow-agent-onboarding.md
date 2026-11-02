@@ -88,3 +88,16 @@ Claude Desktop / Cursor 等客户端的 `mcpServers` 字段格式相同。
 - **多设备必须显式指定**：连了多台又不传 `serial` / `device_select`，调用会直接报错。
 - **`input_text` 原样保留**：录制时输入的用户文本是编译器参数化的依据，不要改写大小写 / 空格。
 - **`shell_exec` 受安全策略限制**：危险命令会被拒绝；它也不在租约管辖内，别用它绕过设备占用。
+
+## 7. 视觉 agent 模式（不录制、不回放）
+
+UI 树几乎为空的界面（TikTok 搜索结果网格、Shop 首页、领券弹窗）录制回放只能盲点坐标。视觉 agent 让模型每步看截图直接操作，不产出脚本；安全护栏由 runner 强制执行，不靠模型自觉。
+
+- **入口**：MCP 工具 `vision_agent_run`（`serial` 必填）；CLI `flow agent --serial <s> --goal <text> --json`；库 `runVisionAgent(options)`（`@escrcpy/flow-core`）。
+- **每步**：截图（长边 1280，JPEG；无 sharp 时纯 JS 缩放成 PNG）+ 前台包名 / Activity + 2 s 内拿得到的精简元素列表 + 最近动作历史 → 模型返回一个 JSON 动作 → runner 执行并写 `report.json` 和逐步截图。
+- **动作空间**：`tap{x,y|element}`（0–1000 归一化坐标）、`long_press`、`swipe`、`scroll{direction}`、`input_text`、`key{back|home|enter}`、`wait`、`read_clipboard`、`done{success,result,reason}`、`fail`。没有 shell / open_url / app_install / app_uninstall / app_stop。
+- **护栏**：前台不在 `allowed_packages` 时不执行模型动作，自动拉起第一个允许的包一次，再越界就以 `guardrail` 结束；点击前把落点解析到 UI 元素（含祖先可点击节点、按钮大小的可点击容器的子节点），命中禁用词（Like/Follow/Add to cart/Buy now/Claim/Message…，含中、葡、西语）就拒绝并告诉模型；拿不到 UI 树时照常点击但记 `unverifiedTap`；`maxSteps` / `timeBudgetMs` / `maxModelCalls` 是硬上限；连续 3 次动作后画面不变判为 `stuck`；屏幕息屏（截图全黑）时自动 WAKEUP。
+- **结果**：`{status, success, result, reason, steps, modelCalls, tokens, clipboardReads, guardrailBlocks, unverifiedTaps, reportPath}`。`clipboardReads` 是模型声称的链接的证据——调用方应校验 `result` 里的每条链接都出现在其中。
+- **模型**：`model` / `--model` 取 `llm.json` 的 `vendor::model`（模型不必在 vendor 的列表里）；缺省用 `active`；都没有时用 `FLOW_LLM_*` 环境变量。vendor 可写 `"apiKeyEnv": "ENV_NAME"`，key 从环境读取，不落盘。
+- **长任务**：一次运行通常几分钟。MCP 客户端要调大请求超时，或传 `progressToken` 接收每步进度通知；取消请求会中止运行并释放租约。
+- **租约**：运行期间持有设备租约；同一进程事先 `device_claim` 过的租约会被复用并保留，不会被释放。
