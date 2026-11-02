@@ -263,7 +263,17 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   let actions = 0
   let typed = 0
   let popupCloses = 0
-  let cursor = 0
+  /**
+   * Per scroll page: positions that showed a price (and no LIVE badge) on any observation, and
+   * positions already opened. Sticky because overlays come and go: after Copy link, Android's
+   * clipboard preview sits over the bottom-left card and hides its price on the next look.
+   */
+  const pageQualified = new Set<CardPosition>()
+  const opened = new Set<CardPosition>()
+  const newPage = () => {
+    pageQualified.clear()
+    opened.clear()
+  }
   let scrolls = 0
   let backs = 0
   let card: { position: CardPosition, ad: boolean, sold: boolean, relevance?: number } | undefined
@@ -465,7 +475,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           if (page === 'video_feed' && backs > 2) {
             rt.decide('back at the feed: search again')
             setGoal('reach_search')
-            cursor = 0
+            newPage()
             scrolls = 0
             typed = 0
             break
@@ -475,7 +485,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         }
         if (page === 'search_input') {
           rt.decide('back at the search page: search again (seen products are skipped by ID)')
-          cursor = 0
+          newPage()
           scrolls = 0
           typed = 0
           setGoal('type')
@@ -484,7 +494,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         }
         if (page === 'shop_home') {
           setGoal('reach_search')
-          cursor = 0
+          newPage()
           scrolls = 0
           typed = 0
           break
@@ -562,7 +572,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         }
         if (page === 'results_grid') {
           // The card tap did not open anything. This observation carried product-page questions,
-          // not card questions: pick the next card on the next observation (cursor already moved).
+          // not card questions: pick the next card on the next observation (this one counts as opened).
           rt.decide('still on the grid after the card tap; next card on the next observation')
           setGoal('pick')
           break
@@ -590,18 +600,23 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     for (const [right, left] of [[1, 0], [3, 2]] as const) {
       const view = cards[right]
       const partner = cards[left]
-      if (view.product < 0.5 || located(undefined, view.box, `${view.position}_card`, true) || !located(undefined, partner.box, `${partner.position}_card`, true))
+      if ((view.product < 0.5 && !pageQualified.has(view.position)) || located(undefined, view.box, `${view.position}_card`, true) || !located(undefined, partner.box, `${partner.position}_card`, true))
         continue
       const { top, bottom, left: l, right: r } = partner.box.box
       view.box = { type: 'box', box: { top, bottom, left: 1 - r, right: 1 - l }, confidence: partner.box.confidence }
       rt.decide(`${view.position} box mirrored from ${partner.position}`)
     }
     // A product card is a card with a visible price and no LIVE badge (optionally no Ad label).
-    const qualified = cards.filter(view => view.product >= 0.5 && view.live < 0.5 && (!params.skipAds || view.ad < 0.5))
+    for (const view of cards) {
+      if (view.product >= 0.5 && view.live < 0.5 && (!params.skipAds || view.ad < 0.5))
+        pageQualified.add(view.position)
+    }
+    const qualified = cards.filter(view => pageQualified.has(view.position) && view.live < 0.5)
     const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : 'ad'})`)
-    rt.decide(`cards: ${qualified.map(view => view.position).join(', ') || 'none'} qualify${skipped.length ? `; skipped ${skipped.join(', ')}` : ''}; cursor ${cursor}`)
-    if (cursor < qualified.length) {
-      const view = qualified[cursor++]
+    rt.decide(`cards: ${qualified.map(view => view.position).join(', ') || 'none'} qualify${skipped.length ? `; skipped ${skipped.join(', ')}` : ''}; opened ${[...opened].join(', ') || 'none'}`)
+    const view = qualified.find(candidate => !opened.has(candidate.position))
+    if (view) {
+      opened.add(view.position)
       card = { position: view.position, ad: view.ad >= 0.5, sold: view.sold >= 0.5 }
       shareTaps = 0
       shareWaits = 0
@@ -629,7 +644,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     const bottomTop = cards[2].product >= 0.5 && located(undefined, cards[2].box, 'bottom_left_card', true) ? cards[2].box.box.top : undefined
     const distance = bottomTop === undefined ? 0.45 : Math.min(0.7, Math.max(0.25, bottomTop - 0.22))
     scrolls++
-    cursor = 0
+    newPage()
     await rt.swipe({ x: 0.5, y: 0.85 }, { x: 0.5, y: 0.85 - distance }, 900, `scroll ${scrolls}`)
   }
 }

@@ -42,6 +42,8 @@ interface WorldOptions {
   grid: Card[]
   noResults?: boolean
   couponPopup?: boolean
+  /** After a copy, Android's clipboard preview hides the bottom-left card's price (seen on device). */
+  clipboardOverlay?: boolean
 }
 
 function world(options: WorldOptions) {
@@ -56,6 +58,7 @@ function world(options: WorldOptions) {
     scroll: 0,
     current: undefined as Card | undefined,
     popupShown: false,
+    overlay: false,
   }
   const taps: RatioPoint[] = []
   const typed: string[] = []
@@ -112,6 +115,7 @@ function world(options: WorldOptions) {
       }
       else if (state.page === 'product_detail' && state.share && inside(point, BOXES.copy_link)) {
         state.clipboard = `https://vt.tiktok.com/ZS${state.current!.id}x/`
+        state.overlay = !!options.clipboardOverlay
         state.share = false
       }
       else if (state.page === 'product_detail' && !state.share && inside(point, BOXES.share_icon)) {
@@ -242,6 +246,10 @@ function fakeJev(w: World, options: JevOptions = {}) {
         if (cardMatch) {
           const c = s.page === 'results_grid' ? card(cardMatch[1]) : undefined
           const flag = cardMatch[2]
+          if (s.overlay && cardMatch[1] === 'bottom_left' && (flag === 'price' || flag === 'sold')) {
+            answers[name] = noul(0.04)
+            continue
+          }
           // A "video" card here is a video post: no price, no sold count.
           answers[name] = noul(flag === 'price' || flag === 'sold' ? (c && !c.video ? 0.95 : 0.03) : c?.[flag as 'live' | 'ad'] ? 0.93 : 0.04)
           continue
@@ -381,6 +389,14 @@ describe('tiktok-shop-links playbook', () => {
     const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
     expect(result.status).toBe('done')
     expect((result.result as any).items[0]).toMatchObject({ position: 'top_right', productId: '1730000902' })
+  })
+
+  it('keeps grid order when the clipboard preview hides the bottom-left price after a copy', async () => {
+    const w = world({ grid: products('1730000961', '1730000962', '1730000963', '1730000964'), clipboardOverlay: true })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev))
+    expect(result.success).toBe(true)
+    expect((result.result as any).items.map((item: any) => item.position)).toEqual(['top_left', 'top_right', 'bottom_left'])
   })
 
   it('does not count a product it already copied', async () => {
