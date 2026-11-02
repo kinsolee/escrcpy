@@ -73,6 +73,8 @@ interface WorldOptions {
   clipboardOverlay?: boolean
   /** Physical half-sheet icons (default SHEET_ICONS). */
   sheetIcons?: { share: Box, cart: Box }
+  /** Observations that show a blank, still-loading screen after each (re)launch. */
+  loadingScreens?: number
   /** `am force-stop` right after the nth tap of this kind. */
   forceStopAfter?: { tap: 'card' | 'share', nth: number }
 }
@@ -93,6 +95,9 @@ function world(options: WorldOptions) {
     sheet: false,
     /** On a video reached by BACK from a product (DetailActivity), not the home feed. */
     fromProduct: false,
+    loading: 0,
+    /** The last screenshot was a blank loading screen (Jev answers about it). */
+    loadingShown: false,
   }
   const sheetIcons = options.sheetIcons ?? SHEET_ICONS
   /** Page at every BACK, and how often BACK hit the home feed / the sheet's cart was tapped. */
@@ -140,7 +145,12 @@ function world(options: WorldOptions) {
   }
 
   const device: VisionAgentDevice = {
-    screencap: async () => screen(),
+    screencap: async () => {
+      state.loadingShown = state.app === TIKTOK_PACKAGE && state.loading > 0
+      if (state.loading > 0)
+        state.loading--
+      return screen()
+    },
     foregroundApp: async (): Promise<ForegroundApp> => ({ package: state.app, activity: activity() }),
     tap: async (_serial, point) => {
       taps.push(point)
@@ -237,7 +247,7 @@ function world(options: WorldOptions) {
     },
     startApp: async (_serial, pkg, opts) => {
       starts.push({ pkg, restart: opts?.restart })
-      Object.assign(state, { app: pkg, page: 'video_feed', fromCard: false, fromProduct: false, popup: false, share: false, sheet: false, scroll: 0 })
+      Object.assign(state, { app: pkg, page: 'video_feed', fromCard: false, fromProduct: false, popup: false, share: false, sheet: false, scroll: 0, loading: options.loadingScreens ?? 0 })
     },
     readClipboard: async () => state.clipboard,
     writeClipboard: async (_serial, text) => {
@@ -318,7 +328,7 @@ function fakeJev(w: World, options: JevOptions = {}) {
           continue
         }
         if (question.type === 'choice') {
-          const page = s.app === TIKTOK_PACKAGE ? s.page : 'other_app'
+          const page = s.app !== TIKTOK_PACKAGE ? 'other_app' : s.loadingShown ? 'other' : s.page
           const keys = Object.keys(question.criteria)
           answers[name] = { type: 'choice', choice: page, confidence: 0.95, probabilities: Object.fromEntries(keys.map(key => [key, key === page ? 0.96 : 0.04 / (keys.length - 1)])) }
           continue
@@ -350,6 +360,7 @@ function fakeJev(w: World, options: JevOptions = {}) {
           error_screen: 0.02,
           home_feed: s.app === TIKTOK_PACKAGE && s.page === 'video_feed' && !s.fromCard && !s.fromProduct ? 0.97 : 0.02,
           product_sheet: s.page === 'product_detail' && s.sheet ? 0.9 : 0.03,
+          loading: s.loadingShown ? 0.95 : 0.02,
         }
         answers[name] = noul(table[name] ?? (name.endsWith('_present') ? 0.95 : 0.1))
       }
@@ -564,6 +575,17 @@ describe('tiktok-shop-links playbook', () => {
     expect(w.backs.filter(page => page === 'video_feed')).toHaveLength(1)
     expect(w.counts.homeBacks).toBe(0)
     expect(result.result).toMatchObject({ researched: false, searchEpochs: 1 })
+  })
+
+  it('waits out the blank screen of a cold start instead of handing it to a takeover', async () => {
+    const w = world({ grid: products('1730001501'), loadingScreens: 2 })
+    const { jev } = fakeJev(w)
+    const model = fakeModel([])
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 }, fallback: { client: model.client } }))
+    expect(result.status).toBe('done')
+    expect(result.fallbacks).toBe(0)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    expect(report.stepLog.filter((step: any) => /still loading/.test(step.decision ?? ''))).toHaveLength(2)
   })
 
   it('does not count a product it already copied', async () => {

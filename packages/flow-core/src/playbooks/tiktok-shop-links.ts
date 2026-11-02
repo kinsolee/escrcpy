@@ -87,6 +87,12 @@ const BASE_QUESTIONS = {
   share_open: { type: 'noul', instructions: 'Is a share panel titled "Send to", with a Copy link button, open at the bottom of `screen`?' },
   no_results: { type: 'noul', instructions: 'Does `screen` show a message saying that no results were found for the search?' },
   popup_close: { type: 'box', instructions: 'the close button (an X) of the popup or dialog in `screen`' },
+  // A cold start shows a blank (black) screen for a few seconds: wait it out instead of counting a miss.
+  loading: {
+    type: 'noul',
+    instructions: 'Is `screen` blank or still loading: mostly empty or black, with no app content besides the status bar?',
+    criteria: { false: { what: 'The app shows content', examples: ['a video', 'a product grid', 'a search page'] } },
+  },
   // Pressing BACK here can leave TikTok, so code must know it: the Activity is the main signal, this the backup.
   home_feed: {
     type: 'noul',
@@ -381,6 +387,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   let cardJustTapped = false
   let lastRelaunches = rt.relaunches
   let relocateWaits = 0
+  let loadingWaits = 0
   let videoBacks = 0
   let takenLink: string | undefined
   const setGoal = (next: Goal) => {
@@ -489,6 +496,15 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         await rt.takeover('A popup or dialog covers the TikTok home screen. Close it with its close (X) button; never tap its action button (Claim, Buy, Follow, etc.) and do not press back.', o => !yes((o.answers as Answers).popup), 'popup on the home feed has no usable close button')
       continue
     }
+
+    if ((page === 'uncertain' || page === 'other') && a.loading.noul >= T.popup && loadingWaits < 4) {
+      loadingWaits++
+      rt.decide(`screen is blank / still loading (${a.loading.noul.toFixed(2)}); wait`)
+      await rt.sleep(1500)
+      continue
+    }
+    if (a.loading.noul < 0.5)
+      loadingWaits = 0
 
     // After a relaunch (TikTok restarted, e.g. force-stopped) the old step goal no longer applies,
     // and the home feed is never a place to press BACK: re-locate by what the screen shows.
