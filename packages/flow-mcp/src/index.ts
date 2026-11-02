@@ -670,6 +670,8 @@ function registerVisionAgentTool(flow: FlowMcpServer): void {
       model: z.string().optional().describe('vendor::model from the shared llm.json; default its active model'),
       run_dir: z.string().optional().describe('Directory for report.json and step screenshots; default ~/.escrcpy/flow/vision-runs/<serial>/<time>'),
       instructions: z.string().optional().describe('Extra guidance appended to the system prompt'),
+      max_foreground_recoveries: z.number().int().min(0).max(10).optional().describe('Relaunches after leaving allowed_packages (default 1; cold-start bounces before the first model call are free)'),
+      llm_timeout_ms: z.number().int().min(5000).max(300_000).optional().describe('Per-request model timeout, retried twice (default 60000)'),
       jev: z.boolean().optional().describe('Jev assist: visually refuse taps on unlabeled social/purchase controls and verify a successful done (links from the clipboard, final screen)'),
     },
   }, async (args, extra): Promise<ToolResponse> => {
@@ -694,6 +696,8 @@ function registerVisionAgentTool(flow: FlowMcpServer): void {
         launch: args.launch,
         instructions: args.instructions,
         ...(args.jev ? { jev: requireJevClient() } : {}),
+        ...(args.max_foreground_recoveries !== undefined ? { maxForegroundRecoveries: args.max_foreground_recoveries } : {}),
+        ...(args.llm_timeout_ms ? { llm: { timeoutMs: args.llm_timeout_ms } } : {}),
         endpoint,
         device: visionDeviceFromFlowDevice(context.device, context.adbx),
         lease: context.lease ?? createDeviceLease(),

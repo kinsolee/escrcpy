@@ -1,9 +1,10 @@
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import process from 'node:process'
+import { describe, expect, it, vi } from 'vitest'
 import { createDeviceLease } from '@escrcpy/flow-device'
-import { exportFlow, HELP, parseCliArgs, runCli, withDeviceLease } from '../src/index.js'
+import { cliErrorResult, exportFlow, HELP, parseCliArgs, runCli, withDeviceLease } from '../src/index.js'
 
 const trace = [
   {
@@ -189,6 +190,26 @@ steps:
     await expect(runCli(['see', '--serial', 'S1'])).rejects.toThrow(/exactly one of --locate/)
     await expect(runCli(['playbook', 'nope', '--serial', 'S1'])).rejects.toThrow(/unknown playbook "nope"; available: tiktok-shop-links/)
     await expect(runCli(['playbook', 'tiktok-shop-links'])).rejects.toThrow(/--serial/)
+  })
+
+  it('prints one JSON result on stdout with --json even when the run cannot start (busy device, bad args)', async () => {
+    expect(cliErrorResult(new Error('device busy: S1 is leased by flow-agent (pid 42); retry after release'))).toEqual({ status: 'busy', success: false, reason: 'device busy: S1 is leased by flow-agent (pid 42); retry after release' })
+    const written: string[] = []
+    const spy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+      written.push(String(chunk))
+      return true
+    })
+    const exitCode = process.exitCode
+    try {
+      await runCli(['playbook', 'tiktok-shop-links', '--json'])
+      expect(JSON.parse(written.join(''))).toMatchObject({ status: 'error', success: false, reason: expect.stringMatching(/--serial/) })
+      expect(process.exitCode).toBe(1)
+    }
+    finally {
+      spy.mockRestore()
+      process.exitCode = exitCode
+    }
+    expect(parseCliArgs(['agent', '--max-foreground-recoveries', '3', '--llm-timeout', '45000']).values).toMatchObject({ 'max-foreground-recoveries': '3', 'llm-timeout': '45000' })
   })
 
   it('exposes the heal command and options in help', () => {

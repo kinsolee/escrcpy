@@ -72,6 +72,10 @@ Agent options (flow agent):
   --forbid-text <text>          Extra label that must never be tapped (repeatable; defaults stay)
   --max-steps <n>               Step budget (default 30)
   --max-model-calls <n>         Model-call budget (default 2 x max-steps)
+  --max-foreground-recoveries <n>
+                                Relaunches after leaving the allowed app (default 1; relaunches
+                                before the first model call, i.e. cold-start bounces, are free)
+  --llm-timeout <ms>            Per-request model timeout, retried twice (default 60000)
   --time-budget <ms>            Wall-clock budget (default 600000)
   --observe <mode>              screenshot | screenshot+tree (default)
   --launch <mode>               if-needed (default) | restart | never, for the first allowed package
@@ -94,6 +98,7 @@ Playbook options (flow playbook tiktok-shop-links):
   --model <vendor::model>       Takeover model from llm.json (default: its active model)
   --no-fallback                 No vision-agent takeovers: an uncertain step fails the run
   --box-threshold <0..1>        Box confidence needed to tap (default 0.6)
+  --llm-timeout <ms>            Per-request timeout of the takeover model (default 60000)
   --launch <mode>               restart (default) | if-needed | never
   --max-steps / --time-budget / --run-dir   as for flow agent (defaults 60 / 360000 /
                                 ~/.escrcpy/flow/playbook-runs/<id>/<serial>/<time>)
@@ -183,6 +188,8 @@ interface CliValues {
   'skip-ads'?: boolean
   'no-fallback'?: boolean
   'box-threshold'?: string
+  'llm-timeout'?: string
+  'max-foreground-recoveries'?: string
 }
 
 export interface ParsedCliArgs {
@@ -245,6 +252,8 @@ const CLI_OPTIONS = {
   'skip-ads': { type: 'boolean' },
   'no-fallback': { type: 'boolean' },
   'box-threshold': { type: 'string' },
+  'llm-timeout': { type: 'string' },
+  'max-foreground-recoveries': { type: 'string' },
 } as const
 
 export function parseCliArgs(argv: string[] = process.argv.slice(2)): ParsedCliArgs {
@@ -623,6 +632,8 @@ async function agentCommand(values: CliValues): Promise<void> {
     forbiddenTexts: values['forbid-text'],
     maxSteps: optionalPositiveInt(values['max-steps'], '--max-steps'),
     maxModelCalls: optionalPositiveInt(values['max-model-calls'], '--max-model-calls'),
+    maxForegroundRecoveries: optionalPositiveInt(values['max-foreground-recoveries'], '--max-foreground-recoveries'),
+    ...(values['llm-timeout'] ? { llm: { timeoutMs: optionalPositiveInt(values['llm-timeout'], '--llm-timeout') } } : {}),
     timeBudgetMs: optionalPositiveInt(values['time-budget'], '--time-budget'),
     observe: values.observe as VisionObserveMode | undefined,
     launch: values.launch as 'if-needed' | 'restart' | 'never' | undefined,
@@ -736,7 +747,7 @@ async function playbookCommand(id: string | undefined, values: CliValues): Promi
   const boxThreshold = parseRatio(values['box-threshold'], '--box-threshold')
   const thresholds: Partial<PlaybookThresholds> = boxThreshold === undefined ? {} : { box: boxThreshold }
   const jev = requireJevClient()
-  const fallback = values['no-fallback'] ? false as const : { endpoint: requireLlmEndpoint(values.model) }
+  const fallback = values['no-fallback'] ? false as const : { endpoint: requireLlmEndpoint(values.model), ...(values['llm-timeout'] ? { llm: { timeoutMs: optionalPositiveInt(values['llm-timeout'], '--llm-timeout') } } : {}) }
   const adbx = adbBackend(values)
   const device = createFlowDevice({ adbx })
   const runDir = values['run-dir'] ?? join(process.env.FLOW_PLAYBOOK_RUNS_DIR ?? join(homedir(), '.escrcpy', 'flow', 'playbook-runs'), id, serial, new Date().toISOString().replace(/[:.]/g, '-'))
@@ -779,6 +790,12 @@ async function playbookCommand(id: string | undefined, values: CliValues): Promi
   process.stdout.write(values.json ? `${JSON.stringify(result)}\n` : `${JSON.stringify(result, null, 2)}\n`)
   if (!result.success)
     process.exitCode = 1
+}
+
+/** The --json result for a command that failed before producing its own: `busy` for a leased device. */
+export function cliErrorResult(error: unknown): { status: 'busy' | 'error', success: false, reason: string } {
+  const reason = error instanceof Error ? error.message : String(error)
+  return { status: reason.startsWith('device busy:') ? 'busy' : 'error', success: false, reason }
 }
 
 async function fleetCommand(manifestPath: string, values: CliValues): Promise<void> {
@@ -919,16 +936,22 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<vo
     await healCommand(positionals[1], values)
     return
   }
-  if (command === 'agent') {
-    await agentCommand(values)
-    return
-  }
-  if (command === 'see') {
-    await seeCommand(values)
-    return
-  }
-  if (command === 'playbook') {
-    await playbookCommand(positionals[1], values)
+  if (command === 'agent' || command === 'see' || command === 'playbook') {
+    try {
+      if (command === 'agent')
+        await agentCommand(values)
+      else if (command === 'see')
+        await seeCommand(values)
+      else
+        await playbookCommand(positionals[1], values)
+    }
+    catch (error) {
+      // With --json, stdout always carries one JSON result, also when the run never started.
+      if (!values.json)
+        throw error
+      process.stdout.write(`${JSON.stringify(cliErrorResult(error))}\n`)
+      process.exitCode = 1
+    }
     return
   }
   if (command === 'fleet') {

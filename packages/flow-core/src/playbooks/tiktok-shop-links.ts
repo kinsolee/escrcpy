@@ -8,8 +8,8 @@ import type { Observation, PlaybookDefinition, PlaybookOutcome, PlaybookRuntime 
  *
  * Code owns the flow; every observation is one Jev request that judges the
  * page type, popups, the share panel, "no results", and locates the controls
- * the current step may need. Cards are judged one position at a time (product?
- * LIVE? video? ad?) and code picks the next qualifying one; product IDs come
+ * the current step may need. Cards are judged one position at a time (price?
+ * sold count? LIVE badge? Ad label?) and code picks the next card with a price and no LIVE badge; product IDs come
  * from the copied link and are compared in code. When Jev is unsure or the
  * screen is unexpected, only that step goes to the vision agent.
  */
@@ -34,6 +34,8 @@ export interface TiktokShopLinkItem {
   finalUrl?: string
   position: CardPosition
   ad: boolean
+  /** The grid card showed a sold count (recorded, not required: the bottom row's count is often cut off). */
+  sold?: boolean
   /** Jev Noul on the product page: is the product the kind of thing `keyword` names. */
   relevance?: number
 }
@@ -109,12 +111,19 @@ const POSITION_WORDS: Record<CardPosition, string> = {
 function cardQuestions(): JevQuestions {
   const questions: JevQuestions = {}
   for (const position of CARD_POSITIONS) {
-    const where = `the ${POSITION_WORDS[position]} position of the results grid in \`screen\``
-    questions[`${position}_product`] = { type: 'noul', instructions: `Is there a product card (a product photo with a title and a price) in ${where}?` }
-    questions[`${position}_live`] = { type: 'noul', instructions: `Is the card in ${where} marked LIVE?` }
-    questions[`${position}_video`] = { type: 'noul', instructions: `Is the card in ${where} a video (with a play icon or a video duration) rather than a product?` }
-    questions[`${position}_ad`] = { type: 'noul', instructions: `Does the card in ${where} show an "Ad" or "Sponsored" label?` }
-    questions[`${position}_card`] = { type: 'box', instructions: `the card in ${where}` }
+    // What counts as a product card is decided in code from these literal facts (price, LIVE badge),
+    // never by asking "is this a product / a video": a product photo with a play icon is still a
+    // product, and the model judged those inconsistently (tk-shop-erp D2).
+    const where = `the ${POSITION_WORDS[position]} card of the product results grid in \`screen\``
+    questions[`${position}_price`] = { type: 'noul', instructions: `Does ${where} show a price, such as "R$ 17,99"?` }
+    questions[`${position}_sold`] = { type: 'noul', instructions: `Does ${where} show how many were sold, such as "2.4K sold" or "40.8K shop sales"?` }
+    questions[`${position}_live`] = {
+      type: 'noul',
+      instructions: `Does ${where} have a "LIVE" badge on its picture, showing a live stream?`,
+      criteria: { false: { what: 'No LIVE badge on the picture', examples: ['a play triangle icon on a product photo', 'a discount badge such as -43%', 'the LIVE filter chip above the grid'] } },
+    }
+    questions[`${position}_ad`] = { type: 'noul', instructions: `Does ${where} show an "Ad" or "Sponsored" label?` }
+    questions[`${position}_card`] = { type: 'box', instructions: where }
   }
   return questions
 }
@@ -201,9 +210,10 @@ type Answers = Record<string, any>
 
 interface CardView {
   position: CardPosition
+  /** Price visible: the card is a product (code's definition; LIVE cards are excluded separately). */
   product: number
+  sold: number
   live: number
-  video: number
   ad: number
   box: JevBoxAnswer
 }
@@ -256,7 +266,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   let cursor = 0
   let scrolls = 0
   let backs = 0
-  let card: { position: CardPosition, ad: boolean, relevance?: number } | undefined
+  let card: { position: CardPosition, ad: boolean, sold: boolean, relevance?: number } | undefined
   let takenLink: string | undefined
   const setGoal = (next: Goal) => {
     if (next !== goal) {
@@ -301,7 +311,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     }
     else {
       seen.add(key)
-      items.push({ link, ...(productId ? { productId } : {}), ...(finalUrl && finalUrl !== link ? { finalUrl } : {}), position: card?.position ?? 'top_left', ad: card?.ad ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}) })
+      items.push({ link, ...(productId ? { productId } : {}), ...(finalUrl && finalUrl !== link ? { finalUrl } : {}), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}) })
       rt.decide(`stored link ${items.length}/${params.count}: ${productId ?? link}`)
     }
     rt.partial = result()
@@ -569,9 +579,9 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   async function pick(obs: Observation<any>, a: Answers): Promise<void> {
     const cards: CardView[] = CARD_POSITIONS.map(position => ({
       position,
-      product: a[`${position}_product`].noul,
+      product: a[`${position}_price`].noul,
+      sold: a[`${position}_sold`].noul,
       live: a[`${position}_live`].noul,
-      video: a[`${position}_video`].noul,
       ad: a[`${position}_ad`].noul,
       box: a[`${position}_card`],
     }))
@@ -586,12 +596,13 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       view.box = { type: 'box', box: { top, bottom, left: 1 - r, right: 1 - l }, confidence: partner.box.confidence }
       rt.decide(`${view.position} box mirrored from ${partner.position}`)
     }
-    const qualified = cards.filter(view => view.product >= 0.5 && view.live < 0.5 && view.video < 0.5 && (!params.skipAds || view.ad < 0.5))
-    const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : view.video >= 0.5 ? 'video' : 'ad'})`)
+    // A product card is a card with a visible price and no LIVE badge (optionally no Ad label).
+    const qualified = cards.filter(view => view.product >= 0.5 && view.live < 0.5 && (!params.skipAds || view.ad < 0.5))
+    const skipped = cards.filter(view => view.product >= 0.5 && !qualified.includes(view)).map(view => `${view.position}(${view.live >= 0.5 ? 'LIVE' : 'ad'})`)
     rt.decide(`cards: ${qualified.map(view => view.position).join(', ') || 'none'} qualify${skipped.length ? `; skipped ${skipped.join(', ')}` : ''}; cursor ${cursor}`)
     if (cursor < qualified.length) {
       const view = qualified[cursor++]
-      card = { position: view.position, ad: view.ad >= 0.5 }
+      card = { position: view.position, ad: view.ad >= 0.5, sold: view.sold >= 0.5 }
       shareTaps = 0
       shareWaits = 0
       if (located(undefined, view.box, `${view.position}_card`)) {

@@ -1,5 +1,6 @@
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import process from 'node:process'
 import { encodeScreenshot, screenFingerprint, withLease, withTimeout } from '@escrcpy/flow-device'
 import type { DeviceLease, ForegroundApp, RatioPoint, UiTree } from '@escrcpy/flow-device'
 import type { z } from 'zod'
@@ -135,7 +136,12 @@ export type PlaybookEvent
     | { type: 'log', message: string }
     | { type: 'finish', result: PlaybookResult }
 
-export interface PlaybookReport extends PlaybookResult {
+export interface PlaybookReport extends Omit<PlaybookResult, 'status'> {
+  /** `running` until the run ends. A report still `running` (no `finishedAt`) whose `pid` is dead was killed. */
+  status: PlaybookStatus | 'running'
+  pid: number
+  /** Last time the report was written; a heartbeat for readers. */
+  updatedAt?: string
   version: 1
   kind: 'playbook'
   playbook: string
@@ -235,6 +241,8 @@ export class PlaybookRuntime {
   private visualGuardBlocks = 0
   private unverifiedTaps = 0
   private recoveries = 0
+  private coldRecoveries = 0
+  private inAppSeen = false
   private wakes = 0
   private current?: PlaybookStepRecord
 
@@ -275,6 +283,8 @@ export class PlaybookRuntime {
       options: { maxSteps: this.maxSteps, timeBudgetMs: this.deadline - this.started, settleMs: this.settleMs, treeTimeoutMs: this.treeTimeoutMs, launch: options.launch ?? 'restart', fallback: options.fallback ? { maxSteps: Math.min(MAX_FALLBACK_STEPS, options.fallback.maxSteps ?? MAX_FALLBACK_STEPS), maxTakeovers: options.fallback.maxTakeovers ?? 6 } : false },
       startedAt: new Date(this.started).toISOString(),
       ...this.snapshot('error', false, 'running'),
+      status: 'running',
+      pid: process.pid,
       stepLog: this.stepLog,
     }
   }
@@ -313,7 +323,7 @@ export class PlaybookRuntime {
   async persist(): Promise<void> {
     if (!this.reportPath)
       return
-    Object.assign(this.report, { ...this.snapshot(this.report.status, this.report.success, this.report.reason, this.report.result), status: this.report.status })
+    Object.assign(this.report, { ...this.snapshot('error', this.report.success, this.report.reason, this.report.result), status: this.report.status, updatedAt: new Date(this.now()).toISOString() })
     const tmp = `${this.reportPath}.tmp`
     await writeFile(tmp, this.redact(JSON.stringify(this.report, null, 2)), 'utf8')
     await rename(tmp, this.reportPath)
@@ -422,9 +432,16 @@ export class PlaybookRuntime {
 
   /** Brings the first allowed app back once; a second escape ends the run with `guardrail`. */
   private async recover(app: ForegroundApp | undefined, step: PlaybookStepRecord): Promise<void> {
-    this.recoveries++
-    if (this.recoveries > 1)
-      throw new PlaybookStop('guardrail', `foreground left the allowed apps again (${app?.package ?? 'unknown'})`)
+    // Cold start: until the app has been seen in front once, relaunches are free (up to 3);
+    // TikTok sometimes drops back to the launcher right after a restart.
+    if (!this.inAppSeen && this.coldRecoveries < 3) {
+      this.coldRecoveries++
+    }
+    else {
+      this.recoveries++
+      if (this.recoveries > 1)
+        throw new PlaybookStop('guardrail', `foreground left the allowed apps again (${app?.package ?? 'unknown'})`)
+    }
     const pkg = this.allowed[0]
     step.actions.push({ type: 'recover', from: app?.package ?? 'unknown', package: pkg })
     await this.device.startApp(this.serial, pkg)
@@ -521,6 +538,7 @@ export class PlaybookRuntime {
         await this.recover(app, step)
         continue
       }
+      this.inAppSeen = true
       const obs: Observation<Q> = { step, screen, app, tree: treeResult.tree, answers: response.answers as JevAnswers<Q> }
       if (this.pendingFallback) {
         const pending = this.pendingFallback

@@ -238,11 +238,12 @@ function fakeJev(w: World, options: JevOptions = {}) {
           continue
         }
         const card = (position: string) => w.visible()[POSITIONS.indexOf(position as typeof POSITIONS[number])]
-        const cardMatch = name.match(/^(top_left|top_right|bottom_left|bottom_right)_(product|live|video|ad)$/)
+        const cardMatch = name.match(/^(top_left|top_right|bottom_left|bottom_right)_(price|sold|live|ad)$/)
         if (cardMatch) {
           const c = s.page === 'results_grid' ? card(cardMatch[1]) : undefined
           const flag = cardMatch[2]
-          answers[name] = noul(flag === 'product' ? (c ? 0.95 : 0.03) : c?.[flag as 'live' | 'video' | 'ad'] ? 0.93 : 0.04)
+          // A "video" card here is a video post: no price, no sold count.
+          answers[name] = noul(flag === 'price' || flag === 'sold' ? (c && !c.video ? 0.95 : 0.03) : c?.[flag as 'live' | 'ad'] ? 0.93 : 0.04)
           continue
         }
         const table: Record<string, number> = {
@@ -424,6 +425,21 @@ describe('tiktok-shop-links playbook', () => {
     expect(result.reason).toMatch(/two takeovers in a row/)
     expect(result.fallbacks).toBe(2)
     expect(result.fallbackFailures).toBe(2)
+  })
+
+  it('relaunches TikTok again when a cold start drops back to the launcher, without using the recovery', async () => {
+    const w = world({ grid: products('1730000951') })
+    const startApp = w.device.startApp
+    let launches = 0
+    w.device.startApp = async (serial, pkg, opts) => {
+      await startApp(serial, pkg, opts)
+      if (++launches <= 2)
+        w.state.app = 'com.google.android.apps.nexuslauncher'
+    }
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(launches).toBe(3)
   })
 
   it('stops with guardrail when a tap keeps leaving TikTok', async () => {

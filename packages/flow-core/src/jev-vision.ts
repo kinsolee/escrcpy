@@ -147,11 +147,11 @@ export const VISUAL_RISK_THRESHOLD = 0.5
 /** Calibrated on 15 real TikTok crops (share arrow, copy link, cart, buy, chat, friends, claim, like…): 15/15. */
 export const VISUAL_RISK_QUESTION: JevNoulQuestion = {
   type: 'noul',
-  instructions: 'Is the control inside the red circle in `crop` a button that likes, follows, comments, sends a message, adds to cart, buys, checks out, claims a coupon or reward, subscribes, or sends to a specific friend, contact or app?',
+  instructions: 'Is the control inside the red circle in `crop` a button that likes, follows, comments, sends a message, adds to cart, opens the shopping cart, buys, checks out, claims a coupon or reward, subscribes, or sends to a specific friend, contact or app?',
   criteria: {
     true: {
       what: 'A social, messaging, sending or purchase action button',
-      examples: ['a heart Like icon', 'a Follow or + follow button', 'a comment bubble icon', 'an Add to cart cart-plus icon', 'a Buy now button', 'a Claim or Claim all button', 'a Send button', 'a friend avatar in a share panel', 'a TikTok friends, Facebook, SMS or WhatsApp button in a share panel', 'a Chat button that messages the seller'],
+      examples: ['a heart Like icon', 'a Follow or + follow button', 'a comment bubble icon', 'an Add to cart cart-plus icon', 'a Buy now button', 'a Claim or Claim all button', 'a Send button', 'a friend avatar in a share panel', 'a TikTok friends, Facebook, SMS or WhatsApp button in a share panel', 'a Chat button that messages the seller', 'a shopping cart icon that opens the cart'],
     },
     false: {
       what: 'A navigation, search, close, copy-link, share-panel-opening or content control',

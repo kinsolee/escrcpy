@@ -1,7 +1,9 @@
 import type { Buffer } from 'node:buffer'
+import { readFileSync } from 'node:fs'
 import { mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import process from 'node:process'
 import { encodePng, parseUiTree } from '@escrcpy/flow-device'
 import type { ForegroundApp, RatioPoint, UiTree } from '@escrcpy/flow-device'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -10,6 +12,7 @@ import {
   checkTapTarget,
   createVisionLlmClient,
   DEFAULT_FORBIDDEN_TEXTS,
+  isMeaningfulLabel,
   loadLlmConfig,
   matchForbiddenText,
   parseUsage,
@@ -191,6 +194,38 @@ describe('runVisionAgent', () => {
     expect(requests).toHaveLength(2)
     expect(requests[1].text).toContain('com.shopee.br')
     expect(state.app).toBe('com.shopee.br')
+  })
+
+  it('does not count cold-start bounces against the recovery budget, and marks the report running with its pid', async () => {
+    const { device, state, calls } = fakeDevice({
+      onTap: (_point, st) => {
+        st.app = 'com.shopee.br'
+      },
+    })
+    state.app = 'com.google.android.apps.nexuslauncher'
+    let starts = 0
+    device.startApp = async (_serial, pkg) => {
+      calls.push({ op: 'startApp', args: [pkg] })
+      // The first two launches drop straight back to the launcher (cold start).
+      state.app = ++starts <= 2 ? 'com.google.android.apps.nexuslauncher' : pkg
+    }
+    let midRun: any
+    const { client } = fakeClient([
+      act({ type: 'tap', x: 500, y: 500 }),
+      () => {
+        midRun = JSON.parse(readFileSync(path.join(dir, 'report.json'), 'utf8'))
+        return act({ type: 'done', success: true, result: {} })
+      },
+    ])
+    const result = await runVisionAgent({ serial: SERIAL, goal: 'g', allowedPackages: [TIKTOK], device, client, runDir: dir, ...fast })
+    // launch + 2 cold relaunches, then the tap into Shopee still gets its one recovery.
+    expect(result.status).toBe('done')
+    expect(calls.filter(call => call.op === 'startApp')).toHaveLength(4)
+    expect(midRun).toMatchObject({ status: 'running', pid: process.pid })
+    expect(midRun.finishedAt).toBeUndefined()
+    expect(midRun.updatedAt).toEqual(expect.any(String))
+    const report = JSON.parse(await readFile(path.join(dir, 'report.json'), 'utf8'))
+    expect(report).toMatchObject({ status: 'done', pid: process.pid, finishedAt: expect.any(String) })
   })
 
   it('checks the foreground again right before executing', async () => {
@@ -450,6 +485,22 @@ describe('forbidden texts', () => {
     expect(checkTapTarget(tree, { x: 1000, y: 1370 }, DEFAULT_FORBIDDEN_TEXTS)).toMatchObject({ verdict: 'blocked', term: 'Follow' })
     expect(checkTapTarget(tree, { x: 1000, y: 1480 }, DEFAULT_FORBIDDEN_TEXTS)).toMatchObject({ verdict: 'blocked', term: 'Like' })
     expect(checkTapTarget(tree, { x: 500, y: 1650 }, DEFAULT_FORBIDDEN_TEXTS)).toMatchObject({ verdict: 'ok' })
+  })
+
+  it('treats raw resource labels like "@2131823611" as unlabeled and blocks cart controls', () => {
+    const tree = parseUiTree(xmlOf([
+      { desc: '@2131823611', bounds: [900, 100, 1000, 200], clickable: true },
+      { desc: 'Shopping cart', bounds: [700, 100, 800, 200], clickable: true },
+      { text: 'Carrinho', bounds: [100, 2200, 300, 2300], clickable: true },
+    ]))
+    const raw = checkTapTarget(tree, { x: 950, y: 150 }, DEFAULT_FORBIDDEN_TEXTS)
+    expect(raw).toMatchObject({ verdict: 'ok', unlabeled: true, labels: [] })
+    expect(checkTapTarget(tree, { x: 750, y: 150 }, DEFAULT_FORBIDDEN_TEXTS)).toMatchObject({ verdict: 'blocked', term: 'Cart' })
+    expect(checkTapTarget(tree, { x: 200, y: 2250 }, DEFAULT_FORBIDDEN_TEXTS)).toMatchObject({ verdict: 'blocked', term: 'Carrinho' })
+    expect(isMeaningfulLabel('@2131823611')).toBe(false)
+    expect(isMeaningfulLabel('123')).toBe(false)
+    expect(isMeaningfulLabel('Copy link')).toBe(true)
+    expect(isMeaningfulLabel('复制链接')).toBe(true)
   })
 
   it('does not look inside large clickable containers', () => {

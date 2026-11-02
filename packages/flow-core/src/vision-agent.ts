@@ -1,6 +1,7 @@
 import type { Buffer } from 'node:buffer'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import process from 'node:process'
 import { z } from 'zod'
 import {
   ancestorsOf,
@@ -127,6 +128,8 @@ export const DEFAULT_FORBIDDEN_TEXTS: readonly string[] = [
   'Message',
   'Chat',
   'Comment',
+  // The cart page holds checkout buttons; opening it is already outside a read-only task.
+  'Cart',
   '关注',
   '点赞',
   '加入购物车',
@@ -150,6 +153,9 @@ export const DEFAULT_FORBIDDEN_TEXTS: readonly string[] = [
   'Conversar',
   'Me gusta',
   'Comentar',
+  'Carrinho',
+  'Carrito',
+  '购物车',
 ]
 
 /** Hiragana/Katakana, CJK ideographs, Hangul: scripts written without spaces between words. */
@@ -218,8 +224,17 @@ function descendantLabels(tree: UiTree, root: UiNode): string[] {
   return labels
 }
 
+/**
+ * A label that says what the control is. Unresolved resource references such as "@2131823611"
+ * and other letter-free strings name nothing: treat them as no label, so the control counts as
+ * unlabeled (and gets the visual check) instead of passing the forbidden-text check.
+ */
+export function isMeaningfulLabel(value: string | undefined): value is string {
+  return !!value && /\p{L}/u.test(value) && !/^@\d+$/.test(value.trim())
+}
+
 function nodeLabels(node: UiNode): string[] {
-  return [node.text, node.contentDesc].filter(value => value && value.trim())
+  return [node.text, node.contentDesc].filter(isMeaningfulLabel)
 }
 
 /**
@@ -560,7 +575,12 @@ export type VisionAgentEvent
     | { type: 'log', message: string }
     | { type: 'finish', result: VisionAgentResult }
 
-export interface VisionAgentReport extends VisionAgentResult {
+export interface VisionAgentReport extends Omit<VisionAgentResult, 'status'> {
+  /** `running` until the run ends. A report still `running` (no `finishedAt`) whose `pid` is dead was killed. */
+  status: VisionRunStatus | 'running'
+  pid: number
+  /** Last time the report was written; a heartbeat for readers. */
+  updatedAt?: string
   version: 1
   serial: string
   goal: string
@@ -630,11 +650,13 @@ function promptElements(tree: UiTree, scale: number, limit = 60): PromptElement[
     return []
   const norm = (value: number, size: number) => Math.round(Math.min(1, Math.max(0, value / size)) * scale)
   return extractElements(tree)
-    .filter(element => element.text || element.contentDesc || element.clickable || element.className.endsWith('EditText'))
+    .filter(element => isMeaningfulLabel(element.text) || isMeaningfulLabel(element.contentDesc) || element.clickable || element.className.endsWith('EditText'))
     .filter(element => element.bounds.width > 0 && element.bounds.height > 0)
     .slice(0, limit)
     .map((element, index) => {
-      const label = [element.text && `"${element.text.slice(0, 60)}"`, element.contentDesc && `desc="${element.contentDesc.slice(0, 60)}"`, !element.text && !element.contentDesc && element.resourceId ? `id=${element.resourceId.split('/').at(-1)}` : '']
+      const text = isMeaningfulLabel(element.text) ? element.text : ''
+      const desc = isMeaningfulLabel(element.contentDesc) ? element.contentDesc : ''
+      const label = [text && `"${text.slice(0, 60)}"`, desc && `desc="${desc.slice(0, 60)}"`, !text && !desc && element.resourceId ? `id=${element.resourceId.split('/').at(-1)}` : '']
         .filter(Boolean)
         .join(' ')
       return {
@@ -680,6 +702,8 @@ function describeStep(step: VisionStepRecord): string {
 // Runner
 
 const MAX_HISTORY = 12
+/** Relaunches during cold start (before the first model call) that do not count as recoveries. */
+const MAX_COLD_RECOVERIES = 3
 /** Automatic screen wake-ups per run before a black screen is left to the model. */
 const MAX_WAKES = 3
 
@@ -740,6 +764,7 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
   let guardrailBlocks = 0
   let unverifiedTaps = 0
   let recoveries = 0
+  let coldRecoveries = 0
   let wakes = 0
   let unchanged = 0
   let notes: string[] = []
@@ -760,7 +785,8 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
     model: client.describe(),
     options: { maxSteps, maxModelCalls, timeBudgetMs, observe, treeTimeoutMs, coordinateScale: scale, settleMs, stuckThreshold, changeThreshold, maxForegroundRecoveries: maxRecoveries, launch: options.launch ?? 'if-needed', imageMaxEdge: options.imageMaxEdge ?? 1280 },
     startedAt: new Date(started).toISOString(),
-    status: 'error',
+    status: 'running',
+    pid: process.pid,
     success: false,
     reason: 'running',
     steps: 0,
@@ -795,7 +821,7 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
   async function persist(): Promise<void> {
     if (!reportPath)
       return
-    const snapshot = { ...report, steps: stepLog.length, modelCalls, tokens, callsWithoutUsage, guardrailBlocks, unverifiedTaps, durationMs: now() - started }
+    const snapshot = { ...report, steps: stepLog.length, modelCalls, tokens, callsWithoutUsage, guardrailBlocks, unverifiedTaps, durationMs: now() - started, updatedAt: new Date(now()).toISOString() }
     const tmp = `${reportPath}.tmp`
     await writeFile(tmp, redact(JSON.stringify(snapshot, null, 2)), 'utf8')
     await rename(tmp, reportPath)
@@ -1257,9 +1283,15 @@ async function runUnleased(options: VisionAgentOptions): Promise<VisionAgentResu
 
   /** Relaunches the first allowed app once; false when the recovery budget is spent. */
   async function recoverForeground(step: VisionStepRecord, app: ForegroundApp | undefined): Promise<boolean> {
-    recoveries++
+    // Before the first model call the app is still cold-starting (TikTok sometimes drops back to the
+    // launcher on its own): those relaunches do not count against the recovery budget.
+    const cold = modelCalls === 0 && coldRecoveries < MAX_COLD_RECOVERIES
+    if (cold)
+      coldRecoveries++
+    else
+      recoveries++
     const pkg = allowed[0]
-    if (recoveries > maxRecoveries) {
+    if (!cold && recoveries > maxRecoveries) {
       step.error = `foreground ${app?.package ?? 'unknown'} is outside ${allowed.join(', ')} and the recovery budget (${maxRecoveries}) is spent`
       emit({ type: 'step', step })
       return false
