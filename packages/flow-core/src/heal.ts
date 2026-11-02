@@ -240,7 +240,7 @@ export function createLlmClient(endpoint: HealLlmEndpoint): HealLlmClient | unde
       throw new HealError(`LLM request returned ${response.status}: ${detail.slice(0, 200)}`, { url: request.url, status: response.status })
     }
     const data: unknown = await response.json()
-    return apiType === 'responses' ? responsesText(data) : apiType === 'chat_completions' ? chatText(data) : messagesText(data)
+    return llmResponseText(apiType, data)
   }
   return {
     async complete(prompt) {
@@ -303,6 +303,26 @@ export function parseLooseJson(text: string): unknown {
     }
   }
   throw new HealError(`LLM response is not valid JSON: ${text.slice(0, 200)}`)
+}
+
+/** The model's text answer from a response body of the given wire format. */
+export function llmResponseText(apiType: LlmApiType, data: unknown): string {
+  return apiType === 'responses' ? responsesText(data) : apiType === 'chat_completions' ? chatText(data) : messagesText(data)
+}
+
+/** `${baseUrl}/v1/…` for the given wire format; `baseUrl` is trimmed of trailing slashes. */
+export function llmRequestUrl(apiType: LlmApiType, baseUrl: string): string {
+  const base = baseUrl.trim().replace(/\/+$/, '')
+  return apiType === 'responses' ? `${base}/v1/responses` : apiType === 'chat_completions' ? `${base}/v1/chat/completions` : `${base}/v1/messages`
+}
+
+/** Auth headers for the given wire format (Anthropic gateways read x-api-key, OpenAI ones Bearer). */
+export function llmRequestHeaders(apiType: LlmApiType, apiKey: string): Record<string, string> {
+  return {
+    'content-type': 'application/json',
+    'authorization': `Bearer ${apiKey}`,
+    ...(apiType === 'messages' ? { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' } : {}),
+  }
 }
 
 function messagesText(data: unknown): string {

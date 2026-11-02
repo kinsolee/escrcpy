@@ -1,9 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { z } from 'zod'
 import { createLlmClient, normalizeLlmApiType } from './heal.js'
-import type { HealLlmClient } from './heal.js'
+import type { HealLlmClient, LlmApiType } from './heal.js'
 
 export const llmModelSchema = z.object({
   id: z.string().min(1, '模型 ID 不能为空'),
@@ -17,7 +17,10 @@ export const llmVendorSchema = z.object({
   /** Cosmetic only; empty is allowed and the UI falls back to an untitled label. */
   name: z.string().optional(),
   baseUrl: z.string().min(1, '供应商 Base URL 不能为空'),
-  apiKey: z.string(),
+  /** Plain-text key. Prefer `apiKeyEnv` so the key never lands on disk. */
+  apiKey: z.string().default(''),
+  /** Name of an environment variable holding the key; when it is set and non-empty it wins over `apiKey`. */
+  apiKeyEnv: z.string().optional(),
   /** See `normalizeLlmApiType`; defaults to `messages`. */
   apiType: z.string().optional(),
   models: z.array(llmModelSchema).default([]),
@@ -36,22 +39,111 @@ export function llmConfigPath(explicit?: string): string {
   return explicit ?? process.env.FLOW_LLM_CONFIG ?? join(homedir(), '.escrcpy', 'flow', 'llm.json')
 }
 
+const warnedPermissions = new Set<string>()
+
+/** Warns once per file when a config that may hold API keys is readable by group/other. Never prints the key. */
+function warnIfShared(file: string): void {
+  if (process.platform === 'win32' || warnedPermissions.has(file))
+    return
+  try {
+    const mode = statSync(file).mode & 0o777
+    if (mode & 0o077) {
+      warnedPermissions.add(file)
+      console.warn(`[flow] warning: ${file} is readable by other users (mode ${mode.toString(8)}); it may contain API keys. Run \`chmod 600 ${file}\` or move keys to apiKeyEnv.`)
+    }
+  }
+  catch {
+    // A stat failure is not worth blocking the read for.
+  }
+}
+
 /** Reads the config file; undefined when it does not exist yet. Throws on malformed JSON. */
 export function loadLlmConfig(path?: string): LlmConfig | undefined {
   const file = llmConfigPath(path)
   if (!existsSync(file))
     return undefined
+  warnIfShared(file)
   const parsed = llmConfigSchema.safeParse(JSON.parse(readFileSync(file, 'utf8')))
   if (!parsed.success)
     throw new Error(`invalid LLM config at ${file}: ${parsed.error.issues[0]?.message}`)
   return parsed.data
 }
 
+/** Writes the config owner-only (0600): it can hold plain-text API keys. */
 export function saveLlmConfig(config: LlmConfig, path?: string): string {
   const file = llmConfigPath(path)
   mkdirSync(dirname(file), { recursive: true })
-  writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`)
+  writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 })
+  // `mode` only applies when the file is created; tighten an existing one too.
+  if (process.platform !== 'win32')
+    chmodSync(file, 0o600)
   return file
+}
+
+/** The vendor's key: the `apiKeyEnv` variable when it is set and non-empty, else the inline `apiKey`. */
+export function vendorApiKey(vendor: Pick<LlmVendor, 'apiKey' | 'apiKeyEnv'>, env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = vendor.apiKeyEnv ? env[vendor.apiKeyEnv]?.trim() : undefined
+  return fromEnv || vendor.apiKey?.trim() || ''
+}
+
+/** A fully resolved model endpoint. Holds the key: never log or persist it. */
+export interface ResolvedLlmEndpoint {
+  baseUrl: string
+  apiKey: string
+  model: string
+  apiType: LlmApiType
+  vendorId: string
+  /** `vision` flag of the model row; undefined when the model is not listed or not annotated. */
+  vision?: boolean
+}
+
+/**
+ * Resolves `<vendorId>::<modelId>` (default: the config's `active`) to an endpoint.
+ * The model does not have to be listed under the vendor: gateways serve more models
+ * than the dialog lists. Undefined when the vendor is unknown or has no key.
+ */
+export function resolveLlmEndpoint(config: LlmConfig | undefined, selector?: string, env: NodeJS.ProcessEnv = process.env): ResolvedLlmEndpoint | undefined {
+  const active = selector ?? config?.active
+  if (!config || !active)
+    return undefined
+  const separator = active.indexOf('::')
+  if (separator <= 0)
+    return undefined
+  const vendorId = active.slice(0, separator)
+  const model = active.slice(separator + 2).trim()
+  const vendor = config.vendors.find(item => item.id === vendorId)
+  const apiKey = vendor ? vendorApiKey(vendor, env) : ''
+  if (!vendor || !model || !apiKey || !vendor.baseUrl.trim())
+    return undefined
+  return {
+    baseUrl: vendor.baseUrl.trim().replace(/\/+$/, ''),
+    apiKey,
+    model,
+    apiType: normalizeLlmApiType(vendor.apiType),
+    vendorId,
+    vision: vendor.models.find(item => item.id === model)?.vision,
+  }
+}
+
+/**
+ * Endpoint for agents run from the CLI / MCP: `selector` (`vendor::model`) or the
+ * config's `active` from llm.json first; without a usable config entry, the
+ * `FLOW_LLM_BASE_URL` / `FLOW_LLM_API_KEY` / `FLOW_LLM_MODEL` / `FLOW_LLM_API_TYPE` env.
+ * Throws a message that never contains the key.
+ */
+export function requireLlmEndpoint(selector?: string, env: NodeJS.ProcessEnv = process.env, configPath?: string): ResolvedLlmEndpoint {
+  const config = loadLlmConfig(configPath)
+  const fromConfig = resolveLlmEndpoint(config, selector, env)
+  if (fromConfig)
+    return fromConfig
+  if (selector && config?.vendors.some(vendor => vendor.id === selector.split('::')[0]))
+    throw new Error(`model ${selector} cannot be used: the vendor has no API key (set apiKey or the env var named by apiKeyEnv)`)
+  const baseUrl = env.FLOW_LLM_BASE_URL?.trim()
+  const apiKey = env.FLOW_LLM_API_KEY?.trim()
+  const model = (selector?.includes('::') ? undefined : selector) ?? env.FLOW_LLM_MODEL?.trim()
+  if (baseUrl && apiKey && model)
+    return { baseUrl: baseUrl.replace(/\/+$/, ''), apiKey, model, apiType: normalizeLlmApiType(env.FLOW_LLM_API_TYPE), vendorId: 'env' }
+  throw new Error(`no usable LLM: ${selector ? `${selector} is not in ${llmConfigPath(configPath)}` : `set an active model in ${llmConfigPath(configPath)}`} (vendor::model), or set FLOW_LLM_BASE_URL, FLOW_LLM_API_KEY and FLOW_LLM_MODEL`)
 }
 
 export interface ResolvedLlm {
@@ -62,18 +154,13 @@ export interface ResolvedLlm {
 
 /** Builds a client for the `active` vendor + model; undefined when nothing usable is selected. */
 export function resolveLlm(config: LlmConfig | undefined): ResolvedLlm | undefined {
-  if (!config?.active)
+  const endpoint = resolveLlmEndpoint(config)
+  if (!endpoint)
     return undefined
-  const separator = config.active.indexOf('::')
-  if (separator <= 0)
-    return undefined
-  const vendorId = config.active.slice(0, separator)
-  const model = config.active.slice(separator + 2)
-  const vendor = config.vendors.find(item => item.id === vendorId)
-  if (!vendor)
-    return undefined
-  const client = createLlmClient({ baseUrl: vendor.baseUrl, apiKey: vendor.apiKey, model, apiType: vendor.apiType })
-  return client ? { client, vendor, model } : undefined
+  const vendor = config!.vendors.find(item => item.id === endpoint.vendorId)!
+  const client = createLlmClient({ baseUrl: endpoint.baseUrl, apiKey: endpoint.apiKey, model: endpoint.model, apiType: vendor.apiType })
+  // `vendor.apiKey` carries the resolved key so callers that spread the vendor into an endpoint keep working with apiKeyEnv.
+  return client ? { client, vendor: { ...vendor, apiKey: endpoint.apiKey }, model: endpoint.model } : undefined
 }
 
 /** Fetches `/v1/models`; OpenAI- and Anthropic-style gateways both serve this shape. */
