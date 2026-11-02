@@ -287,7 +287,10 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
 
   /** Stores a freshly copied link; returns true when the target count is reached. */
   const store = async (link: string): Promise<boolean> => {
-    const resolved = productIdFromUrl(link) ? link : await rt.resolveLink(link, PRODUCT_ID_RE)
+    let resolved = productIdFromUrl(link) ? link : await rt.resolveLink(link, PRODUCT_ID_RE)
+    // A short-link lookup occasionally fails transiently; one more try before keying on the link.
+    if (!productIdFromUrl(resolved) && !productIdFromUrl(link))
+      resolved = await rt.resolveLink(link, PRODUCT_ID_RE) ?? resolved
     const productId = productIdFromUrl(resolved) ?? productIdFromUrl(link)
     const finalUrl = resolved ? stripQuery(resolved) : undefined
     // Never key on an unresolved final URL: two different products could both land on /login.
@@ -548,10 +551,10 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           break
         }
         if (page === 'results_grid') {
-          // The card tap did not open anything: move on to the next card.
-          rt.decide('still on the grid after the card tap; next card')
+          // The card tap did not open anything. This observation carried product-page questions,
+          // not card questions: pick the next card on the next observation (cursor already moved).
+          rt.decide('still on the grid after the card tap; next card on the next observation')
           setGoal('pick')
-          await pick(obs, a)
           break
         }
         await miss(`expected a product page, saw ${page}`, `Go back to the TikTok Shop search results grid for "${keyword}" using the back key.`, o => pageOf(o.answers as Answers) === 'results_grid')

@@ -13,7 +13,7 @@ import type { JevAnswer, JevClient, JevImage, JevQuestions, PlaybookOptions, Vis
 
 type Page = 'video_feed' | 'shop_home' | 'search_input' | 'results_grid' | 'no_results' | 'product_detail' | 'live_room'
 
-interface Card { id: string, live?: boolean, video?: boolean, ad?: boolean, opensApp?: string }
+interface Card { id: string, live?: boolean, video?: boolean, ad?: boolean, opensApp?: string, /** The tap does nothing (grid still loading). */ dead?: boolean }
 
 interface Box { top: number, bottom: number, left: number, right: number }
 
@@ -99,6 +99,8 @@ function world(options: WorldOptions) {
         const index = POSITIONS.findIndex(position => inside(point, BOXES[`${position}_card`]))
         const card = visible()[index]
         if (!card)
+          return
+        if (card.dead)
           return
         state.current = card
         if (card.opensApp) {
@@ -370,6 +372,14 @@ describe('tiktok-shop-links playbook', () => {
     expect((result.result as any).items[0]).toMatchObject({ position: 'top_right', productId: '1730000802' })
     const cardTap = w.taps.find(point => inside(point, BOXES.top_right_card))!
     expect(cardTap.x).toBeCloseTo(0.75, 2)
+  })
+
+  it('moves on to the next card when a card tap opens nothing (no crash on missing card answers)', async () => {
+    const w = world({ grid: [{ id: '1730000901', dead: true }, { id: '1730000902' }] })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect((result.result as any).items[0]).toMatchObject({ position: 'top_right', productId: '1730000902' })
   })
 
   it('does not count a product it already copied', async () => {
