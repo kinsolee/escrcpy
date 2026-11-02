@@ -88,6 +88,8 @@ interface WorldOptions {
   uniqueLinks?: boolean
   /** BACK does not leave the LIVE room (a dialog without an X in front of it). */
   liveStuck?: boolean
+  /** Observations of a black, still-loading LIVE room after a card opens one; BACK is swallowed meanwhile. */
+  liveLoading?: number
   /** A terms / policy notice: named in the UI tree or only visible to Jev; shown on the results grid or at every launch. */
   consent?: { via: 'tree' | 'jev', when: 'results' | 'launch', clearsOnBack?: boolean }
   /** Physical half-sheet icons (default SHEET_ICONS). */
@@ -119,6 +121,7 @@ function world(options: WorldOptions) {
     loadingShown: false,
     consent: false,
     consentShown: false,
+    liveLoading: 0,
   }
   const sheetIcons = options.sheetIcons ?? SHEET_ICONS
   /** Page at every BACK, and how often BACK hit the home feed / the sheet's cart was tapped. */
@@ -170,7 +173,9 @@ function world(options: WorldOptions) {
 
   const device: VisionAgentDevice = {
     screencap: async () => {
-      state.loadingShown = state.app === TIKTOK_PACKAGE && state.loading > 0
+      state.loadingShown = state.app === TIKTOK_PACKAGE && (state.loading > 0 || (state.page === 'live_room' && state.liveLoading > 0))
+      if (state.page === 'live_room' && state.liveLoading > 0)
+        state.liveLoading--
       if (state.loading > 0)
         state.loading--
       return screen()
@@ -219,6 +224,8 @@ function world(options: WorldOptions) {
         state.page = card.live || card.liveHidden ? 'live_room' : card.video ? 'video_feed' : 'product_detail'
         if (card.liveHidden)
           liveSeen.add(card.id)
+        if (state.page === 'live_room')
+          state.liveLoading = options.liveLoading ?? 0
         state.fromCard = state.page === 'video_feed'
         state.sheet = !!card.sheet
         fault('card')
@@ -274,7 +281,7 @@ function world(options: WorldOptions) {
           state.consent = false
         return
       }
-      if (state.page === 'live_room' && options.liveStuck)
+      if (state.page === 'live_room' && (options.liveStuck || state.loadingShown))
         return
       if (state.share)
         state.share = false
@@ -876,6 +883,16 @@ describe('tiktok-shop-links playbook', () => {
     const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
     expect(report.stepLog.some((step: any) => /top_left card opened a LIVE room: marked LIVE/.test(step.decision ?? ''))).toBe(true)
     expect(report.stepLog.some((step: any) => /top_left\(opened a LIVE room\)/.test(step.decision ?? ''))).toBe(true)
+  })
+
+  it('waits for a LIVE room that is still loading before its BACK, so no relaunch is needed', async () => {
+    const w = world({ grid: [{ id: '1730003051', liveHidden: 'always' }, { id: '1730003052' }], liveLoading: 1 })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(w.counts.liveTaps).toBe(0)
+    expect(w.counts.restarts).toBe(1)
+    expect(result.result).toMatchObject({ liveRoomEntries: 1, researched: false, productIds: ['1730003052'] })
   })
 
   it('force-stops and relaunches when BACK does not leave the LIVE room, then searches again', async () => {

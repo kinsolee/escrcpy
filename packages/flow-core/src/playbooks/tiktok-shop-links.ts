@@ -314,6 +314,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   let inLiveRoom = false
   let liveBackTried = false
   let liveRestarted = false
+  let liveLoadWaits = 0
   // Consent notices: BACK once, then force-stop + relaunch once per run; seen again after that, a human decides.
   let consentBackTried = false
   let consentRestarts = 0
@@ -536,6 +537,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       inLiveRoom = true
       liveBackTried = false
       liveRestarted = false
+      liveLoadWaits = 0
       liveRoomEntries++
       if (tappedCard && card) {
         liveMarked.add(card.position)
@@ -572,6 +574,13 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
 
     // In a LIVE room: leave without touching anything (no popups closed, no takeover).
     if (inLive) {
+      // A LIVE room renders black for a moment; a BACK sent then is swallowed (seen on 16091).
+      if (!liveBackTried && a.loading.noul >= T.popup && liveLoadWaits < 2) {
+        liveLoadWaits++
+        rt.decide(`LIVE room still loading (${a.loading.noul.toFixed(2)}); wait before BACK`)
+        await rt.sleep(1500)
+        continue
+      }
       if (!liveBackTried) {
         liveBackTried = true
         if (await back(obs, 'leave the LIVE room'))
