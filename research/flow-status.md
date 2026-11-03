@@ -432,7 +432,7 @@ tk-shop-erp 定了 Jev 坐标规则（`jev-mobile-decision-loop.md`「点击坐�
 | J16 | 期望标签只覆盖 en / pt / es；界面语言换成别的语言时，有标签的落点会被判不一致而拒绝（偏保守，走 miss / 接管）     | 新语言要在 `TIKTOK_EXPECTED_LABELS` 补词                                        |
 | J17 | 「同一控件」按边界互相包含中心来合并；两个真正不同、但重叠的同名控件会被当成一个                                  | 区域约束 + 标签检查 + 其他护栏仍在；本轮没见到                                  |
 
-#### 7.8.4 验证基线（2026-11-03，本分支 `67fdff38`）
+#### 7.8.4 验证基线（2026-11-03，本分支 `67fdff38`）；最新见 §7.9.4
 
 | 包          | typecheck | test                                                                                                                                                                                                                                                                                                                                      | eslint |
 | ----------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
@@ -442,3 +442,49 @@ tk-shop-erp 定了 Jev 坐标规则（`jev-mobile-decision-loop.md`「点击坐�
 | flow-cli    | 通过      | 26 / 26                                                                                                                                                                                                                                                                                                                                   | 通过   |
 
 命令：`pnpm --filter "@escrcpy/flow-*" build && pnpm --filter "@escrcpy/flow-*" typecheck`，各包 `pnpm test`，仓库根目录 `npx eslint packages/flow-device packages/flow-core packages/flow-mcp packages/flow-cli research`。证据：`/tmp/jevcoord/runs/`、`/tmp/jevcoord/runs2/`（各运行的 report.json、截图、stdout JSON），汇总 `/tmp/jevcoord/summary.json`。
+
+### 7.9 每条结果附商品页原图（2026-11-03，`f0762111`，tk-shop-erp KIN-90）
+
+tk-shop-erp 拿到链接后要用「复制链接时的那一屏商品页」做链接绑定（商品页截图 vs 链接 OG 主图）和多通道同款投票；report 里的 `step-NNN.jpg` 是缩到 576×1280 的 JPEG，不能当证据。
+
+#### 7.9.1 实现
+
+- `items[].productScreenshot: { file, sha256, width, height, step }`：原始 screencap PNG 字节（`obs.screen.png`，不缩放、不重编码），写到 runDir 的 `item-<n>-product.png`，`sha256` 为文件字节的 hex，`step` 为该帧所在的 step 序号。
+- 取帧：该卡片打开后、**最后一次执行成功的 Share 点击（顶栏 Share 或半屏 Share）所在的那次观测**——商品页、Share 面板未开。同一卡片点了两次 Share（第一次没开面板）取第二次；不会取到其他卡片、Share 面板已开或已回到结果页的帧（卡片切换时帧随卡片清空）。接管（视觉 agent）替代打开了面板时，退而用该卡片最近一次「商品页、面板未开」的观测；连这样的帧都没有的链接进 `unresolved`（reason `no product-page frame was observed for this card`），不计入 items。
+- 只给计入 `items` 的条目写文件；重复、unresolved 不写。
+- 不变量：构造结果时 `assertItemScreenshots` 断言每个 item 都有截图、文件存在、哈希与 PNG 尺寸一致。
+- 没有 runDir 的调用：`runPlaybook` 改为自动建临时目录（`$TMPDIR/flow-playbook-<id>-*`），结果里的 `runDir` 指向它，保证文件引用总是真实存在；CLI 和 MCP 本来就总是给 runDir。
+- 权限 0600（截图显示的是已登录账号的屏幕）；runDir 其他产物原先没有统一权限，未改。
+- 选卡、坐标来源、半屏、护栏、短链解析未改。
+
+#### 7.9.2 真机核对（`removedor de fiapos` @ 16091 / 46.5.3，`massageador digital` @ 18041 / 47.5.3）
+
+两次都 done、0 兜底，66 s / 60 s。
+
+| 设备  | item | productId           | 卡位 | 文件               | 尺寸      | 哈希 | 权限 | step / 页面                                  | 面板 | 画面标题                                                                            | 与 productId 对应                                                    |
+| ----- | ---- | ------------------- | ---- | ------------------ | --------- | ---- | ---- | -------------------------------------------- | ---- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 16091 | 1    | 1737459860992918548 | 左上 | item-1-product.png | 1080×2400 | 一致 | 0600 | 7 / SeaPdpActivity，顶栏 Share               | 未开 | Papa Bolinhas Eletrico Tira Pelos de Roupas Removedor Aparador Sem Fio Recarregável | 是（tk-shop-erp 解析记录的 OG 标题相同）                             |
+| 16091 | 2    | 1738134049752712979 | 右上 | item-2-product.png | 1080×2400 | 一致 | 0600 | 10 / SeaPdpActivity，顶栏 Share              | 未开 | Papa Bolinhas Elétrico USB Sem Fio Portátil, Removedor de Pêlos e Fiapos…           | 无现成 OG 记录；下一步复制链接时面板后面是同一商品（同图、R$ 17,99） |
+| 16091 | 3    | 1733367568851371065 | 左下 | item-3-product.png | 1080×2400 | 一致 | 0600 | 13 / DetailActivity，视频 + 半屏，半屏 Share | 未开 | Papa Bolinhas Eletrico Tira Pelos de Roup…                                          | 是（OG 标题相同）                                                    |
+| 18041 | 1    | 1737660200969930116 | 左上 | item-1-product.png | 1080×2400 | 一致 | 0600 | 8 / SeaPdpActivity，顶栏 Share               | 未开 | Massageador Portátil Recarregável Multifuncional para Uso Doméstico…                | 是（OG 标题相同）                                                    |
+| 18041 | 2    | 1738312809302492466 | 右上 | item-2-product.png | 1080×2400 | 一致 | 0600 | 11 / SeaPdpActivity，顶栏 Share              | 未开 | Aparelho Massageador Muscular Fisioterapia Portátil Digital Com Pulso Elétrico      | 是（OG 标题相同）                                                    |
+| 18041 | 3    | 1738324867441002197 | 左下 | item-3-product.png | 1080×2400 | 一致 | 0600 | 14 / SeaPdpActivity，顶栏 Share              | 未开 | Munhequeira Elétrica Massageadora com Aquecimento…                                  | 无现成 OG 记录；下一步复制链接时面板后面是同一商品（同图、R$ 58,99） |
+
+- 6 条链接经独立 `curl` 解析的商品 ID 都与 `productIds` 一致。公开商品页（`tiktok.com/view/product`、`shop.tiktok.com/br/pdp`）未登录时只返回 Security Check，拿不到 OG 标题；4 条与 tk-shop-erp 之前解析记录（`case-evidence/*/host/links-resolved.json`）里的标题对上，另 2 条只能用「截图帧 → 下一步复制链接」的连续性核对。
+- 证据：`/tmp/jevshot/runs/{16091,18041}/s1/`（report.json、`item-*-product.png`、step 截图），核对脚本 `/tmp/jevshot/check.py`。
+
+#### 7.9.3 待修 / 已知限制
+
+| #   | 问题                                                                                                              | 备注                                                    |
+| --- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
+| J18 | 截图是全屏原始 PNG（约 1–3 MB / 张），含状态栏和已登录账号的界面                                                  | 文件 0600；下游只存需要的部分                           |
+| J19 | 接管打开面板时用的是该卡片最近一次「商品页、面板未开」的观测，不是「Share 点击帧」（那次点击发生在视觉 agent 里） | 本轮真机没有出现；没有任何此类帧时该链接进 `unresolved` |
+
+#### 7.9.4 验证基线（2026-11-03，本分支 `f0762111`）
+
+| 包          | typecheck | test                                                                                                                                                                                                             | eslint |
+| ----------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ |
+| flow-device | 通过      | 105 / 105                                                                                                                                                                                                        | 通过   |
+| flow-core   | 通过      | 164 / 164（+6：顶栏 Share 帧；半屏 Share 帧；Share 第一次没开面板取第二次的帧；强停重搜后的 item 用新搜索的帧；只给计入的 item 写文件 + 不变量断言（缺文件 / 哈希不符 / 无截图）+ 0600；无 runDir 时写临时目录） | 通过   |
+| flow-mcp    | 通过      | 26 / 26                                                                                                                                                                                                          | 通过   |
+| flow-cli    | 通过      | 26 / 26                                                                                                                                                                                                          | 通过   |
