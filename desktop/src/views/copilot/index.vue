@@ -6,7 +6,7 @@
         :placeholder="$t('flow.run.device')"
         size="small"
         class="w-56"
-        :disabled="Boolean(sessionId)"
+        :disabled="busy"
         @change="startSession"
       >
         <el-option
@@ -140,7 +140,19 @@ watch(chat, () => {
   nextTick(() => listEl.value?.scrollTo({ top: listEl.value.scrollHeight }))
 }, { deep: true })
 
+/** Each session is bound to one device, so switching devices closes the old one first. */
+async function closeSession() {
+  const id = sessionId.value
+  if (!id)
+    return
+  sessionId.value = ''
+  toolCount.value = 0
+  chat.value = []
+  await invoke('copilot:close', { sessionId: id })
+}
+
 async function startSession() {
+  await closeSession()
   if (!serial.value)
     return
   const { success, sessionId: id, toolCount: tools, error } = await invoke('copilot:start', { serial: serial.value })
@@ -268,9 +280,14 @@ async function saveAsFlow() {
   ElMessage.success(window.t('copilot.saved', { path, steps }))
 }
 
+// A renderer reload would otherwise orphan the session's MCP client in the main process.
+useEventListener(window, 'beforeunload', closeSession)
+
 onMounted(() => {
   deviceStore.getList()
 })
+
+onBeforeUnmount(closeSession)
 </script>
 
 <style lang="postcss" scoped>

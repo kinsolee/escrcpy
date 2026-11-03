@@ -109,6 +109,17 @@ const handlers = {
     return { success: true }
   },
 
+  /** Drop a session for good (device switch, page reload): stop its run and close its MCP client. */
+  'copilot:close': async (_event, payload) => {
+    const session = sessions.get(payload?.sessionId)
+    if (!session)
+      return { success: true }
+    sessions.delete(payload.sessionId)
+    session.controller?.abort()
+    await session.mcp.close().catch(() => {})
+    return { success: true }
+  },
+
   'copilot:clear': async (_event, payload) => {
     const session = sessionOrError(payload?.sessionId)
     session.messages = []

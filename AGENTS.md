@@ -29,8 +29,9 @@ Escrcpy is a pnpm + Turborepo monorepo for an Electron GUI around Android mirror
 - i18n sync: `pnpm locale-sync` (from [desktop/](../desktop/)) after editing locale keys in `desktop/electron/resources/extra/common/locales/*.json`.
 - Electron install repair: `pnpm electron-fix` when Electron reports an incomplete install.
 - wscrcpy type check: `pnpm --filter @escrcpy/wscrcpy typecheck` (vue-tsc; plain tsc cannot resolve `.vue` imports).
+- Gate: `pnpm typecheck` and `pnpm test` run turbo `typecheck` / `test` for the four flow packages (dependencies are built first). Upstream `electron-ipcx` is not in the gate: its typecheck and vitest 2 setup fail on their own.
 
-There is no repo-wide test script today. For changes, run the smallest meaningful verification first, then `pnpm lint`; use `pnpm build` for packaging, Electron main-process, Vite config, dependency, or release-sensitive changes.
+For changes, run the smallest meaningful verification first, then `pnpm typecheck && pnpm test && pnpm lint` before merging flow work; use `pnpm build` for packaging, Electron main-process, Vite config, dependency, or release-sensitive changes.
 
 ## Frontend Patterns
 

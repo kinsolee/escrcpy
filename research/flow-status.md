@@ -3,7 +3,7 @@
 > 这是 flow 自动化（录制 → 编译 → 回放）**唯一的任务入口**。新任务、状态变化都改这一份；设计细节仍以 [record-replay-prototype-design.md](record-replay-prototype-design.md) 为准。
 >
 > 状态：**已完成** / **待修** / **需真机验证** / **环境问题** / **不做**。
-> 最后更新：2026-11-02（分支 `kinsolee/jev-decision-layer`，从 `kinsolee/vision-agent-takeover` `29fd6bab` 拉出；M9 见 §7。`claude/flow-ledger-followups` 的 `d66fdd80` 仍未合并，本分支未包含）。
+> 最后更新：2026-11-03（分支 `kinsolee/tiktok-shop-links` = `kinsolee/jev-decision-layer` `309cc748` 并入 main `168355ad`；M9 见 §7）。
 
 ## 1. 里程碑
 
@@ -36,14 +36,15 @@
 
 ## 3. 待修
 
-| #   | 问题                                                                                                                                  | 位置                                                                                                                        | 备注                                                                         |
-| --- | ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| 1   | 切换设备时旧的 Copilot session 不会关闭：`sessions` Map 只增不减，每个旧 session 的 in-process MCP client 一直不 close                | `desktop/src/views/copilot/index.vue` `startSession`；`desktop/electron/modules/copilot/service.js`（缺少 `copilot:close`） | 只有 app 退出时才统一清理                                                    |
-| 2   | 需真机验证：Copilot 页里让模型去选另一台设备，应收到 `SERIAL_LOCKED`，并继续在原设备上执行                                            | Copilot 页                                                                                                                  | 单测已覆盖 MCP 层；还没在运行中的 app 里验证                                 |
-| 3   | `pnpm lint` 在上游文件上失败：`vue/no-reserved-component-names`（组件名 "Install"）——main 上 `59d7eba8` 已改名为 `InstallApp`，已修   | `desktop/src/components/control-bar/index.vue:107`                                                                          | 来自上游 v3.0.8（`3ef48ba1`），不是 flow 引入的；flow 相关文件全部 lint 通过 |
-| 4   | 投屏（scrcpy）没有接入设备租约：设计 §6 / §10.4 写的是镜像窗口启动前 acquire，目前只有流程页（`modules/flow/scripts.js`）在用租约     | `desktop/electron/modules/flow/scripts.js` 之外                                                                             | 可选；agent / 流程运行时，投屏和输入仍可能互相干扰                           |
-| 5   | 没有 repo 级的 typecheck / test 门禁，`81efedb4` 带着 flow-core 类型错误合进了 main                                                   | `turbo.json` / 根 `package.json`                                                                                            | 可以给四个 flow 包加 turbo `typecheck` + `test` 任务                         |
-| 6   | 需真机验证：Copilot 页里模型调 `screenshot` 后能真正「看到」图片（进程内 `callTool` 现在保留图片 block，agent loop 以 user 消息附图） | Copilot 页                                                                                                                  | 单测覆盖 MCP 与 agent loop 两层；`d66fdd80` 合并后一起验证                   |
+| #   | 问题                                                                                                                                                                                                                     | 位置                                                                                                     | 备注                                                                                       |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 1   | 已完成：切换设备 / 页面卸载 / 渲染层重载时关闭旧的 Copilot session（新增 `copilot:close`：中止运行中的 loop 并 close MCP client）；设备下拉框只在运行中禁用，不再一开会话就锁死                                          | 2026-11-03 已在打包版 app 里验证：Pixel 会话问完后切到小米，旧对话清空、新会话直接在小米上执行，无需重启 | 原来会话一开就不能换设备，只能重启 app；app 内效果和 #2 一起需真机验证                     |
+| 2   | 已验证：Copilot 会话锁定设备。模型被要求切到另一台设备时，按 system prompt 直接拒绝、不调用工具；绕过模型直接调 MCP 时，`device_select` / 带其他 serial 的工具都返回 `SERIAL_LOCKED`，不传 serial 的调用仍落在绑定设备上 | Copilot 页                                                                                               | 2026-11-03 用 agent-desktop 无障碍接口驱动（不占鼠标）+ 真机 MCP 脚本验证                  |
+| 3   | 已完成：`control-bar` 的 `Install` 组件改名为 `InstallApp`，`pnpm lint` 全部通过                                                                                                                                         | `desktop/src/components/control-bar/index.vue`                                                           | `59d7eba8`                                                                                 |
+| 4   | 投屏（scrcpy）没有接入设备租约：设计 §6 / §10.4 写的是镜像窗口启动前 acquire，目前只有流程页（`modules/flow/scripts.js`）在用租约                                                                                        | `desktop/electron/modules/flow/scripts.js` 之外                                                          | 可选；agent / 流程运行时，投屏和输入仍可能互相干扰                                         |
+| 5   | 已完成：turbo 新增 `typecheck` / `test` 任务（依赖 `^build`），根目录 `pnpm typecheck` / `pnpm test` 只跑四个 flow 包                                                                                                    | `turbo.json`；根 `package.json`                                                                          | 合并前跑 `pnpm typecheck && pnpm test && pnpm lint`                                        |
+| 6   | 上游 `electron-ipcx` 不在门禁里：typecheck 报 TS2578/TS2339（`shared/errors.ts:180`），vitest 2.1.9 在当前 vite 下 `__vite_ssr_exportName__ is not defined`                                                              | `packages/electron-ipcx`                                                                                 | 来自上游 v3.3.1（`e35972b4`），不是 flow 引入的；修要升级它的 vitest，属于依赖改动，先不动 |
+| 7   | 需真机验证：Copilot 页里模型调 `screenshot` 后能真正「看到」图片（进程内 `callTool` 现在保留图片 block，agent loop 以 user 消息附图） | Copilot 页                                                                                                                  | 单测覆盖 MCP 与 agent loop 两层；`d66fdd80` 合并后一起验证                   |
 
 ## 4. 环境问题 / 不做
 
