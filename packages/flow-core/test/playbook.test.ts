@@ -1119,6 +1119,12 @@ describe('tiktok-shop-links playbook', () => {
     expect(share.found?.point.x).toBeCloseTo(0.73, 2)
     expect(findTreeTarget(tree, ['Shop'], { y: [0, 0.15] })).toMatchObject({ candidates: 0 })
     expect(findTreeTarget(undefined, ['Shop'], {})).toMatchObject({ candidates: 0, reason: 'no UI tree' })
+    // Siblings on the same icon (a clickable "Share" and a non-clickable "share" image over it) are one control.
+    const siblings = treeOf([
+      { desc: 'Share', box: { top: 0.07, bottom: 0.1, left: 0.7, right: 0.76 }, clickable: true },
+      { desc: 'share', box: { top: 0.072, bottom: 0.098, left: 0.705, right: 0.755 } },
+    ])
+    expect(findTreeTarget(siblings, ['Share'], { x: [0.5, 1], y: [0, 0.15] }).found?.point.x).toBeCloseTo(0.73, 2)
     expect(labelMismatch(['Following'], ['Shop'])).toEqual(['Following'])
     expect(labelMismatch(['Shop', 'Following'], ['Shop'])).toBeUndefined()
     expect(labelMismatch([], ['Shop'])).toBeUndefined()

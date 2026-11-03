@@ -53,7 +53,9 @@ export type TreeTargetResult
  * matches an expected label, with non-zero bounds and a centre inside
  * `region`. Each is resolved to the node to tap (itself when clickable and not
  * tiny, else its closest clickable ancestor when that is button-sized); nodes
- * resolving to the same control count once. Exactly one control → its centre.
+ * resolving to the same control count once, and so do overlapping ones (one
+ * contains the other's centre: TikTok's PDP top bar has a "Share" and a
+ * "share" element on the same icon). Exactly one control → its centre.
  */
 export function findTreeTarget(tree: UiTree | undefined, expected: readonly string[], region: CenterRegion): TreeTargetResult {
   if (!tree || !tree.nodes.length)
@@ -73,7 +75,13 @@ export function findTreeTarget(tree: UiTree | undefined, expected: readonly stri
       return clickable
     return node
   }
-  const targets = new Map<string, { node: UiNode, label: string }>()
+  const targets: Array<{ node: UiNode, label: string }> = []
+  const containsCenter = (outer: UiNode, inner: UiNode) => {
+    const cx = (inner.bounds.left + inner.bounds.right) / 2
+    const cy = (inner.bounds.top + inner.bounds.bottom) / 2
+    return cx >= outer.bounds.left && cx <= outer.bounds.right && cy >= outer.bounds.top && cy <= outer.bounds.bottom
+  }
+  const clickable = (node: UiNode) => node.clickable || node.longClickable
   for (const node of tree.nodes) {
     if (boundsArea(node.bounds) <= 0)
       continue
@@ -84,13 +92,16 @@ export function findTreeTarget(tree: UiTree | undefined, expected: readonly stri
     if (!inside(center.x, region.x) || !inside(center.y, region.y))
       continue
     const tapNode = resolve(node)
-    const key = `${tapNode.bounds.left},${tapNode.bounds.top},${tapNode.bounds.right},${tapNode.bounds.bottom}`
-    if (!targets.has(key))
-      targets.set(key, { node: tapNode, label })
+    const same = targets.findIndex(other => containsCenter(other.node, tapNode) || containsCenter(tapNode, other.node))
+    if (same < 0)
+      targets.push({ node: tapNode, label })
+    // The same control seen twice: keep the clickable one, else the smaller one.
+    else if ((clickable(tapNode) && !clickable(targets[same].node)) || (clickable(tapNode) === clickable(targets[same].node) && boundsArea(tapNode.bounds) < boundsArea(targets[same].node.bounds)))
+      targets[same] = { node: tapNode, label }
   }
-  if (targets.size !== 1)
-    return { candidates: targets.size, reason: targets.size ? `${targets.size} matching elements` : 'no matching element' }
-  const [{ node, label }] = targets.values()
+  if (targets.length !== 1)
+    return { candidates: targets.length, reason: targets.length ? `${targets.length} matching elements` : 'no matching element' }
+  const [{ node, label }] = targets
   const point = centerOf(node)
   return { found: { point: { x: Math.min(1, Math.max(0, point.x)), y: Math.min(1, Math.max(0, point.y)) }, label, bounds: { ...node.bounds } } }
 }
