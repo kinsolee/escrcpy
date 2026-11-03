@@ -20,9 +20,19 @@ export interface AgentToolCall {
   args: Record<string, unknown>
 }
 
+export type AgentContentPart
+  = | { type: 'text', text: string }
+    | { type: 'image_url', image_url: { url: string } }
+
+/** A tool result with images (e.g. the MCP screenshot tool); plain strings stay text-only. */
+export interface AgentToolOutput {
+  text: string
+  images?: Array<{ data: string, mimeType: string }>
+}
+
 export interface AgentMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
-  content?: string | null
+  content?: string | null | AgentContentPart[]
   tool_calls?: Array<{ id: string, type: 'function', function: { name: string, arguments: string } }>
   tool_call_id?: string
 }
@@ -38,8 +48,12 @@ export interface AgentLoopOptions {
   /** Conversation history; the loop appends assistant/tool messages to a copy. */
   messages: AgentMessage[]
   tools: AgentTool[]
-  /** Executes one tool call and returns the text fed back to the model. */
-  callTool: (call: AgentToolCall) => Promise<string>
+  /**
+   * Executes one tool call. Text goes back as the tool message; images (OpenAI
+   * tool messages cannot carry them) follow in one user message after the turn's
+   * tool results. Only the newest image message is kept in the history.
+   */
+  callTool: (call: AgentToolCall) => Promise<string | AgentToolOutput>
   onEvent?: (event: AgentEvent) => void
   /** LLM round-trips before the loop gives up. Default 16. */
   maxTurns?: number
@@ -63,6 +77,19 @@ export interface AgentLoopResult {
 export type CopilotMessage = AgentMessage
 
 const MAX_TOOL_CONTENT = 8000
+
+/** Replaces images in all but the newest image-bearing message with a text note, so screenshots do not pile up. */
+export function pruneAgentImages(messages: AgentMessage[], keep = 1): void {
+  let seen = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const content = messages[i].content
+    if (!Array.isArray(content) || !content.some(part => part.type === 'image_url'))
+      continue
+    seen++
+    if (seen > keep)
+      messages[i] = { ...messages[i], content: [...content.filter(part => part.type === 'text'), { type: 'text', text: '[earlier screenshot omitted]' }] }
+  }
+}
 
 function chatUrl(baseUrl: string): string {
   return `${baseUrl.trim().replace(/\/+$/, '')}/v1/chat/completions`
@@ -164,6 +191,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       return { messages, text, turns: turn }
     }
     options.onEvent?.({ type: 'assistant', text: content ?? '', toolCalls })
+    const images: Array<{ tool: string, data: string, mimeType: string }> = []
     for (const call of toolCalls) {
       const started = Date.now()
       let result: string
@@ -174,7 +202,15 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
       }
       else {
         try {
-          result = await options.callTool(call)
+          const output = await options.callTool(call)
+          if (typeof output === 'string') {
+            result = output
+          }
+          else {
+            result = output.text || (output.images?.length ? `(${output.images.length} image(s) attached below)` : 'ok')
+            for (const image of output.images ?? [])
+              images.push({ tool: call.name, ...image })
+          }
         }
         catch (error) {
           ok = false
@@ -185,6 +221,16 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
         result = `${result.slice(0, MAX_TOOL_CONTENT)}\n…(truncated)`
       messages.push({ role: 'tool', tool_call_id: call.id, content: result })
       options.onEvent?.({ type: 'tool_result', call, ok, content: result, durationMs: Date.now() - started })
+    }
+    if (images.length) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: `Image output of ${[...new Set(images.map(image => image.tool))].join(', ')}:` },
+          ...images.map(image => ({ type: 'image_url' as const, image_url: { url: `data:${image.mimeType};base64,${image.data}` } })),
+        ],
+      })
+      pruneAgentImages(messages)
     }
   }
   return { messages, text: '', turns: turn }

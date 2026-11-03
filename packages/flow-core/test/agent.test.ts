@@ -141,4 +141,31 @@ describe('runAgentLoop', () => {
     // The abort fires inside the second fetch, so the c2 tool round completes before the loop notices.
     expect(result.messages.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'c2' })
   })
+
+  it('shows tool images to the model in a follow-up user message and keeps only the newest one', async () => {
+    const fetchImpl = fetchResponder([
+      { toolCalls: [{ id: 'c1', name: 'screenshot', args: {} }] },
+      { toolCalls: [{ id: 'c2', name: 'screenshot', args: {} }] },
+      { content: 'saw it' },
+    ])
+    let shot = 0
+    const result = await runAgentLoop({
+      endpoint,
+      messages: [{ role: 'user', content: 'look' }],
+      tools,
+      callTool: async () => ({ text: '{"width":10}', images: [{ data: `IMG${++shot}`, mimeType: 'image/png' }] }),
+      fetchImpl,
+    })
+    expect(result.text).toBe('saw it')
+    const imageMessages = result.messages.filter(message => Array.isArray(message.content))
+    expect(imageMessages).toHaveLength(2)
+    const parts = (message: AgentMessage) => message.content as Array<{ type: string, image_url?: { url: string }, text?: string }>
+    expect(parts(imageMessages[0]).some(part => part.type === 'image_url')).toBe(false)
+    expect(parts(imageMessages[0]).at(-1)?.text).toMatch(/omitted/)
+    expect(parts(imageMessages[1]).find(part => part.type === 'image_url')?.image_url?.url).toBe('data:image/png;base64,IMG2')
+    // The second request carried the first screenshot right after the tool result.
+    const secondBody = JSON.parse(String((fetchImpl.mock.calls[1] as unknown[])[1] && ((fetchImpl.mock.calls[1] as unknown[])[1] as RequestInit).body))
+    expect(secondBody.messages.at(-1).content[1].image_url.url).toBe('data:image/png;base64,IMG1')
+    expect(secondBody.messages.at(-2)).toMatchObject({ role: 'tool', content: '{"width":10}' })
+  })
 })

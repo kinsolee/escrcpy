@@ -1,4 +1,5 @@
 import type { Adbx } from '@escrcpy/adbx'
+import type { JevClient } from '@escrcpy/flow-core'
 import type { DeviceLease, FlowDevice, LeaseInfo, RatioPoint, Selector, Snapshot, Target, UiElement } from '@escrcpy/flow-device'
 import { closestClickable, FlowDeviceError, hitTest, LeaseBusyError } from '@escrcpy/flow-device'
 import type { FlowTraceRecorder, TraceCall, TraceDevice, TraceTarget } from './recorder.js'
@@ -21,6 +22,8 @@ export interface FlowMcpContext {
   describeDevice?: (serial: string) => Promise<TraceDevice>
   adbx?: AdbxLike
   logger?: (message: string, error?: unknown) => void
+  /** Jev client for visual_locate / visual_check; default built from llm.json per call. */
+  jev?: JevClient
 }
 
 export interface ToolResult {
