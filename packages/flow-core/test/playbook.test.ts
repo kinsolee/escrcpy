@@ -1,11 +1,12 @@
 import type { Buffer } from 'node:buffer'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { mkdtemp, readdir, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { decodePng, encodePng, parseUiTree } from '@escrcpy/flow-device'
 import type { ForegroundApp, RatioPoint, UiTree } from '@escrcpy/flow-device'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { assertItemsResolved, CONSENT_NEEDS_HUMAN, findTreeTarget, HopFetchError, labelMismatch, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE, tiktokShopLinksParams } from '../src/index.js'
+import { assertItemScreenshots, assertItemsResolved, CONSENT_NEEDS_HUMAN, findTreeTarget, HopFetchError, labelMismatch, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE, tiktokShopLinksParams } from '../src/index.js'
 import type { HopFetcher, HopResponse, JevAnswer, JevClient, JevImage, JevQuestions, PlaybookDefinition, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,25 @@ const SHEET_ICONS = {
   cart: { top: 0.285, bottom: 0.315, left: 0.8, right: 0.85 },
 }
 const SHARE_SHADE = 230
+/** The open share panel (bottom 40 % of the screen). */
+const PANEL_SHADE = 15
+/** Shade of the product-identifying block on a product page (1..99). */
+const productShade = (id: string) => 1 + (Number(id.slice(-4)) % 97)
+
+/** Steps whose executed (not blocked) tap has this target. */
+function shareTapSteps(report: any, target: string): number[] {
+  return report.stepLog.filter((step: any) => step.actions.some((action: any) => action.type === 'tap' && action.target === target && !action.blocked)).map((step: any) => step.index)
+}
+
+/** The item's product screenshot: raw PNG of its own product page, panel closed, hash as recorded. */
+async function expectProductFrame(runDir: string, item: any): Promise<void> {
+  const data = await readFile(path.join(runDir, item.productScreenshot.file))
+  expect(createHash('sha256').update(data).digest('hex')).toBe(item.productScreenshot.sha256)
+  const png = decodePng(data)!
+  expect([png.width, png.height]).toEqual([item.productScreenshot.width, item.productScreenshot.height])
+  expect(png.data[(5 * png.width + 5) * 3]).toBe(productShade(item.productId))
+  expect(png.data[((png.height - 5) * png.width + 5) * 3]).not.toBe(PANEL_SHADE)
+}
 const CART_SHADE = 250
 const ACTIVITY = {
   home: 'com.ss.android.ugc.aweme.splash.SplashActivity',
@@ -95,6 +115,8 @@ interface WorldOptions {
   clipboardOverlay?: boolean
   /** Every Copy link yields a new short link, as on real TikTok (default: one fixed link per product). */
   uniqueLinks?: boolean
+  /** The first N Share taps do not open the panel. */
+  shareMisses?: number
   /** BACK does not leave the LIVE room (a dialog without an X in front of it). */
   liveStuck?: boolean
   /** Observations of a black, still-loading LIVE room after a card opens one; BACK is swallowed meanwhile. */
@@ -159,6 +181,8 @@ function world(options: WorldOptions) {
       forceStop()
   }
   const taps: RatioPoint[] = []
+  let shareMisses = options.shareMisses ?? 0
+  const shareOpens = () => shareMisses-- <= 0
   let dumps = 0
   let copies = 0
   const typed: string[] = []
@@ -173,6 +197,16 @@ function world(options: WorldOptions) {
         for (let y = Math.round(box.top * H); y < Math.round(box.bottom * H); y++)
           data.fill(CARD_SHADES[index], (y * W + Math.round(box.left * W)) * 3, (y * W + Math.round(box.right * W)) * 3)
       })
+    }
+    if (state.page === 'product_detail' && state.current) {
+      // A block whose shade identifies the product, so a saved frame can be traced to its card.
+      const shade = productShade(state.current.id)
+      for (let y = 0; y < 20; y++)
+        data.fill(shade, y * W * 3, (y * W + 20) * 3)
+    }
+    if (state.share) {
+      for (let y = Math.round(0.6 * H); y < H; y++)
+        data.fill(PANEL_SHADE, y * W * 3, (y + 1) * W * 3)
     }
     if (state.page === 'product_detail' && state.sheet) {
       for (const [box, shade] of [[sheetIcons.share, SHARE_SHADE], [sheetIcons.cart, CART_SHADE]] as const) {
@@ -252,12 +286,12 @@ function world(options: WorldOptions) {
         if (inside(point, sheetIcons.cart))
           counts.cartTaps++
         if (inside(point, sheetIcons.share)) {
-          state.share = true
+          state.share = shareOpens()
           fault('share')
         }
       }
       else if (state.page === 'product_detail' && !state.share && inside(point, BOXES.share_icon)) {
-        state.share = true
+        state.share = shareOpens()
         fault('share')
       }
     },
@@ -1130,6 +1164,97 @@ describe('tiktok-shop-links playbook', () => {
     expect(labelMismatch([], ['Shop'])).toBeUndefined()
     expect(labelMismatch(['Copiar link'], ['Copy link', 'Copiar link'])).toBeUndefined()
     expect(labelMismatch(['Following'], undefined)).toBeUndefined()
+  })
+
+  it('product screenshot: each item carries the raw frame of its executed top-bar Share tap', async () => {
+    const w = world({ grid: products('1730005001', '1730005002', '1730005003') })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev))
+    expect(result.status).toBe('done')
+    const items = (result.result as any).items
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    for (const [i, item] of items.entries()) {
+      expect(item.productScreenshot).toMatchObject({ file: `item-${i + 1}-product.png`, width: W, height: H })
+      expect(shareTapSteps(report, 'Share icon')).toContain(item.productScreenshot.step)
+      await expectProductFrame(result.runDir!, item)
+    }
+  })
+
+  it('product screenshot: a half-sheet item uses the frame of its sheet Share tap', async () => {
+    const w = world({ grid: [{ id: '1730005101', sheet: true }, { id: '1730005102' }] })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2 } }))
+    expect(result.status).toBe('done')
+    const [sheetItem, pdpItem] = (result.result as any).items
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    expect(sheetItem.sheet).toBe(true)
+    expect(shareTapSteps(report, 'sheet Share icon')).toContain(sheetItem.productScreenshot.step)
+    expect(shareTapSteps(report, 'Share icon')).toContain(pdpItem.productScreenshot.step)
+    const sheetPng = decodePng(await readFile(path.join(result.runDir!, sheetItem.productScreenshot.file)))!
+    // The sheet's Share icon is painted in that frame (the video + half sheet, panel not open).
+    const sx = Math.round(0.71 * W)
+    const sy = Math.round(0.3 * H)
+    expect(sheetPng.data[(sy * W + sx) * 3]).toBe(SHARE_SHADE)
+    await expectProductFrame(result.runDir!, sheetItem)
+    await expectProductFrame(result.runDir!, pdpItem)
+  })
+
+  it('product screenshot: when the first Share tap did not open the panel, the frame of the second one is used', async () => {
+    const w = world({ grid: products('1730005201'), shareMisses: 1 })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const steps = shareTapSteps(report, 'Share icon')
+    expect(steps).toHaveLength(2)
+    const [item] = (result.result as any).items
+    expect(item.productScreenshot.step).toBe(steps[1])
+    await expectProductFrame(result.runDir!, item)
+  })
+
+  it('product screenshot: after a force-stop and re-search, frames come from the new search\'s product pages', async () => {
+    const w = world({ grid: products('1730005301', '1730005302', '1730005303', '1730005304'), forceStopAfter: { tap: 'share', nth: 2 } })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev))
+    expect(result.status).toBe('done')
+    const res = result.result as any
+    expect(res.researched).toBe(true)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const relaunchStep = report.stepLog.find((step: any) => /TikTok was relaunched/.test(step.decision ?? '')).index
+    for (const item of res.items) {
+      expect(shareTapSteps(report, 'Share icon')).toContain(item.productScreenshot.step)
+      if (item.searchEpoch === 2)
+        expect(item.productScreenshot.step).toBeGreaterThan(relaunchStep)
+      await expectProductFrame(result.runDir!, item)
+    }
+    // The frame of the share tap interrupted by the force-stop belongs to no item.
+    expect(res.items.map((item: any) => item.productScreenshot.file)).toEqual(['item-1-product.png', 'item-2-product.png', 'item-3-product.png'])
+  })
+
+  it('product screenshot: only counted items get a file; the invariant checks presence, hash and size', async () => {
+    const w = world({ grid: products('1730005401', '1730005401', '1730005402'), uniqueLinks: true })
+    const { jev } = fakeJev(w)
+    const hops = scriptedHops({ 1730005402: ['reset', 'reset', 'reset', 'reset'] })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 }, resolveLink: undefined, fetchHop: hops.fetchHop }))
+    expect(result.status).toBe('done')
+    const files = (await readdir(result.runDir!)).filter(name => name.startsWith('item-'))
+    expect(files).toEqual(['item-1-product.png'])
+    const [item] = (result.result as any).items
+    expect(() => assertItemScreenshots([item], result.runDir!)).not.toThrow()
+    expect(() => assertItemScreenshots([{ ...item, productScreenshot: { ...item.productScreenshot, sha256: '0'.repeat(64) } }], result.runDir!)).toThrow(/invariant violated/)
+    expect(() => assertItemScreenshots([{ ...item, productScreenshot: { ...item.productScreenshot, file: 'item-9-product.png' } }], result.runDir!)).toThrow(/missing/)
+    expect(() => assertItemScreenshots([{ ...item, productScreenshot: undefined }], result.runDir!)).toThrow(/no product screenshot/)
+    expect((await stat(path.join(result.runDir!, 'item-1-product.png'))).mode & 0o777).toBe(0o600)
+  })
+
+  it('product screenshot: without a runDir the run uses a temp directory and still writes the files', async () => {
+    const w = world({ grid: products('1730005501') })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 }, runDir: undefined }))
+    expect(result.status).toBe('done')
+    expect(result.runDir).toMatch(/flow-playbook-tiktok-shop-links-/)
+    await expectProductFrame(result.runDir!, (result.result as any).items[0])
+    await rm(result.runDir!, { recursive: true, force: true })
   })
 
   it('extracts product ids from canonical links', () => {

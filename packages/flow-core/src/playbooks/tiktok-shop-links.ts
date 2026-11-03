@@ -1,6 +1,10 @@
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import type { Buffer } from 'node:buffer'
 import { z } from 'zod'
 import { CONSENT_NEEDS_HUMAN, describeConsent } from '../consent.js'
-import { jevBoxCenter } from '../jev.js'
+import { imageDimensions, jevBoxCenter } from '../jev.js'
 import type { JevBoxAnswer, JevNoulAnswer, JevNoulQuestion, JevQuestions } from '../jev.js'
 import type { Observation, PlaybookDefinition, PlaybookOutcome, PlaybookRuntime } from './runtime.js'
 import { findTreeTarget } from './tree-target.js'
@@ -47,6 +51,20 @@ export interface TiktokShopLinkItem {
   searchEpoch: number
   /** The product was opened in TikTok's video + product half sheet (DetailActivity) rather than a full product page. */
   sheet?: boolean
+  /**
+   * The product page as it was when Share was tapped for this item (before the share panel
+   * opened): the raw screencap PNG, not scaled or re-encoded. `file` is relative to the run dir.
+   */
+  productScreenshot: ProductScreenshot
+}
+
+export interface ProductScreenshot {
+  file: string
+  sha256: string
+  width: number
+  height: number
+  /** Step of the observation the frame belongs to (report.json stepLog index). */
+  step: number
 }
 
 /** A freshly copied link whose product ID could not be resolved; not counted toward `count`. */
@@ -299,11 +317,34 @@ export function assertItemsResolved(items: readonly TiktokShopLinkItem[]): void 
   }
 }
 
+/** Every counted item has its product screenshot on disk under `runDir`, with the recorded hash and size. */
+export function assertItemScreenshots(items: readonly TiktokShopLinkItem[], runDir: string | undefined): void {
+  for (const item of items) {
+    const shot = item.productScreenshot
+    if (!shot?.file || !runDir)
+      throw new Error(`invariant violated: item ${item.productId} has no product screenshot`)
+    const path = join(runDir, shot.file)
+    if (!existsSync(path))
+      throw new Error(`invariant violated: product screenshot ${shot.file} of item ${item.productId} is missing`)
+    const data = readFileSync(path)
+    const sha256 = createHash('sha256').update(data).digest('hex')
+    const size = imageDimensions(data)
+    if (sha256 !== shot.sha256 || size?.format !== 'png' || size.width !== shot.width || size.height !== shot.height)
+      throw new Error(`invariant violated: product screenshot ${shot.file} of item ${item.productId} does not match its recorded hash / size`)
+  }
+}
+
 export function productIdFromUrl(url: string | undefined): string | undefined {
   return url?.match(PRODUCT_ID_RE)?.[1]
 }
 
 type Answers = Record<string, any>
+
+/** A raw screencap of one observation. */
+interface CardFrame {
+  png: Buffer
+  step: number
+}
 
 interface CardView {
   position: CardPosition
@@ -346,6 +387,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   let epochCounted = true
   const result = (): TiktokShopLinksResult => {
     assertItemsResolved(items)
+    assertItemScreenshots(items, rt.runDir)
     return { keyword, links: items.map(item => item.link), productIds: items.map(item => item.productId), noResults: false, items: [...items], duplicates: [...duplicates], unresolved: [...unresolved], searchEpochs: searchEpoch, researched: searchEpoch > 1, liveRoomEntries }
   }
   rt.partial = result()
@@ -478,7 +520,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   }
   let scrolls = 0
   let backs = 0
-  let card: { position: CardPosition, ad: boolean, sold: boolean, relevance?: number, sheet?: boolean } | undefined
+  /**
+   * The card being worked on. `shareFrame`: the observation of the last Share tap that was executed
+   * for it (product page, panel not open yet). `productFrame`: its latest product-page observation
+   * without the panel, used only when a takeover opened the panel instead.
+   */
+  let card: { position: CardPosition, ad: boolean, sold: boolean, relevance?: number, sheet?: boolean, shareFrame?: CardFrame, productFrame?: CardFrame } | undefined
   /** Set when the last action was a card tap; read (and cleared) by the next observation. */
   let cardJustTapped = false
   let lastRelaunches = rt.relaunches
@@ -513,6 +560,15 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     return link
   }
 
+  /** Writes a card's product-page frame as `item-<n>-product.png` (raw screencap bytes). */
+  const saveProductFrame = async (n: number, frame: CardFrame): Promise<ProductScreenshot> => {
+    const size = imageDimensions(frame.png)
+    if (size?.format !== 'png')
+      throw new Error('product screenshot is not a PNG screencap')
+    const file = await rt.saveArtifact(`item-${n}-product.png`, frame.png)
+    return { file, sha256: createHash('sha256').update(frame.png).digest('hex'), width: size.width, height: size.height, step: frame.step }
+  }
+
   /**
    * Stores a freshly copied link; returns true when the target count is reached. Only links that
    * resolve to a product ID count: others go to `unresolved` and the playbook moves on to the next card.
@@ -528,7 +584,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         failure = resolution.reason ?? 'no product URL'
     }
     const productId = productIdFromUrl(productUrl)
-    if (!productUrl || !productId) {
+    const frame = card?.shareFrame ?? card?.productFrame
+    if (productUrl && productId && !seen.has(productId) && !frame) {
+      unresolved.push({ link, position: card?.position ?? 'top_left', searchEpoch: Math.max(1, searchEpoch), reason: 'no product-page frame was observed for this card' })
+      rt.decide(`link for ${productId} has no product-page screenshot; not counted, next card`)
+    }
+    else if (!productUrl || !productId) {
       unresolved.push({ link, position: card?.position ?? 'top_left', searchEpoch: Math.max(1, searchEpoch), reason: failure ?? 'no product ID in the link' })
       rt.decide(`link ${link} did not resolve to a product ID (${failure}); not counted, next card`)
     }
@@ -538,7 +599,8 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     }
     else {
       seen.add(productId)
-      items.push({ link, productId, finalUrl: stripQuery(productUrl), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}), searchEpoch: Math.max(1, searchEpoch), ...(card?.sheet ? { sheet: true } : {}) })
+      const productScreenshot = await saveProductFrame(items.length + 1, frame!)
+      items.push({ link, productId, finalUrl: stripQuery(productUrl), position: card?.position ?? 'top_left', ad: card?.ad ?? false, sold: card?.sold ?? false, ...(card?.relevance !== undefined ? { relevance: Math.round(card.relevance * 1000) / 1000 } : {}), searchEpoch: Math.max(1, searchEpoch), ...(card?.sheet ? { sheet: true } : {}), productScreenshot })
       rt.decide(`stored link ${items.length}/${params.count}: ${productId}`)
     }
     rt.partial = result()
@@ -851,6 +913,8 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         const sheet = isSheet(obs, a, page)
         if (sheet && card)
           card.sheet = true
+        if (page === 'product_detail' && !shareOpen && a.share_open.noul < 0.5 && card)
+          card.productFrame = { png: obs.screen.png, step: obs.step.index }
         if (shareOpen || (goal === 'copy' && a.share_open.noul >= 0.5 && located(a.copy_link_present, a.copy_link, 'copy_link'))) {
           setGoal('copy')
           const copyTarget = aim(obs, 'copy_link', located(a.copy_link_present, a.copy_link, 'copy_link') ? a.copy_link : undefined)
@@ -907,6 +971,8 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
                 const { point, source } = candidates[i]
                 const blocksBefore = rt.visualGuardBlocks
                 if (await rt.tap(obs, point, 'sheet Share icon', { settleMs: 2000, confirm: SHEET_SHARE_CONFIRM, coordSource: source, expectLabels: TIKTOK_EXPECTED_LABELS.sheet_share_icon })) {
+                  if (card)
+                    card.shareFrame = { png: obs.screen.png, step: obs.step.index }
                   shareTaps++
                   shareWaits = 0
                   goal = 'copy'
@@ -930,8 +996,11 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
             shareTaps++
             shareWaits = 0
             // The share panel loads its targets before sliding in (~2 s on a Pixel 5a).
-            if (await rt.tap(obs, shareTarget.point, 'Share icon', { settleMs: 2000, coordSource: shareTarget.source, expectLabels: TIKTOK_EXPECTED_LABELS.share_icon }))
+            if (await rt.tap(obs, shareTarget.point, 'Share icon', { settleMs: 2000, coordSource: shareTarget.source, expectLabels: TIKTOK_EXPECTED_LABELS.share_icon })) {
+              if (card)
+                card.shareFrame = { png: obs.screen.png, step: obs.step.index }
               goal = 'copy'
+            }
             break
           }
           await miss(`Share icon not usable (box ${(a.share_icon.confidence ?? 0).toFixed(2)})`, 'Open the share panel ("Send to") of this TikTok Shop product with the Share arrow icon in the top bar. Stop when the panel with Copy link shows.', o => yes((o.answers as Answers).share_open))

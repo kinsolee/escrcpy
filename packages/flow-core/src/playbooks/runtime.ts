@@ -1,4 +1,6 @@
-import { mkdir, rename, writeFile } from 'node:fs/promises'
+import type { Buffer } from 'node:buffer'
+import { chmod, mkdir, mkdtemp, rename, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import process from 'node:process'
 import { encodeScreenshot, screenFingerprint, withLease, withTimeout } from '@escrcpy/flow-device'
@@ -499,6 +501,25 @@ export class PlaybookRuntime {
     await this.sleep(Math.max(this.settleMs, 2000))
   }
 
+  /** Directory for the report and run artifacts (always set when started through runPlaybook). */
+  get runDir(): string | undefined {
+    return this.options.runDir
+  }
+
+  /**
+   * Writes an artifact into the run directory, owner-only (0600: product screenshots show the
+   * signed-in account's screen). Returns its path relative to the run directory.
+   */
+  async saveArtifact(name: string, data: Buffer): Promise<string> {
+    const dir = this.options.runDir
+    if (!dir)
+      throw new HealError('saveArtifact needs a run directory')
+    const path = join(dir, name)
+    await writeFile(path, data, { mode: 0o600 })
+    await chmod(path, 0o600)
+    return name
+  }
+
   async start(): Promise<void> {
     if (this.options.runDir)
       await mkdir(this.options.runDir, { recursive: true })
@@ -958,7 +979,9 @@ export class PlaybookRuntime {
 /** Runs a playbook definition, holding the device lease when one is given. */
 export async function runPlaybookDefinition(definition: PlaybookDefinition, options: PlaybookOptions): Promise<PlaybookResult> {
   const params = definition.params.parse(options.params)
-  const run = () => new PlaybookRuntime(definition, { ...options, params }).run(params)
+  // Results reference files in the run directory (e.g. product screenshots): without one, use a fresh temp directory.
+  const runDir = options.runDir ?? await mkdtemp(join(tmpdir(), `flow-playbook-${definition.id}-`))
+  const run = () => new PlaybookRuntime(definition, { ...options, params, runDir }).run(params)
   if (options.lease)
     return withLease(options.lease, options.serial, { holder: options.leaseHolder ?? `playbook:${definition.id}` }, run)
   return run()
