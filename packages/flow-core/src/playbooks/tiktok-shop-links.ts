@@ -3,6 +3,8 @@ import { CONSENT_NEEDS_HUMAN, describeConsent } from '../consent.js'
 import { jevBoxCenter } from '../jev.js'
 import type { JevBoxAnswer, JevNoulAnswer, JevNoulQuestion, JevQuestions } from '../jev.js'
 import type { Observation, PlaybookDefinition, PlaybookOutcome, PlaybookRuntime } from './runtime.js'
+import { findTreeTarget } from './tree-target.js'
+import type { CenterRegion, CoordSource } from './tree-target.js'
 import type { RatioPoint } from '@escrcpy/flow-device'
 
 /**
@@ -222,6 +224,26 @@ export const TIKTOK_BOX_REGIONS: Record<string, BoxRegion> = {
   bottom_right_card: { x: [0.5, 1], y: [0.45, 1], minWidth: 0.3, maxWidth: 0.55, minHeight: 0.15 },
 }
 
+/**
+ * Labels that name each tappable target (case-insensitive, whole word; en / pt / es). A tap is
+ * refused when the UI tree has labels at the point and none of them is one of these, and the
+ * UI-tree element carrying one of them (inside the target's region) supplies the point when there
+ * is exactly one. Product cards and the Shop search box have no rule: the grid is not in the UI
+ * tree, and the search box shows rotating suggested searches.
+ */
+export const TIKTOK_EXPECTED_LABELS = {
+  shop_tab: ['Shop', 'Loja', 'Tienda'],
+  share_icon: ['Share', 'Compartilhar', 'Compartir'],
+  sheet_share_icon: ['Share', 'Compartilhar', 'Compartir'],
+  copy_link: ['Copy link', 'Copiar link', 'Copiar enlace'],
+  popup_close: ['Close', 'Fechar', 'Cerrar', 'Dismiss'],
+} as const satisfies Record<string, readonly string[]>
+
+export type LabelledTarget = keyof typeof TIKTOK_EXPECTED_LABELS
+
+/** A popup's close X has no fixed place: its UI-tree element must lie this close to Jev's box centre. */
+const POPUP_CLOSE_TREE_RADIUS = 0.1
+
 export function boxFitsRegion(box: { top: number, bottom: number, left: number, right: number }, region: BoxRegion | undefined): boolean {
   if (!region)
     return false
@@ -346,6 +368,28 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
   }
   let gridWaits = 0
 
+  /**
+   * Point for a labelled target: the UI-tree element when exactly one names it inside the target's
+   * region (coordinate rule: the element wins), else the Jev box when one is usable.
+   */
+  const aim = (obs: Observation<any>, name: LabelledTarget, box: JevBoxAnswer | undefined): { point: RatioPoint, source: CoordSource } | undefined => {
+    let region: CenterRegion = TIKTOK_BOX_REGIONS[name]
+    if (name === 'popup_close') {
+      if (!box)
+        return undefined
+      const c = jevBoxCenter(box.box)
+      region = { x: [c.x - POPUP_CLOSE_TREE_RADIUS, c.x + POPUP_CLOSE_TREE_RADIUS], y: [c.y - POPUP_CLOSE_TREE_RADIUS, c.y + POPUP_CLOSE_TREE_RADIUS] }
+    }
+    const lookup = findTreeTarget(obs.tree, TIKTOK_EXPECTED_LABELS[name], region)
+    if (lookup.found) {
+      rt.decide(`${name} from the UI tree ("${lookup.found.label}")`)
+      return { point: lookup.found.point, source: 'tree' }
+    }
+    if (lookup.candidates > 1)
+      rt.decide(`${name}: ${lookup.reason} in the UI tree; using the Jev box`)
+    return box ? { point: jevBoxCenter(box.box), source: 'jev_box' } : undefined
+  }
+
   /** The TikTok home feed (For You). Never press BACK here: it is one step from leaving the app. */
   const isHome = (obs: Observation<any>, a: Answers, page: Page | 'uncertain') => {
     if (page === 'shop_home')
@@ -386,20 +430,28 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
    * not on the cart, then one icon left of the cart. Each tap first passes the visual check, which
    * also confirms the ringed control is a Share arrow, so a point on the cart is refused.
    */
-  const sheetShareCandidates = (a: Answers): RatioPoint[] => {
+  const sheetShareCandidates = (obs: Observation<any>, a: Answers): Array<{ point: RatioPoint, source: CoordSource }> => {
     const usable = (box: JevBoxAnswer, name: string) => (box.confidence ?? 0) >= T.boxGeometry && boxFitsRegion(box.box, TIKTOK_BOX_REGIONS[name])
     const cart = usable(a.sheet_cart_icon, 'sheet_cart_icon') ? jevBoxCenter(a.sheet_cart_icon.box) : undefined
-    const points: RatioPoint[] = []
+    const points: Array<{ point: RatioPoint, source: CoordSource }> = []
     if (usable(a.sheet_share_icon, 'sheet_share_icon')) {
       const share = jevBoxCenter(a.sheet_share_icon.box)
       if (!cart || cart.x - share.x >= SHEET_ICON_SPACING / 2)
-        points.push(share)
+        points.push({ point: share, source: 'jev_box' })
     }
     if (cart)
-      points.push({ x: cart.x - SHEET_ICON_SPACING, y: cart.y })
-    return points
-      .filter((point, i) => points.findIndex(other => Math.abs(other.x - point.x) < 0.015 && Math.abs(other.y - point.y) < 0.015) === i)
-      .sort((p, q) => p.x - q.x)
+      points.push({ point: { x: cart.x - SHEET_ICON_SPACING, y: cart.y }, source: 'derived' })
+    const sorted = points
+      .filter((candidate, i) => points.findIndex(other => Math.abs(other.point.x - candidate.point.x) < 0.015 && Math.abs(other.point.y - candidate.point.y) < 0.015) === i)
+      .sort((p, q) => p.point.x - q.point.x)
+    // A UI-tree element in the sheet's icon row comes first (the video's right-rail Share is outside that region).
+    const lookup = findTreeTarget(obs.tree, TIKTOK_EXPECTED_LABELS.sheet_share_icon, TIKTOK_BOX_REGIONS.sheet_share_icon)
+    if (lookup.found) {
+      rt.decide(`sheet_share_icon from the UI tree ("${lookup.found.label}")`)
+      const tree = lookup.found.point
+      return [{ point: tree, source: 'tree' as const }, ...sorted.filter(other => Math.abs(other.point.x - tree.x) >= 0.015 || Math.abs(other.point.y - tree.y) >= 0.015)]
+    }
+    return sorted
   }
   /** Share-icon taps for the current product, and observations waited since the last one (the panel slides in slowly). */
   let shareTaps = 0
@@ -604,7 +656,8 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       }
       if ((a.popup_close.confidence ?? 0) >= T.box && boxFitsRegion(a.popup_close.box, TIKTOK_BOX_REGIONS.popup_close)) {
         rt.decide('close popup with its X')
-        if (await rt.tap(obs, jevBoxCenter(a.popup_close.box), 'popup close X'))
+        const target = aim(obs, 'popup_close', a.popup_close)!
+        if (await rt.tap(obs, target.point, 'popup close X', { coordSource: target.source, expectLabels: TIKTOK_EXPECTED_LABELS.popup_close }))
           continue
       }
       rt.decide('close popup with BACK')
@@ -658,12 +711,17 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           await rt.takeover('Open the TikTok Shop search input page: tap the Shop tab at the top of the video feed, then the search box at the top of the Shop page. Stop when the search text field (usually with a keyboard) is showing.', o => pageOf(o.answers as Answers) === 'search_input', 'search page not reached')
           break
         }
-        if (page === 'video_feed' && located(a.shop_tab_present, a.shop_tab, 'shop_tab')) {
-          await rt.tap(obs, jevBoxCenter(a.shop_tab.box), 'Shop tab')
-          break
+        if (page === 'video_feed') {
+          const target = aim(obs, 'shop_tab', located(a.shop_tab_present, a.shop_tab, 'shop_tab') ? a.shop_tab : undefined)
+          if (target) {
+            const mismatches = rt.labelMismatchBlocks
+            if (!(await rt.tap(obs, target.point, 'Shop tab', { coordSource: target.source, expectLabels: TIKTOK_EXPECTED_LABELS.shop_tab })) && rt.labelMismatchBlocks > mismatches)
+              await miss('Shop tab point is labelled as something else', 'Open the TikTok Shop search input page: from the video feed tap the Shop tab at the top, then tap the search box at the top of the Shop page. Stop when the search text field (usually with a keyboard) is showing.', o => pageOf(o.answers as Answers) === 'search_input')
+            break
+          }
         }
         if (page === 'shop_home' && located(a.shop_search_present, a.shop_search, 'shop_search')) {
-          await rt.tap(obs, jevBoxCenter(a.shop_search.box), 'Shop search box')
+          await rt.tap(obs, jevBoxCenter(a.shop_search.box), 'Shop search box', { coordSource: 'jev_box' })
           break
         }
         await miss(`page ${page} (${a.page.choice} ${a.page.confidence.toFixed(2)}) has no usable control`, 'Open the TikTok Shop search input page: from the video feed tap the Shop tab at the top, then tap the search box at the top of the Shop page. Stop when the search text field (usually with a keyboard) is showing.', o => pageOf(o.answers as Answers) === 'search_input')
@@ -795,11 +853,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
           card.sheet = true
         if (shareOpen || (goal === 'copy' && a.share_open.noul >= 0.5 && located(a.copy_link_present, a.copy_link, 'copy_link'))) {
           setGoal('copy')
-          if (located(a.copy_link_present, a.copy_link, 'copy_link')) {
+          const copyTarget = aim(obs, 'copy_link', located(a.copy_link_present, a.copy_link, 'copy_link') ? a.copy_link : undefined)
+          if (copyTarget) {
             // Read, never write, before copying: a write pops Android's clipboard preview over the
             // bottom-left corner, exactly where Copy link sits.
             const before = await rt.readClipboard()
-            if (!(await rt.tap(obs, jevBoxCenter(a.copy_link.box), 'Copy link'))) {
+            if (!(await rt.tap(obs, copyTarget.point, 'Copy link', { coordSource: copyTarget.source, expectLabels: TIKTOK_EXPECTED_LABELS.copy_link }))) {
               await miss('Copy link tap refused', 'Tap "Copy link" in the open share panel. Do not tap any friend, contact or other app.', async () => !!(takenLink = await takeClipboard(before)))
               break
             }
@@ -843,11 +902,11 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
             // candidate passes the visual check (forbidden control + "is this the Share arrow").
             rt.decide(`product half sheet over a video (${obs.app?.activity.split('.').at(-1) ?? 'activity unknown'}, sheet ${a.product_sheet.noul.toFixed(2)})`)
             if (shareTaps < 2) {
-              const candidates = sheetShareCandidates(a)
+              const candidates = sheetShareCandidates(obs, a)
               for (let i = 0; i < candidates.length && i < 3; i++) {
-                const point = candidates[i]
+                const { point, source } = candidates[i]
                 const blocksBefore = rt.visualGuardBlocks
-                if (await rt.tap(obs, point, 'sheet Share icon', { settleMs: 2000, confirm: SHEET_SHARE_CONFIRM })) {
+                if (await rt.tap(obs, point, 'sheet Share icon', { settleMs: 2000, confirm: SHEET_SHARE_CONFIRM, coordSource: source, expectLabels: TIKTOK_EXPECTED_LABELS.sheet_share_icon })) {
                   shareTaps++
                   shareWaits = 0
                   goal = 'copy'
@@ -855,9 +914,9 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
                 }
                 // Refused as a forbidden control: that point was on the cart, so Share is one icon to its left.
                 const left = { x: point.x - SHEET_ICON_SPACING, y: point.y }
-                if (rt.visualGuardBlocks > blocksBefore && left.x > 0.5 && !candidates.some(other => Math.abs(other.x - left.x) < 0.015)) {
+                if (rt.visualGuardBlocks > blocksBefore && left.x > 0.5 && !candidates.some(other => Math.abs(other.point.x - left.x) < 0.015)) {
                   rt.decide(`sheet Share candidate (${point.x.toFixed(2)}, ${point.y.toFixed(2)}) was refused as a forbidden control; try one icon to its left`)
-                  candidates.push(left)
+                  candidates.push({ point: left, source: 'derived' })
                 }
               }
               if (goal === 'copy')
@@ -866,11 +925,12 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
             await miss(`sheet Share icon not usable (box ${(a.sheet_share_icon.confidence ?? 0).toFixed(2)})`, 'Open the share panel ("Send to") of this product with the curved-arrow Share icon at the top-right of the product sheet, the icon left of the shopping cart. Never tap the shopping cart. Stop when the panel with Copy link shows.', o => yes((o.answers as Answers).share_open))
             break
           }
-          if (located(a.share_icon_present, a.share_icon, 'share_icon') && shareTaps < 2) {
+          const shareTarget = aim(obs, 'share_icon', located(a.share_icon_present, a.share_icon, 'share_icon') ? a.share_icon : undefined)
+          if (shareTarget && shareTaps < 2) {
             shareTaps++
             shareWaits = 0
             // The share panel loads its targets before sliding in (~2 s on a Pixel 5a).
-            if (await rt.tap(obs, jevBoxCenter(a.share_icon.box), 'Share icon', { settleMs: 2000 }))
+            if (await rt.tap(obs, shareTarget.point, 'Share icon', { settleMs: 2000, coordSource: shareTarget.source, expectLabels: TIKTOK_EXPECTED_LABELS.share_icon }))
               goal = 'copy'
             break
           }
@@ -950,6 +1010,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
     }))
     // Right-column boxes often come back wrong on the real grid (spanning both columns, or a copy
     // of the left card). The grid is two symmetric columns, so mirror the left card of the row.
+    const mirrored = new Set<CardPosition>()
     for (const [right, left] of [[1, 0], [3, 2]] as const) {
       const view = cards[right]
       const partner = cards[left]
@@ -957,6 +1018,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
         continue
       const { top, bottom, left: l, right: r } = partner.box.box
       view.box = { type: 'box', box: { top, bottom, left: 1 - r, right: 1 - l }, confidence: partner.box.confidence }
+      mirrored.add(view.position)
       rt.decide(`${view.position} box mirrored from ${partner.position}`)
     }
     // A product card is a card with a visible price and no LIVE badge (optionally no Ad label).
@@ -975,7 +1037,7 @@ async function run(rt: PlaybookRuntime, params: TiktokShopLinksParams): Promise<
       shareWaits = 0
       if (located(undefined, view.box, `${view.position}_card`)) {
         setGoal('open_share')
-        if (await rt.tap(obs, jevBoxCenter(view.box.box), `${view.position} card`))
+        if (await rt.tap(obs, jevBoxCenter(view.box.box), `${view.position} card`, { coordSource: mirrored.has(view.position) ? 'jev_box_mirrored' : 'jev_box' }))
           cardJustTapped = true
         else
           setGoal('pick')

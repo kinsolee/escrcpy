@@ -5,7 +5,7 @@ import path from 'node:path'
 import { decodePng, encodePng, parseUiTree } from '@escrcpy/flow-device'
 import type { ForegroundApp, RatioPoint, UiTree } from '@escrcpy/flow-device'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { assertItemsResolved, CONSENT_NEEDS_HUMAN, HopFetchError, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE, tiktokShopLinksParams } from '../src/index.js'
+import { assertItemsResolved, CONSENT_NEEDS_HUMAN, findTreeTarget, HopFetchError, labelMismatch, productIdFromUrl, resolveLinkDetailed, resolveRedirects, runPlaybook, TIKTOK_PACKAGE, tiktokShopLinksParams } from '../src/index.js'
 import type { HopFetcher, HopResponse, JevAnswer, JevClient, JevImage, JevQuestions, PlaybookDefinition, PlaybookOptions, VisionAgentDevice, VisionLlmClient } from '../src/index.js'
 
 // ---------------------------------------------------------------------------
@@ -68,6 +68,15 @@ const H = 600
 const inside = (point: RatioPoint, box: Box) => point.x >= box.left && point.x <= box.right && point.y >= box.top && point.y <= box.bottom
 
 /** UI tree of TikTok's policy update dialog (text as on device), or of a screen without one. */
+interface FakeNode { text?: string, desc?: string, box: Box, clickable?: boolean, children?: FakeNode[] }
+
+/** A 1080x2400 UI tree from nodes placed in 0..1 screen ratios. */
+function treeOf(nodes: FakeNode[]): UiTree {
+  const px = (box: Box) => `[${Math.round(box.left * 1080)},${Math.round(box.top * 2400)}][${Math.round(box.right * 1080)},${Math.round(box.bottom * 2400)}]`
+  const render = (node: FakeNode): string => `<node class="android.widget.${node.text ? 'TextView' : 'FrameLayout'}" package="${TIKTOK_PACKAGE}" text="${node.text ?? ''}" content-desc="${node.desc ?? ''}" resource-id="" clickable="${node.clickable ? 'true' : 'false'}" bounds="${px(node.box)}">${(node.children ?? []).map(render).join('')}</node>`
+  return parseUiTree(`<hierarchy rotation="0"><node class="android.widget.FrameLayout" package="${TIKTOK_PACKAGE}" text="" content-desc="" resource-id="" clickable="false" bounds="[0,0][1080,2400]">${nodes.map(render).join('')}</node></hierarchy>`)
+}
+
 function consentTree(shown: boolean): UiTree {
   const node = (text: string, bounds: string, clickable = false) => `<node class="android.widget.TextView" package="${TIKTOK_PACKAGE}" text="${text}" content-desc="" resource-id="" clickable="${clickable}" bounds="${bounds}" />`
   const dialog = shown
@@ -90,6 +99,8 @@ interface WorldOptions {
   liveStuck?: boolean
   /** Observations of a black, still-loading LIVE room after a card opens one; BACK is swallowed meanwhile. */
   liveLoading?: number
+  /** UI tree per dump (the nth dump of the run, from 0); undefined → the dump fails (no tree). */
+  tree?: (state: { page: Page, share: boolean, sheet: boolean, popup: boolean }, dump: number) => FakeNode[] | undefined
   /** A terms / policy notice: named in the UI tree or only visible to Jev; shown on the results grid or at every launch. */
   consent?: { via: 'tree' | 'jev', when: 'results' | 'launch', clearsOnBack?: boolean }
   /** Physical half-sheet icons (default SHEET_ICONS). */
@@ -148,6 +159,7 @@ function world(options: WorldOptions) {
       forceStop()
   }
   const taps: RatioPoint[] = []
+  let dumps = 0
   let copies = 0
   const typed: string[] = []
   const starts: Array<{ pkg: string, restart?: boolean }> = []
@@ -306,7 +318,16 @@ function world(options: WorldOptions) {
       // An account-level notice pops up again at every launch.
       state.consent = options.consent?.when === 'launch'
     },
-    ...(options.consent?.via === 'tree' ? { uiTree: async () => consentTree(state.consent) } : {}),
+    ...(options.tree
+      ? {
+          uiTree: async () => {
+            const nodes = options.tree!(state, dumps++)
+            if (!nodes)
+              throw new Error('UI tree timed out')
+            return treeOf(nodes)
+          },
+        }
+      : options.consent?.via === 'tree' ? { uiTree: async () => consentTree(state.consent) } : {}),
     readClipboard: async () => state.clipboard,
     writeClipboard: async (_serial, text) => {
       state.clipboard = text
@@ -344,6 +365,8 @@ interface JevOptions {
   boxConfidence?: Record<string, number>
   /** Box edge overrides by question name. */
   boxes?: Record<string, Box>
+  /** Box overrides used only the first time the question is asked. */
+  boxesOnce?: Record<string, Box>
   /** Visual risk probability by the grey level under the tap (see CARD_SHADES / PAGE_SHADES). */
   riskByShade?: Record<number, number>
 }
@@ -397,7 +420,10 @@ function fakeJev(w: World, options: JevOptions = {}) {
         }
         if (question.type === 'box') {
           const sheetBox = name === 'sheet_share_icon' ? SHEET_ICONS.share : name === 'sheet_cart_icon' ? SHEET_ICONS.cart : undefined
-          answers[name] = { type: 'box', box: options.boxes?.[name] ?? sheetBox ?? BOXES[name] ?? { top: 0.4, bottom: 0.6, left: 0.4, right: 0.6 }, confidence: options.boxConfidence?.[name] ?? 0.9 }
+          const once = options.boxesOnce?.[name]
+          if (once)
+            delete options.boxesOnce![name]
+          answers[name] = { type: 'box', box: once ?? options.boxes?.[name] ?? sheetBox ?? BOXES[name] ?? { top: 0.4, bottom: 0.6, left: 0.4, right: 0.6 }, confidence: options.boxConfidence?.[name] ?? 0.9 }
           continue
         }
         const card = (position: string) => w.visible()[POSITIONS.indexOf(position as typeof POSITIONS[number])]
@@ -975,6 +1001,129 @@ describe('tiktok-shop-links playbook', () => {
     expect(w.taps).toEqual([])
     expect(w.counts.consentTouches).toBe(0)
     expect(result.consentBlocks).toBe(4)
+  })
+
+  it('coordinate rule: a Shop-tab box that lands on "Following" is refused; the next observation taps Shop', async () => {
+    const FOLLOWING: Box = { top: 0.07, bottom: 0.11, left: 0.4, right: 0.55 }
+    // Cold start: the first dump has only "Following"; later ones have the Shop tab too.
+    const w = world({ grid: products('1730004001'), tree: (state, dump) => state.page === 'video_feed' ? [{ text: 'Following', box: FOLLOWING, clickable: true }, ...(dump > 0 ? [{ text: 'Shop', box: BOXES.shop_tab, clickable: true }] : [])] : [] })
+    const { jev } = fakeJev(w, { boxesOnce: { shop_tab: FOLLOWING }, boxConfidence: { shop_tab: 0.35 } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(result.labelMismatchBlocks).toBe(1)
+    expect(result.guardrailBlocks).toBeGreaterThanOrEqual(1)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    // No executed tap landed on "Following" (the Shop search box later shares its screen area on another page).
+    expect(report.stepLog.flatMap((step: any) => step.actions).some((action: any) => action.type === 'tap' && !action.blocked && action.labels?.includes('Following'))).toBe(false)
+    const shopTaps = report.stepLog.flatMap((step: any) => step.actions).filter((action: any) => action.target === 'Shop tab')
+    expect(shopTaps[0]).toMatchObject({ coordSource: 'jev_box', labels: ['Following'], blocked: expect.stringMatching(/^label mismatch: "Following"/) })
+    expect(shopTaps[1]).toMatchObject({ coordSource: 'tree' })
+    expect(shopTaps[1].blocked).toBeUndefined()
+    expect(result.coordSources.tree).toBeGreaterThanOrEqual(1)
+  })
+
+  it('coordinate rule: the Shop-tab element wins over an off-target Jev box', async () => {
+    const w = world({ grid: products('1730004101'), tree: state => state.page === 'video_feed' ? [{ text: 'Following', box: { top: 0.07, bottom: 0.11, left: 0.4, right: 0.55 }, clickable: true }, { text: 'Shop', box: BOXES.shop_tab, clickable: true }] : [] })
+    const { jev } = fakeJev(w, { boxes: { shop_tab: { top: 0.07, bottom: 0.11, left: 0.45, right: 0.5 } } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(result.labelMismatchBlocks).toBe(0)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const shopTap = report.stepLog.flatMap((step: any) => step.actions).find((action: any) => action.target === 'Shop tab')
+    expect(shopTap).toMatchObject({ coordSource: 'tree', ratio: { x: 0.65, y: 0.09 }, labels: ['Shop'] })
+  })
+
+  it('coordinate rule: without a UI tree the Jev boxes are used as before', async () => {
+    const w = world({ grid: products('1730004201', '1730004202'), tree: () => undefined })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2 } }))
+    expect(result.status).toBe('done')
+    expect(result.coordSources.tree).toBe(0)
+    expect(result.coordSources.jev_box).toBeGreaterThan(0)
+    expect(result.labelMismatchBlocks).toBe(0)
+  })
+
+  it('coordinate rule: on the half sheet only the sheet Share element is used (not the video rail Share), still visually confirmed', async () => {
+    const RAIL_SHARE: Box = { top: 0.78, bottom: 0.82, left: 0.88, right: 0.96 }
+    const w = world({ grid: [{ id: '1730004301', sheet: true }], tree: state => state.page === 'product_detail' && state.sheet && !state.share ? [{ desc: 'Share', box: RAIL_SHARE, clickable: true }, { desc: 'Share', box: SHEET_ICONS.share, clickable: true }, { desc: 'Cart', box: SHEET_ICONS.cart, clickable: true }] : [] })
+    // Jev's sheet Share box is off to the right of the icon; the cart box is unusable.
+    const { jev } = fakeJev(w, { boxes: { sheet_share_icon: { top: 0.285, bottom: 0.315, left: 0.745, right: 0.775 } }, boxConfidence: { sheet_cart_icon: 0.05 } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(w.counts.cartTaps).toBe(0)
+    expect(w.taps.some(point => inside(point, RAIL_SHARE))).toBe(false)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const sheetTap = report.stepLog.flatMap((step: any) => step.actions).find((action: any) => action.target === 'sheet Share icon')
+    expect(sheetTap).toMatchObject({ coordSource: 'tree', visualCheck: { confirmed: 0.95, reason: 'required for this target' } })
+    expect(sheetTap.ratio.x).toBeCloseTo(0.7125, 2)
+    expect(sheetTap.blocked).toBeUndefined()
+  })
+
+  it('coordinate rule: two elements with the same label fall back to the Jev box, which is still label-checked', async () => {
+    const w = world({ grid: products('1730004401'), tree: state => state.page === 'product_detail' && !state.share ? [{ desc: 'Share', box: BOXES.share_icon, clickable: true }, { desc: 'Share', box: { top: 0.11, bottom: 0.14, left: 0.85, right: 0.95 }, clickable: true }] : [] })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const shareTap = report.stepLog.flatMap((step: any) => step.actions).find((action: any) => action.target === 'Share icon')
+    expect(shareTap).toMatchObject({ coordSource: 'jev_box', labels: ['Share'] })
+    expect(report.stepLog.some((step: any) => /share_icon: 2 matching elements in the UI tree; using the Jev box/.test(step.decision ?? ''))).toBe(true)
+  })
+
+  it('coordinate rule: Copy link uses its element centre', async () => {
+    const w = world({ grid: products('1730004501'), tree: state => state.share ? [{ text: 'Copy link', box: BOXES.copy_link, clickable: true }, { text: 'TikTok friends', box: { top: 0.84, bottom: 0.92, left: 0.72, right: 0.86 }, clickable: true }] : [] })
+    const { jev } = fakeJev(w, { boxes: { copy_link: { top: 0.84, bottom: 0.92, left: 0.2, right: 0.3 } } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    expect(result.status).toBe('done')
+    expect(result.result).toMatchObject({ productIds: ['1730004501'] })
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const copyTap = report.stepLog.flatMap((step: any) => step.actions).find((action: any) => action.target === 'Copy link')
+    expect(copyTap).toMatchObject({ coordSource: 'tree', ratio: { x: 0.11, y: 0.88 } })
+  })
+
+  it('coordinate rule: product cards and the Shop search box are not label-checked', async () => {
+    const w = world({
+      grid: products('1730004601', '1730004602'),
+      tree: state => state.page === 'shop_home'
+        ? [{ text: 'vintage christmas lights', box: BOXES.shop_search, clickable: true }]
+        : state.page === 'results_grid' ? [{ text: 'Sponsored picks', box: { top: 0.15, bottom: 0.85, left: 0, right: 1 } }] : [],
+    })
+    const { jev } = fakeJev(w)
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 2 } }))
+    expect(result.status).toBe('done')
+    expect(result.labelMismatchBlocks).toBe(0)
+    const report = JSON.parse(await readFile(result.reportPath!, 'utf8'))
+    const actions = report.stepLog.flatMap((step: any) => step.actions)
+    expect(actions.find((action: any) => action.target === 'Shop search box')).toMatchObject({ labels: ['vintage christmas lights'], coordSource: 'jev_box' })
+    expect(actions.filter((action: any) => (action.target ?? '').endsWith(' card')).every((action: any) => !action.blocked)).toBe(true)
+  })
+
+  it('coordinate rule: a target refused again and again goes to the miss path, not a loop', async () => {
+    const FOLLOWING: Box = { top: 0.07, bottom: 0.11, left: 0.4, right: 0.55 }
+    const w = world({ grid: products('1730004701'), tree: state => state.page === 'video_feed' ? [{ text: 'Following', box: FOLLOWING, clickable: true }] : [] })
+    const { jev } = fakeJev(w, { boxes: { shop_tab: FOLLOWING } })
+    const result = await runTikTok(options(w, jev, { params: { keyword: 'k', count: 1 } }))
+    // Two refusals in a row reach the takeover, which is off here: the run fails instead of looping.
+    expect(result.status).toBe('failed')
+    expect(result.reason).toMatch(/takeovers are disabled/)
+    expect(result.labelMismatchBlocks).toBe(2)
+    expect(w.taps.some(point => inside(point, FOLLOWING))).toBe(false)
+  })
+
+  it('tree targets: nested elements count once, tiny clickables aim at their button, labels match whole words', () => {
+    const tree = treeOf([
+      { desc: 'Share', box: { top: 0.07, bottom: 0.1, left: 0.7, right: 0.76 }, clickable: true, children: [{ desc: 'share', box: { top: 0.075, bottom: 0.095, left: 0.72, right: 0.74 } }] },
+      { text: 'Shopping Ranking', box: { top: 0.02, bottom: 0.05, left: 0.1, right: 0.4 }, clickable: true },
+    ])
+    const share = findTreeTarget(tree, ['Share'], { x: [0.5, 1], y: [0, 0.15] })
+    expect(share.found?.point.x).toBeCloseTo(0.73, 2)
+    expect(findTreeTarget(tree, ['Shop'], { y: [0, 0.15] })).toMatchObject({ candidates: 0 })
+    expect(findTreeTarget(undefined, ['Shop'], {})).toMatchObject({ candidates: 0, reason: 'no UI tree' })
+    expect(labelMismatch(['Following'], ['Shop'])).toEqual(['Following'])
+    expect(labelMismatch(['Shop', 'Following'], ['Shop'])).toBeUndefined()
+    expect(labelMismatch([], ['Shop'])).toBeUndefined()
+    expect(labelMismatch(['Copiar link'], ['Copy link', 'Copiar link'])).toBeUndefined()
+    expect(labelMismatch(['Following'], undefined)).toBeUndefined()
   })
 
   it('extracts product ids from canonical links', () => {

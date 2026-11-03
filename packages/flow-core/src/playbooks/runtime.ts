@@ -16,6 +16,8 @@ import type { VisionAgentDevice, VisionAgentResult } from '../vision-agent.js'
 import type { VisionLlmClient, VisionLlmClientOptions, VisionLlmEndpoint } from '../vision-llm.js'
 import { redactSecret } from '../vision-llm.js'
 import { redactUrl, resolveLinkDetailed } from './link-resolver.js'
+import { labelMismatch } from './tree-target.js'
+import type { CoordSource } from './tree-target.js'
 import type { HopFetcher, LinkResolution } from './link-resolver.js'
 
 /**
@@ -139,6 +141,10 @@ export interface PlaybookResult {
   unverifiedTaps: number
   /** Touches refused because a terms / policy / consent notice was on screen. */
   consentBlocks: number
+  /** Taps refused because the UI-tree labels at the point did not name the target (also in guardrailBlocks). */
+  labelMismatchBlocks: number
+  /** Executed taps by where their point came from. */
+  coordSources: Record<CoordSource, number>
   /** Set when the run stopped at a consent notice (reason starts with consent_dialog_needs_human): the frame and what was found. */
   consent?: ConsentDetection & { screenshot?: string }
   durationMs: number
@@ -205,6 +211,13 @@ export interface TapOptions {
   visualCheck?: 'auto' | 'always'
   /** Also ask, on the same crop, whether the ringed control is the intended one (refer to it as \`crop\`); refuse below 0.5. Implies `visualCheck: 'always'`. */
   confirm?: JevNoulQuestion
+  /** Where the point came from (recorded on the action and counted in `coordSources`). Default `jev_box`. */
+  coordSource?: CoordSource
+  /**
+   * Labels that name the target (case-insensitive, whole word). When the UI tree has labels at the
+   * point and none of them matches, the tap is refused as a label mismatch.
+   */
+  expectLabels?: readonly string[]
 }
 
 /** Judges a takeover on the next observation (may read the device, e.g. the clipboard). */
@@ -263,6 +276,9 @@ export class PlaybookRuntime {
   private pendingFallback?: { step: PlaybookStepRecord, ok: boolean, expect: TakeoverCheck }
   private guardrailBlocks = 0
   private consentBlocks = 0
+  /** Taps refused because the UI-tree labels at the point named something else. */
+  labelMismatchBlocks = 0
+  private readonly coordSources: Record<CoordSource, number> = { tree: 0, jev_box: 0, jev_box_mirrored: 0, derived: 0 }
   private consentStop?: ConsentDetection & { screenshot?: string }
   /** Consent state of the latest observation (swipe / ENTER have no observation of their own). */
   private lastConsent?: ConsentDetection
@@ -341,6 +357,8 @@ export class PlaybookRuntime {
       visualGuardBlocks: this.visualGuardBlocks,
       unverifiedTaps: this.unverifiedTaps,
       consentBlocks: this.consentBlocks,
+      labelMismatchBlocks: this.labelMismatchBlocks,
+      coordSources: { ...this.coordSources },
       ...(this.consentStop ? { consent: this.consentStop } : {}),
       durationMs: this.now() - this.started,
       ...(this.options.runDir ? { runDir: this.options.runDir, reportPath: this.reportPath } : {}),
@@ -615,7 +633,8 @@ export class PlaybookRuntime {
    */
   async tap(obs: Observation<any>, ratio: RatioPoint, target: string, options: TapOptions = {}): Promise<boolean> {
     this.checkBudget()
-    const entry = this.action({ type: 'tap', target, ratio: { x: Math.round(ratio.x * 1000) / 1000, y: Math.round(ratio.y * 1000) / 1000 } })
+    const coordSource = options.coordSource ?? 'jev_box'
+    const entry = this.action({ type: 'tap', target, ratio: { x: Math.round(ratio.x * 1000) / 1000, y: Math.round(ratio.y * 1000) / 1000 }, coordSource })
     // Anywhere on a screen with a consent notice: its buttons, and the dimmed area around it.
     if (obs.consent?.present) {
       this.consentBlocks++
@@ -639,6 +658,14 @@ export class PlaybookRuntime {
     }
     if (check.labels.length)
       entry.labels = check.labels.slice(0, 6)
+    // The UI tree names something else at this point (e.g. "Following" where the Shop tab was expected).
+    const mismatch = labelMismatch(check.labels, options.expectLabels)
+    if (mismatch) {
+      this.labelMismatchBlocks++
+      this.guardrailBlocks++
+      entry.blocked = `label mismatch: ${mismatch.slice(0, 4).map(label => JSON.stringify(label)).join(', ')} at the point, expected ${options.expectLabels!.map(label => JSON.stringify(label)).join(' / ')}`
+      return false
+    }
     const always = options.visualCheck === 'always' || !!options.confirm
     if (always || check.verdict === 'unverified' || check.unlabeled) {
       try {
@@ -677,6 +704,7 @@ export class PlaybookRuntime {
     }
     const started = this.now()
     await this.device.tap(this.serial, ratio)
+    this.coordSources[coordSource]++
     entry.ms = this.now() - started
     await this.sleep(options.settleMs ?? this.settleMs)
     return true

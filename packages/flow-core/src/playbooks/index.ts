@@ -6,6 +6,7 @@ import { tiktokShopLinks } from './tiktok-shop-links.js'
 export * from './link-resolver.js'
 export * from './runtime.js'
 export * from './tiktok-shop-links.js'
+export * from './tree-target.js'
 
 /** Built-in playbooks by id. Add new ones here. */
 export const PLAYBOOKS: Readonly<Record<string, PlaybookDefinition>> = {
